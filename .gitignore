@@ -1,0 +1,8 @@
+.zig-cache/
+zig-out/
+*.exe
+*.pdb
+probe
+.env
+.env.*
+!.env.example
