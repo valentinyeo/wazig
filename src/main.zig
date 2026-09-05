@@ -187,6 +187,10 @@ const App = struct {
     wic_factory: [*c]win.IWICImagingFactory = null,
     player_window: ?win.HWND = null,
     mf_player: ?*win.IMFPMediaPlayer = null,
+    audio_window: ?win.HWND = null,
+    audio_player: ?*win.IMFPMediaPlayer = null,
+    audio_rate: f64 = 1.0,
+    audio_message_id: Utf8Text(191) = .{},
     displayed_jid: Utf8Text(191) = .{},
     displayed_timestamp: Utf8Text(47) = .{},
     played: [2048]u64 = [_]u64{0} ** 2048,
@@ -784,6 +788,7 @@ fn playerCallbackEvent(_: [*c]win.IMFPMediaPlayerCallback, event: [*c]win.MFP_EV
     if (event.*.eEventType == win.MFP_EVENT_TYPE_ERROR) {
         if (app_ptr) |a| {
             if (a.player_window) |hwnd| _ = win.SetWindowTextW(hwnd, lit("Messages · Video (playback failed)"));
+            if (a.audio_window) |hwnd| _ = win.SetWindowTextW(hwnd, lit("Messages · Voice note (playback failed)"));
         }
     }
 }
@@ -896,6 +901,208 @@ fn playVideoInline(a: *App, message: *const Message) void {
     a.mf_player = player;
     _ = win.ShowWindow(hwnd, win.SW_SHOW);
 }
+
+// Voice notes play in-app through Media Foundation MFPlay so the speed buttons
+// (1x / 1.5x / 2x) keep the original pitch; the external player the app used to
+// shell out to shifts pitch up and makes voices sound high ("mouse voice").
+// Shares player_callback and the MFPlay infrastructure with the video player.
+const audio_rates = [3]f64{ 1.0, 1.5, 2.0 };
+const audio_button_width: i32 = 92;
+const audio_button_height: i32 = 32;
+const audio_client_width: i32 = 340;
+const audio_client_height: i32 = 108;
+
+fn audioButtonRect(index: usize) win.RECT {
+    return .{
+        .left = 16 + @as(i32, @intCast(index)) * (audio_button_width + 12),
+        .top = 60,
+        .right = 16 + @as(i32, @intCast(index)) * (audio_button_width + 12) + audio_button_width,
+        .bottom = 60 + audio_button_height,
+    };
+}
+
+fn audioButtonAt(x: i32, y: i32) ?usize {
+    for (audio_rates, 0..) |_, index| {
+        const rect = audioButtonRect(index);
+        if (x >= rect.left and x <= rect.right and y >= rect.top and y <= rect.bottom) return index;
+    }
+    return null;
+}
+
+fn fileUrl(buffer: []u16, path: []const u16) [:0]const u16 {
+    const prefix = [_]u16{ 'f', 'i', 'l', 'e', ':', '/', '/', '/' };
+    @memcpy(buffer[0..prefix.len], &prefix);
+    var n = prefix.len;
+    for (path) |c| {
+        if (n + 1 >= buffer.len) break;
+        buffer[n] = if (c == '\\') '/' else c;
+        n += 1;
+    }
+    buffer[n] = 0;
+    return buffer[0..n :0];
+}
+
+fn setAudioRate(a: *App, rate: f64) void {
+    a.audio_rate = rate;
+    if (a.audio_player) |player| _ = player.lpVtbl.*.SetRate.?(player, @floatCast(rate));
+    if (a.audio_window) |hwnd| _ = win.InvalidateRect(hwnd, null, win.TRUE);
+}
+
+fn closeAudioPlayer(a: *App) void {
+    if (a.audio_player) |player| {
+        _ = player.lpVtbl.*.Shutdown.?(player);
+        _ = player.lpVtbl.*.Release.?(player);
+        a.audio_player = null;
+    }
+    if (a.audio_window) |hwnd| {
+        a.audio_window = null;
+        _ = win.DestroyWindow(hwnd);
+    }
+    a.audio_rate = 1.0;
+}
+
+fn drawAudioPlayer(hwnd: win.HWND, a: *App) void {
+    var paint: win.PAINTSTRUCT = undefined;
+    const hdc = win.BeginPaint(hwnd, &paint);
+    defer _ = win.EndPaint(hwnd, &paint);
+    var client: win.RECT = undefined;
+    _ = win.GetClientRect(hwnd, &client);
+    _ = win.FillRect(hdc, &client, a.brush_bg.?);
+    _ = win.SetBkMode(hdc, win.TRANSPARENT);
+    _ = win.SelectObject(hdc, @ptrCast(a.font_bold.?));
+    _ = win.SetTextColor(hdc, color_text);
+    var title_rect = win.RECT{ .left = 16, .top = 14, .right = client.right - 16, .bottom = 44 };
+    _ = win.DrawTextW(hdc, lit("Voice note"), -1, &title_rect, win.DT_LEFT | win.DT_SINGLELINE | win.DT_VCENTER);
+    for (audio_rates, 0..) |rate, index| {
+        const rect = audioButtonRect(index);
+        const current = a.audio_rate == rate;
+        const brush = win.CreateSolidBrush(if (current) color_accent else color_panel) orelse continue;
+        const old_brush = win.SelectObject(hdc, brush);
+        const pen = win.CreatePen(win.PS_SOLID, 1, if (current) color_accent else color_muted);
+        const old_pen = win.SelectObject(hdc, @ptrCast(pen));
+        _ = win.RoundRect(hdc, rect.left, rect.top, rect.right, rect.bottom, 12, 12);
+        _ = win.SelectObject(hdc, old_brush);
+        _ = win.SelectObject(hdc, old_pen);
+        _ = win.DeleteObject(brush);
+        if (pen) |dead_pen| _ = win.DeleteObject(dead_pen);
+        _ = win.SelectObject(hdc, @ptrCast(if (current) a.font_bold.? else a.font.?));
+        _ = win.SetTextColor(hdc, if (current) color_bg else color_muted);
+        const label: [*:0]const u16 = switch (index) {
+            0 => lit("1x"),
+            1 => lit("1.5x"),
+            else => lit("2x"),
+        };
+        _ = win.DrawTextW(hdc, label, -1, @ptrCast(@constCast(&rect)), win.DT_CENTER | win.DT_SINGLELINE | win.DT_VCENTER);
+    }
+}
+
+fn audioProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.LPARAM) callconv(.winapi) win.LRESULT {
+    const a = app_ptr orelse return win.DefWindowProcW(hwnd, message, wparam, lparam);
+    switch (message) {
+        win.WM_PAINT => {
+            drawAudioPlayer(hwnd, a);
+            return 0;
+        },
+        win.WM_ERASEBKGND => return 1,
+        win.WM_LBUTTONDOWN => {
+            const x: i32 = @as(i16, @bitCast(loword(@as(usize, @bitCast(lparam)))));
+            const y: i32 = @as(i16, @bitCast(hiword(@as(usize, @bitCast(lparam)))));
+            if (audioButtonAt(x, y)) |index| setAudioRate(a, audio_rates[index]);
+            return 0;
+        },
+        win.WM_KEYDOWN => {
+            const rates_keys = [_]win.WPARAM{ '1', '2', '3' };
+            for (rates_keys, 0..) |key, index| {
+                if (wparam == key) {
+                    setAudioRate(a, audio_rates[index]);
+                    return 0;
+                }
+            }
+            if (wparam == 27) { // escape
+                closeAudioPlayer(a);
+                return 0;
+            }
+        },
+        win.WM_CLOSE => {
+            closeAudioPlayer(a);
+            return 0;
+        },
+        win.WM_DESTROY => {
+            if (a.audio_window != null and a.audio_window.? == hwnd) a.audio_window = null;
+            if (a.audio_player) |player| {
+                _ = player.lpVtbl.*.Shutdown.?(player);
+                _ = player.lpVtbl.*.Release.?(player);
+                a.audio_player = null;
+            }
+            return 0;
+        },
+        else => {},
+    }
+    return win.DefWindowProcW(hwnd, message, wparam, lparam);
+}
+
+fn playVoiceNote(a: *App, message: *const Message) void {
+    if (message.local_path.len == 0) return;
+    if (a.audio_message_id.len > 0 and std.mem.eql(u8, a.audio_message_id.slice(), message.id.slice())) {
+        closeAudioPlayer(a);
+        return;
+    }
+    closeAudioPlayer(a);
+    var rect = win.RECT{ .left = 0, .top = 0, .right = audio_client_width, .bottom = audio_client_height };
+    _ = win.AdjustWindowRect(&rect, win.WS_CAPTION | win.WS_SYSMENU, 0);
+
+    if (!audio_class_registered) {
+        var class = win.WNDCLASSEXW{
+            .cbSize = @sizeOf(win.WNDCLASSEXW),
+            .style = win.CS_HREDRAW | win.CS_VREDRAW,
+            .lpfnWndProc = audioProc,
+            .hInstance = a.instance,
+            .hCursor = win.LoadCursorW(null, @ptrFromInt(32512)),
+            .hbrBackground = win.CreateSolidBrush(color_bg),
+            .lpszClassName = lit("MessagesVoicePlayer"),
+            .hIconSm = null,
+        };
+        if (win.RegisterClassExW(&class) == 0) {
+            setStatus(a, "Could not open the voice player");
+            return;
+        }
+        audio_class_registered = true;
+    }
+    const hwnd = win.CreateWindowExW(
+        0,
+        lit("MessagesVoicePlayer"),
+        lit("Messages · Voice note"),
+        win.WS_CAPTION | win.WS_SYSMENU,
+        win.CW_USEDEFAULT,
+        win.CW_USEDEFAULT,
+        rect.right - rect.left,
+        rect.bottom - rect.top,
+        a.hwnd orelse null,
+        null,
+        a.instance,
+        null,
+    ) orelse {
+        setStatus(a, "Could not open the voice player");
+        return;
+    };
+    a.audio_window = hwnd;
+    a.audio_rate = 1.0;
+    a.audio_message_id.set(message.id.slice());
+    var url_buffer: [560]u16 = [_]u16{0} ** 560;
+    const url = fileUrl(&url_buffer, message.local_path.slice());
+    var player: ?*win.IMFPMediaPlayer = null;
+    const hr = win.MFPCreateMediaPlayer(url.ptr, 1, win.MFP_OPTION_NONE, &player_callback, hwnd, &player);
+    if (hr < 0 or player == null) {
+        closeAudioPlayer(a);
+        setStatus(a, "Voice playback is not available for this file");
+        openMedia(a, message);
+        return;
+    }
+    a.audio_player = player;
+    _ = win.ShowWindow(hwnd, win.SW_SHOW);
+}
+
+var audio_class_registered: bool = false;
 
 fn advanceGifs(a: *App) void {
     var changed = false;
@@ -1543,12 +1750,14 @@ fn canvasProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win
                     a.selected_message = index;
                     if (isVideo(item)) {
                         if (item.local_path.len > 0) playVideoInline(a, item) else downloadMedia(a, index, false);
-                    } else if (item.local_path.len > 0) {
-                        openMedia(a, item);
-                        if (isAudio(item)) {
+                    } else if (isAudio(item)) {
+                        if (item.local_path.len > 0) {
+                            playVoiceNote(a, item);
                             markPlayed(a, item.id.slice());
                             _ = win.InvalidateRect(hwnd, null, win.TRUE);
-                        }
+                        } else downloadMedia(a, index, false);
+                    } else if (item.local_path.len > 0) {
+                        openMedia(a, item);
                     } else {
                         downloadMedia(a, index, false);
                     }
@@ -1570,7 +1779,7 @@ fn canvasProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win
                 const bubble = item.bubble_hit;
                 if (x >= media.left and x <= media.right and y >= media.top and y <= media.bottom) {
                     a.selected_message = index;
-                    if (isVideo(item) and item.local_path.len > 0) {
+                    if ((isVideo(item) or isAudio(item)) and item.local_path.len > 0) {
                         openMedia(a, item);
                         return 0;
                     }
@@ -1726,6 +1935,7 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
         },
         win.WM_DESTROY => {
             closePlayer(a);
+            closeAudioPlayer(a);
             _ = win.KillTimer(hwnd, timer_refresh);
             _ = win.KillTimer(hwnd, timer_search);
             _ = win.KillTimer(hwnd, timer_animation);
@@ -1984,4 +2194,23 @@ test clampPlayerSize {
     try std.testing.expect(@as(u32, 253) == tall[0]);
     const empty = clampPlayerSize(0, 0);
     try std.testing.expectEqual(@as(u32, 640), empty[0]);
+}
+
+test audioButtonRect {
+    const first = audioButtonRect(0);
+    try std.testing.expectEqual(@as(i32, 16), first.left);
+    try std.testing.expectEqual(@as(i32, 108), first.right);
+    const third = audioButtonRect(2);
+    try std.testing.expectEqual(@as(i32, 316), third.right);
+    try std.testing.expect(audioButtonAt(110, 76) == null);
+    try std.testing.expectEqual(@as(usize, 1), audioButtonAt(120, 76).?);
+    try std.testing.expectEqual(@as(usize, 2), audioButtonAt(260, 76).?);
+}
+
+test fileUrl {
+    var buffer: [560]u16 = [_]u16{0} ** 560;
+    const url = fileUrl(&buffer, &.{ 'C', ':', '\\', 'U', 's', 'e', 'r', 's' });
+    const utf8 = try std.unicode.utf16LeToUtf8Alloc(std.testing.allocator, url);
+    defer std.testing.allocator.free(utf8);
+    try std.testing.expectEqualStrings("file:///C:/Users", utf8);
 }
