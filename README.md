@@ -34,7 +34,7 @@ The interface uses Win32, Windows Imaging Component, and Windows shell thumbnail
 | `Esc` | Return to the chat list |
 | `Q` | Quit |
 
-Use `Win+.` in the composer for the Windows emoji picker. Right-click a message bubble to react.
+Click the smiley button next to the composer to insert emoji from a small picker menu. Right-click a message bubble to react.
 
 ## Build
 

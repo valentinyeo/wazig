@@ -27,6 +27,11 @@ const id_compose = 1032;
 const id_send = 1040;
 const id_status = 1048;
 const id_dictate = 1056;
+const emoji_picker = @import("emoji_picker.zig");
+const picker_emojis = emoji_picker.picker_emojis;
+const picker_base = emoji_picker.picker_base;
+const pickerEmojiForCommand = emoji_picker.pickerEmojiForCommand;
+const id_emoji = 1064;
 const command_search = 2001;
 const command_compose = 2002;
 const command_unread = 2003;
@@ -152,10 +157,12 @@ const App = struct {
     compose: ?win.HWND = null,
     send: ?win.HWND = null,
     dictate: ?win.HWND = null,
+    emoji_btn: ?win.HWND = null,
     status: ?win.HWND = null,
     font: ?win.HFONT = null,
     font_small: ?win.HFONT = null,
     font_bold: ?win.HFONT = null,
+    font_emoji: ?win.HFONT = null,
     brush_bg: ?win.HBRUSH = null,
     brush_panel: ?win.HBRUSH = null,
     brush_raised: ?win.HBRUSH = null,
@@ -1125,6 +1132,35 @@ fn reactToSelected(a: *App, command: u16) void {
     setStatus(a, if (emoji.len == 0) "Reaction removed" else "Reaction sent");
 }
 
+fn insertEmoji(a: *App, emoji: []const u8) void {
+    if (a.compose) |compose| {
+        var wide = WideText(31){};
+        wide.set(a.allocator, emoji);
+        if (wide.len == 0) return;
+        const length = win.GetWindowTextLengthW(compose);
+        _ = win.SendMessageW(compose, win.EM_SETSEL, @bitCast(@as(isize, length)), @bitCast(@as(isize, length)));
+        _ = win.SendMessageW(compose, win.EM_REPLACESEL, win.TRUE, @bitCast(@intFromPtr(wide.ptr())));
+        _ = win.SendMessageW(compose, win.EM_SCROLLCARET, 0, 0);
+        _ = win.SetFocus(compose);
+    }
+}
+
+fn openEmojiMenu(a: *App) void {
+    const menu = win.CreatePopupMenu() orelse return;
+    defer _ = win.DestroyMenu(menu);
+    for (picker_emojis, 0..) |emoji, index| {
+        var wide = WideText(31){};
+        wide.set(a.allocator, emoji);
+        if (wide.len == 0) continue;
+        _ = win.AppendMenuW(menu, win.MF_STRING, picker_base + index, wide.ptr());
+    }
+    var rect: win.RECT = undefined;
+    if (a.hwnd) |hwnd| _ = win.GetWindowRect(hwnd, &rect);
+    const choice = win.TrackPopupMenu(menu, win.TPM_RETURNCMD | win.TPM_NONOTIFY, rect.right - 232, rect.bottom - 110, 0, a.hwnd.?, null);
+    if (choice == 0) return;
+    if (pickerEmojiForCommand(@intCast(choice))) |emoji| insertEmoji(a, emoji);
+}
+
 fn addReactionItems(menu: win.HMENU) void {
     _ = win.AppendMenuW(menu, win.MF_STRING, reaction_like, lit("👍  Like"));
     _ = win.AppendMenuW(menu, win.MF_STRING, reaction_love, lit("❤️  Love"));
@@ -1234,8 +1270,9 @@ fn layout(a: *App, width: i32, height: i32) void {
     if (a.chats_hwnd) |hwnd| _ = win.MoveWindow(hwnd, 0, header_height + search_height, left_width, height - header_height - search_height - status_height, win.TRUE);
     if (a.status) |hwnd| _ = win.MoveWindow(hwnd, 12, height - status_height, left_width - 24, status_height, win.TRUE);
     if (a.canvas) |hwnd| _ = win.MoveWindow(hwnd, left_width + 1, header_height, width - left_width - 1, height - header_height - compose_height, win.TRUE);
-    if (a.compose) |hwnd| _ = win.MoveWindow(hwnd, left_width + 14, height - compose_height + 11, width - left_width - 198, 44, win.TRUE);
-    if (a.dictate) |hwnd| _ = win.MoveWindow(hwnd, width - 176, height - compose_height + 11, 84, 44, win.TRUE);
+    if (a.compose) |hwnd| _ = win.MoveWindow(hwnd, left_width + 14, height - compose_height + 11, width - left_width - 258, 44, win.TRUE);
+    if (a.emoji_btn) |hwnd| _ = win.MoveWindow(hwnd, width - 236, height - compose_height + 11, 44, 44, win.TRUE);
+    if (a.dictate) |hwnd| _ = win.MoveWindow(hwnd, width - 184, height - compose_height + 11, 92, 44, win.TRUE);
     if (a.send) |hwnd| _ = win.MoveWindow(hwnd, width - 82, height - compose_height + 11, 68, 44, win.TRUE);
 }
 
@@ -1430,7 +1467,7 @@ fn drawCanvas(hwnd: win.HWND, a: *App) void {
         const len: c_int = if (message.text.len > 0) @intCast(message.text.len) else 1;
         _ = win.DrawTextW(hdc, text, len, &text_rect, win.DT_LEFT | win.DT_WORDBREAK | win.DT_NOPREFIX);
         if (message.reaction.len > 0) {
-            _ = win.SelectObject(hdc, @ptrCast(a.font.?));
+            _ = win.SelectObject(hdc, @ptrCast(a.font_emoji.?));
             _ = win.SetTextColor(hdc, color_text);
             var reaction_rect = win.RECT{ .left = left + 12, .top = y + height - 30, .right = left + 52, .bottom = y + height - 6 };
             _ = win.DrawTextW(hdc, message.reaction.ptr(), @intCast(message.reaction.len), &reaction_rect, win.DT_LEFT | win.DT_SINGLELINE | win.DT_VCENTER);
@@ -1521,21 +1558,25 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
             a.brush_bg = win.CreateSolidBrush(color_bg);
             a.brush_panel = win.CreateSolidBrush(color_panel);
             a.brush_raised = win.CreateSolidBrush(color_raised);
-            a.font = win.CreateFontW(-17, 0, 0, 0, win.FW_NORMAL, 0, 0, 0, win.DEFAULT_CHARSET, win.OUT_DEFAULT_PRECIS, win.CLIP_DEFAULT_PRECIS, win.CLEARTYPE_QUALITY, win.DEFAULT_PITCH, lit("IBM Plex Sans"));
+            // Body text uses Segoe UI: IBM Plex Sans has no emoji glyphs and no font-linking entry, so GDI renders emoji as tofu.
+            a.font = win.CreateFontW(-17, 0, 0, 0, win.FW_NORMAL, 0, 0, 0, win.DEFAULT_CHARSET, win.OUT_DEFAULT_PRECIS, win.CLIP_DEFAULT_PRECIS, win.CLEARTYPE_QUALITY, win.DEFAULT_PITCH, lit("Segoe UI"));
             a.font_small = win.CreateFontW(-13, 0, 0, 0, win.FW_NORMAL, 0, 0, 0, win.DEFAULT_CHARSET, win.OUT_DEFAULT_PRECIS, win.CLIP_DEFAULT_PRECIS, win.CLEARTYPE_QUALITY, win.DEFAULT_PITCH, lit("IBM Plex Sans"));
             a.font_bold = win.CreateFontW(-16, 0, 0, 0, win.FW_SEMIBOLD, 0, 0, 0, win.DEFAULT_CHARSET, win.OUT_DEFAULT_PRECIS, win.CLIP_DEFAULT_PRECIS, win.CLEARTYPE_QUALITY, win.DEFAULT_PITCH, lit("IBM Plex Sans"));
+            a.font_emoji = win.CreateFontW(-20, 0, 0, 0, win.FW_NORMAL, 0, 0, 0, win.DEFAULT_CHARSET, win.OUT_DEFAULT_PRECIS, win.CLIP_DEFAULT_PRECIS, win.CLEARTYPE_QUALITY, win.DEFAULT_PITCH, lit("Segoe UI Emoji"));
             a.search = win.CreateWindowExW(0, lit("EDIT"), null, win.WS_CHILD | win.WS_VISIBLE | win.WS_TABSTOP | win.ES_AUTOHSCROLL, 0, 0, 0, 0, hwnd, controlId(id_search), a.instance, null);
             a.chats_hwnd = win.CreateWindowExW(0, lit("LISTBOX"), null, win.WS_CHILD | win.WS_VISIBLE | win.WS_TABSTOP | win.WS_VSCROLL | win.LBS_NOTIFY | win.LBS_OWNERDRAWFIXED | win.LBS_NOINTEGRALHEIGHT, 0, 0, 0, 0, hwnd, controlId(id_chats), a.instance, null);
             a.canvas = win.CreateWindowExW(0, lit("WacliMessageCanvas"), null, win.WS_CHILD | win.WS_VISIBLE | win.WS_TABSTOP, 0, 0, 0, 0, hwnd, controlId(id_canvas), a.instance, null);
             a.compose = win.CreateWindowExW(0, lit("EDIT"), null, win.WS_CHILD | win.WS_VISIBLE | win.WS_TABSTOP | win.ES_MULTILINE | win.ES_AUTOVSCROLL | win.WS_VSCROLL, 0, 0, 0, 0, hwnd, controlId(id_compose), a.instance, null);
             a.dictate = win.CreateWindowExW(0, lit("BUTTON"), lit("Dictate"), win.WS_CHILD | win.WS_VISIBLE | win.WS_TABSTOP | win.BS_PUSHBUTTON, 0, 0, 0, 0, hwnd, controlId(id_dictate), a.instance, null);
             a.send = win.CreateWindowExW(0, lit("BUTTON"), lit("Send"), win.WS_CHILD | win.WS_VISIBLE | win.WS_TABSTOP | win.BS_PUSHBUTTON, 0, 0, 0, 0, hwnd, controlId(id_send), a.instance, null);
+            a.emoji_btn = win.CreateWindowExW(0, lit("BUTTON"), lit("😊"), win.WS_CHILD | win.WS_VISIBLE | win.WS_TABSTOP | win.BS_PUSHBUTTON, 0, 0, 0, 0, hwnd, controlId(id_emoji), a.instance, null);
             a.status = win.CreateWindowExW(0, lit("STATIC"), lit("Loading..."), win.WS_CHILD | win.WS_VISIBLE | win.SS_LEFT, 0, 0, 0, 0, hwnd, controlId(id_status), a.instance, null);
             setFont(a.search, a.font);
             setFont(a.chats_hwnd, a.font);
             setFont(a.compose, a.font);
             setFont(a.dictate, a.font_bold);
             setFont(a.send, a.font_bold);
+            setFont(a.emoji_btn, a.font_emoji);
             setFont(a.status, a.font_small);
             if (a.search) |search| _ = win.SendMessageW(search, win.EM_SETCUEBANNER, 1, @bitCast(@intFromPtr(lit("Search chats  Ctrl+F"))));
             if (a.chats_hwnd) |list| _ = win.SendMessageW(list, win.LB_SETITEMHEIGHT, 0, 64);
@@ -1597,6 +1638,8 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
                 sendMessage(a);
             } else if (id == id_dictate and notification == win.BN_CLICKED) {
                 runCommand(a, command_dictate);
+            } else if (id == id_emoji and notification == win.BN_CLICKED) {
+                openEmojiMenu(a);
             } else if (id == id_search and notification == win.EN_CHANGE) {
                 _ = win.KillTimer(hwnd, timer_search);
                 _ = win.SetTimer(hwnd, timer_search, 240, null);
@@ -1652,6 +1695,7 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
             if (a.font) |font| _ = win.DeleteObject(font);
             if (a.font_small) |font| _ = win.DeleteObject(font);
             if (a.font_bold) |font| _ = win.DeleteObject(font);
+            if (a.font_emoji) |font| _ = win.DeleteObject(font);
             if (a.brush_bg) |brush| _ = win.DeleteObject(brush);
             if (a.brush_panel) |brush| _ = win.DeleteObject(brush);
             if (a.brush_raised) |brush| _ = win.DeleteObject(brush);
