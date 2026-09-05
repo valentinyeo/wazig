@@ -689,13 +689,15 @@ fn markChatRead(a: *App) void {
     if (!a.user_viewed or a.selected_chat >= a.chat_count) return;
     const chat = &a.chats[a.selected_chat];
     if (!chat.unread and chat.unread_count == 0) return;
-    chat.unread = false;
-    chat.unread_count = 0;
+    // Clear the badge only once the request is queued: if the queue is
+    // full, keep the unread state so the next view of this chat retries.
     if (a.pending_read_count < a.pending_reads.len) {
         a.pending_reads[a.pending_read_count].set(chat.jid.slice());
         a.pending_read_count += 1;
+        chat.unread = false;
+        chat.unread_count = 0;
+        if (a.chats_hwnd) |list| _ = win.InvalidateRect(list, null, win.TRUE);
     }
-    if (a.chats_hwnd) |list| _ = win.InvalidateRect(list, null, win.TRUE);
     startNextMarkRead(a);
 }
 
