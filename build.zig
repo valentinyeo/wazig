@@ -79,11 +79,12 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(exe);
 
     const test_step = b.step("test", "Run unit tests");
+    // Host target: the tests must run on the CI machine even when the exe is
+    // cross-compiled for Windows.
     const webp_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/webp.zig"),
-            .target = target,
-            .optimize = optimize,
+            .target = b.resolveTargetQuery(.{}),
         }),
     });
     const run_webp_tests = b.addRunArtifact(webp_tests);

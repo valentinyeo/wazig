@@ -1249,7 +1249,8 @@ fn ensureBitmap(a: *App, message: *Message) void {
 }
 
 // Windows WIC has no WebP codec, so stickers (WebP files) would never render.
-// Decode them with the vendored libwebp; for animated stickers this returns the
+// Decode them with the vendored libwebp; animated stickers are handled by
+// firstAnimationFrame (the simple API cannot decode animation) and show the
 // first frame. ponytail: frames are not animated on screen; use WebPAnimDecoder
 // (vendor src/demux) if stickers should move later.
 fn ensureWebPBitmap(a: *App, message: *Message) void {
@@ -1260,9 +1261,14 @@ fn ensureWebPBitmap(a: *App, message: *Message) void {
     if (!webp_detect.isWebPBytes(data)) return;
     var width: c_int = 0;
     var height: c_int = 0;
-    const pixels = webp.WebPDecodeRGBA(data.ptr, data.len, &width, &height) orelse return;
+    var pixels = webp.WebPDecodeRGBA(data.ptr, data.len, &width, &height);
+    if (pixels == null) {
+        if (webp_detect.firstAnimationFrame(data)) |frame| {
+            pixels = webp.WebPDecodeRGBA(frame.ptr, frame.len, &width, &height);
+        }
+    }
     defer webp.WebPFree(pixels);
-    if (width <= 0 or height <= 0) return;
+    if (pixels == null or width <= 0 or height <= 0) return;
 
     // Wrap the decoded pixels as a WIC bitmap so the shared convert/scale/DIB
     // path can be reused.
