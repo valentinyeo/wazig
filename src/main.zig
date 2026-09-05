@@ -63,6 +63,28 @@ fn rgb(r: u8, g: u8, b: u8) win.COLORREF {
     return @as(win.COLORREF, r) | (@as(win.COLORREF, g) << 8) | (@as(win.COLORREF, b) << 16);
 }
 
+// Palette readable on the dark incoming bubble; FNV-1a over the sender JID
+// keeps each person's color stable across sessions.
+const sender_palette = [_]win.COLORREF{
+    rgb(101, 195, 245), // light blue
+    rgb(73, 209, 189), // teal
+    rgb(250, 173, 92), // orange
+    rgb(191, 149, 244), // violet
+    rgb(246, 131, 184), // pink
+    rgb(134, 213, 118), // green
+    rgb(122, 222, 230), // cyan
+    rgb(238, 216, 110), // gold
+};
+
+fn senderColor(jid: []const u8) win.COLORREF {
+    var hash: u32 = 0x811c9dc5;
+    for (jid) |byte| {
+        hash ^= byte;
+        hash = hash *% 0x01000193;
+    }
+    return sender_palette[hash % sender_palette.len];
+}
+
 fn WideText(comptime capacity: usize) type {
     return struct {
         buf: [capacity + 1]u16 = [_]u16{0} ** (capacity + 1),
@@ -1653,7 +1675,13 @@ fn drawCanvas(hwnd: win.HWND, a: *App) void {
         var text_top = y + 8;
         if (show_sender) {
             _ = win.SelectObject(hdc, @ptrCast(a.font_bold.?));
-            _ = win.SetTextColor(hdc, if (message.from_me) color_text else rgb(83, 189, 235));
+            const in_group = std.mem.endsWith(u8, a.chats[a.selected_chat].jid.slice(), "@g.us");
+            _ = win.SetTextColor(hdc, if (message.from_me)
+                color_text
+            else if (in_group)
+                senderColor(if (message.sender_jid.len > 0) message.sender_jid.slice() else "unknown")
+            else
+                rgb(83, 189, 235));
             var sender_rect = win.RECT{ .left = left + 12, .top = y + 8, .right = right - 52, .bottom = y + 28 };
             _ = win.DrawTextW(hdc, message.sender.ptr(), @intCast(message.sender.len), &sender_rect, win.DT_LEFT | win.DT_SINGLELINE | win.DT_END_ELLIPSIS);
             text_top = y + 28;
