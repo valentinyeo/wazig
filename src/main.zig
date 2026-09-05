@@ -738,11 +738,16 @@ fn loadPlayed(a: *App) void {
     const contents = readFileWin(a.allocator, a.played_path, 128 * 1024) orelse return;
     defer a.allocator.free(contents);
     var lines = std.mem.tokenizeAny(u8, contents, "\r\n");
+    // Keep the newest a.played.len entries: the file is append-only and
+    // the ring wraps, so parsing head-first would restore only the
+    // oldest hashes and recent messages would come back unplayed.
+    var total: usize = 0;
     while (lines.next()) |line| {
-        if (a.played_count >= a.played.len) break;
-        a.played[a.played_count] = std.fmt.parseInt(u64, line, 16) catch continue;
-        a.played_count += 1;
+        const hash = std.fmt.parseInt(u64, line, 16) catch continue;
+        a.played[total % a.played.len] = hash;
+        total += 1;
     }
+    a.played_count = @min(total, a.played.len);
 }
 
 fn markPlayed(a: *App, id: []const u8) void {
@@ -759,6 +764,12 @@ fn markPlayed(a: *App, id: []const u8) void {
     if (readFileWin(a.allocator, a.played_path, 128 * 1024)) |existing| {
         defer a.allocator.free(existing);
         contents.appendSlice(a.allocator, existing) catch return;
+    } else {
+        // Only start a fresh store when the file genuinely does not
+        // exist; a transient read failure must not truncate it.
+        const wide = std.unicode.utf8ToUtf16LeAllocZ(a.allocator, a.played_path) catch return;
+        defer a.allocator.free(wide);
+        if (win.GetFileAttributesW(wide.ptr) != win.INVALID_FILE_ATTRIBUTES) return;
     }
     contents.appendSlice(a.allocator, line) catch return;
     writeFileWin(a.played_path, contents.items);
