@@ -28,16 +28,13 @@ pub fn build(b: *std.Build) void {
     }
     b.installArtifact(exe);
 
-    // Tests must target Windows because main.zig @cImports windows.h; run them
-    // under Windows (CI) or wine locally.
     const tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/main.zig"),
-            .target = b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .windows, .abi = .gnu }),
+            .root_source_file = b.path("src/emoji_picker.zig"),
+            .target = target,
             .optimize = optimize,
         }),
     });
-    tests.root_module.link_libc = true;
     const run_tests = b.addRunArtifact(tests);
     b.step("test", "Run unit tests").dependOn(&run_tests.step);
 

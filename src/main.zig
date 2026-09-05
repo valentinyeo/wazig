@@ -26,8 +26,11 @@ const id_compose = 1032;
 const id_send = 1040;
 const id_status = 1048;
 const id_dictate = 1056;
+const emoji_picker = @import("emoji_picker.zig");
+const picker_emojis = emoji_picker.picker_emojis;
+const picker_base = emoji_picker.picker_base;
+const pickerEmojiForCommand = emoji_picker.pickerEmojiForCommand;
 const id_emoji = 1064;
-const picker_base = 3101;
 const command_search = 2001;
 const command_compose = 2002;
 const command_unread = 2003;
@@ -917,14 +920,6 @@ fn selectMessage(a: *App, delta: i32) void {
     }
 }
 
-const picker_emojis = [_][]const u8{ "👍", "❤️", "😂", "😮", "😢", "🙏", "👏", "🔥", "🎉", "🥰", "😭", "😅", "😉", "🤔", "😊", "😍" };
-
-fn pickerEmojiForCommand(command: u16) ?[]const u8 {
-    const index = command -% picker_base;
-    if (index < picker_emojis.len) return picker_emojis[index];
-    return null;
-}
-
 fn reactionForCommand(command: u16) ?[]const u8 {
     return switch (command) {
         reaction_like => "👍",
@@ -1096,15 +1091,6 @@ fn runCommand(a: *App, command: u16) void {
         },
         else => reactToSelected(a, command),
     }
-}
-
-test "picker command ids map to the picker emojis" {
-    for (picker_emojis, 0..) |emoji, index| {
-        try std.testing.expectEqualStrings(emoji, pickerEmojiForCommand(picker_base + @as(u16, @intCast(index))).?);
-    }
-    try std.testing.expectEqual(@as(?[]const u8, null), pickerEmojiForCommand(picker_base + picker_emojis.len));
-    try std.testing.expectEqual(@as(?[]const u8, null), pickerEmojiForCommand(0));
-    try std.testing.expectEqual(@as(?[]const u8, null), pickerEmojiForCommand(reaction_like));
 }
 
 fn layout(a: *App, width: i32, height: i32) void {
