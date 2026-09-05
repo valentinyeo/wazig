@@ -850,7 +850,6 @@ fn playVideoInline(a: *App, message: *const Message) void {
     _ = win.ShowWindow(hwnd, win.SW_SHOW);
 }
 
-
 fn advanceGifs(a: *App) void {
     var changed = false;
     for (a.messages[0..a.message_count]) |*message| {
