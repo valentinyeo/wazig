@@ -381,7 +381,7 @@ fn createTooltips(a: *App, hwnd: win.HWND) void {
     // TTM_SETMAXWIDTH (WM_USER + 24); not exposed by the commctrl.h import
     _ = win.SendMessageW(tt, 0x400 + 24, 0, 260);
     addTooltip(tt, a.search, lit("Search chats  Ctrl+F or /"));
-    addTooltip(tt, a.chats_hwnd, lit("Chats  ↑/↓ or J/K move · Ctrl+Tab next chat"));
+    addTooltip(tt, a.chats_hwnd, lit("Chats  ↑/↓ move · Ctrl+Tab next chat"));
     addTooltip(tt, a.canvas, lit("Messages  Alt+J/K select · Ctrl+P play voice · Ctrl+T transcript · Ctrl+R react"));
     addTooltip(tt, a.compose, lit("Message box  Enter sends · Shift+Enter new line"));
     addTooltip(tt, a.dictate, lit("Dictate  Ctrl+D"));
