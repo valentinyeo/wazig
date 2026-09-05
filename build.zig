@@ -78,18 +78,6 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addWin32ResourceFile(.{ .file = b.path("assets/app.rc") });
     b.installArtifact(exe);
 
-    const test_step = b.step("test", "Run unit tests");
-    // Host target: the tests must run on the CI machine even when the exe is
-    // cross-compiled for Windows.
-    const webp_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/webp.zig"),
-            .target = b.resolveTargetQuery(.{}),
-        }),
-    });
-    const run_webp_tests = b.addRunArtifact(webp_tests);
-    test_step.dependOn(&run_webp_tests.step);
-
     b.installFile("assets/IBMPlexSans-Regular.ttf", "bin/IBMPlexSans-Regular.ttf");
     b.installFile("assets/IBMPlexSans-SemiBold.ttf", "bin/IBMPlexSans-SemiBold.ttf");
     b.installFile("assets/IBM-Plex-LICENSE.txt", "bin/IBM-Plex-LICENSE.txt");
@@ -107,4 +95,14 @@ pub fn build(b: *std.Build) void {
         const run_tests = b.addRunArtifact(tests);
         test_step.dependOn(&run_tests.step);
     }
+    // webp.zig tests use the host target: they must run on the CI machine
+    // even when the exe is cross-compiled for Windows.
+    const webp_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/webp.zig"),
+            .target = b.resolveTargetQuery(.{}),
+        }),
+    });
+    const run_webp_tests = b.addRunArtifact(webp_tests);
+    test_step.dependOn(&run_webp_tests.step);
 }
