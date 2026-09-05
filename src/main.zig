@@ -1699,7 +1699,6 @@ fn drawCanvas(hwnd: win.HWND, a: *App) void {
         if (in_group and !message.from_me and message.sender.len > 0) drawSenderAvatar(hdc, a, left - 38, y + 8, message);
         if (show_sender) {
             _ = win.SelectObject(hdc, @ptrCast(a.font_bold.?));
-            const in_group = std.mem.endsWith(u8, a.chats[a.selected_chat].jid.slice(), "@g.us");
             _ = win.SetTextColor(hdc, if (message.from_me)
                 color_text
             else if (in_group)
