@@ -21,6 +21,7 @@ const max_messages = 100;
 const timer_refresh = 1;
 const timer_search = 2;
 const timer_animation = 3;
+const wm_chain_next = win.WM_APP + 1; // wparam 0 = playback ended, 1 = playback failed
 const id_search = 1008;
 const id_chats = 1016;
 const id_canvas = 1024;
@@ -218,6 +219,7 @@ const App = struct {
     audio_player: ?*win.IMFPMediaPlayer = null,
     audio_rate: f64 = 1.0,
     audio_message_id: Utf8Text(191) = .{},
+    pending_id: Utf8Text(191) = .{},
     displayed_jid: Utf8Text(191) = .{},
     displayed_timestamp: Utf8Text(47) = .{},
     played: [2048]u64 = [_]u64{0} ** 2048,
@@ -604,6 +606,24 @@ fn isGif(message: *const Message) bool {
     return std.ascii.eqlIgnoreCase(message.mime_type.slice(), "image/gif");
 }
 
+/// Index of the first audio message strictly after the one with `after_id`, or null.
+/// Null when after_id is empty, not found, or no audio follows it.
+fn nextAudioIndex(messages: []const Message, after_id: []const u8) ?usize {
+    if (after_id.len == 0) return null;
+    var start: ?usize = null;
+    for (messages, 0..) |*message, index| {
+        if (std.mem.eql(u8, message.id.slice(), after_id)) {
+            start = index + 1;
+            break;
+        }
+    }
+    const from = start orelse return null;
+    for (messages[from..], from..) |*message, index| {
+        if (isAudio(message) and message.id.len > 0) return index;
+    }
+    return null;
+}
+
 fn ensureVideoBitmap(message: *Message) void {
     var factory: [*c]win.IShellItemImageFactory = null;
     if (win.SHCreateItemFromParsingName(message.local_path.ptr(), null, &win.IID_IShellItemImageFactory, @ptrCast(&factory)) < 0 or factory == null) return;
@@ -782,6 +802,15 @@ fn mediaWasAttempted(a: *App, id: []const u8) bool {
 
 fn autoDownloadNextMedia(a: *App) void {
     if (a.media_child != null) return;
+    // keep an autoplay chain moving if its download is still missing
+    if (a.pending_id.len > 0) {
+        for (a.messages[0..a.message_count], 0..) |*message, index| {
+            if (!std.mem.eql(u8, message.id.slice(), a.pending_id.slice())) continue;
+            if (message.local_path.len == 0 and !mediaWasAttempted(a, message.id.slice())) downloadMedia(a, index, true);
+            break;
+        }
+        return;
+    }
     for (a.messages[0..a.message_count], 0..) |*message, index| {
         if ((!isImage(message) and !isVideo(message)) or message.local_path.len > 0 or message.id.len == 0) continue;
         if (mediaWasAttempted(a, message.id.slice())) continue;
@@ -799,6 +828,20 @@ fn checkMediaDownload(a: *App) void {
         a.media_child = null;
         startSync(a);
         refreshMessages(a);
+        if (a.pending_id.len > 0) {
+            if (code != 0) {
+                closeAudioPlayer(a);
+                setStatus(a, "Download failed or the attachment expired");
+                return;
+            }
+            for (a.messages[0..a.message_count]) |*message| {
+                if (std.mem.eql(u8, message.id.slice(), a.pending_id.slice())) {
+                    if (message.local_path.len > 0) playVoiceNote(a, message);
+                    break;
+                }
+            }
+            return;
+        }
         setStatus(a, if (code == 0) "Attachment downloaded" else "Download failed or the attachment expired");
     }
 }
@@ -854,11 +897,19 @@ fn playerCallbackRelease(_: [*c]win.IMFPMediaPlayerCallback) callconv(.c) win.UL
 
 fn playerCallbackEvent(_: [*c]win.IMFPMediaPlayerCallback, event: [*c]win.MFP_EVENT_HEADER) callconv(.c) void {
     if (event == null) return;
-    if (event.*.eEventType == win.MFP_EVENT_TYPE_ERROR) {
-        if (app_ptr) |a| {
-            if (a.player_window) |hwnd| _ = win.SetWindowTextW(hwnd, lit("Messages · Video (playback failed)"));
-            if (a.audio_window) |hwnd| _ = win.SetWindowTextW(hwnd, lit("Messages · Voice note (playback failed)"));
-        }
+    switch (event.*.eEventType) {
+        win.MFP_EVENT_TYPE_ERROR => {
+            // never touch player state here; the callback runs on a Media Foundation thread
+            if (app_ptr) |a| {
+                if (a.hwnd) |hwnd| _ = win.PostMessageW(hwnd, wm_chain_next, 1, 0);
+            }
+        },
+        win.MFP_EVENT_TYPE_PLAYBACK_ENDED => {
+            if (app_ptr) |a| {
+                if (a.hwnd) |hwnd| _ = win.PostMessageW(hwnd, wm_chain_next, 0, 0);
+            }
+        },
+        else => {},
     }
 }
 
@@ -1037,6 +1088,7 @@ fn closeAudioPlayer(a: *App) void {
         _ = win.DestroyWindow(hwnd);
     }
     a.audio_rate = 1.0;
+    a.pending_id.set("");
 }
 
 fn drawAudioPlayer(hwnd: win.HWND, a: *App) void {
@@ -1182,6 +1234,41 @@ fn playVoiceNote(a: *App, message: *const Message) void {
 
 var audio_class_registered: bool = false;
 
+/// Called on the UI thread when playback ends (wparam 0) or fails (wparam 1).
+/// Video keeps its old behavior: only voice notes chain.
+fn advanceAudioChain(a: *App, failed: bool) void {
+    const playing_audio = a.audio_player != null and a.audio_message_id.len > 0;
+    if (!playing_audio) {
+        if (failed) {
+            if (a.player_window) |hwnd| _ = win.SetWindowTextW(hwnd, lit("Messages · Video (playback failed)"));
+        }
+        return;
+    }
+    if (failed) {
+        closeAudioPlayer(a);
+        setStatus(a, "Playback failed");
+        return;
+    }
+    const next = nextAudioIndex(a.messages[0..a.message_count], a.audio_message_id.slice()) orelse {
+        closeAudioPlayer(a);
+        setStatus(a, "End of voice notes");
+        if (a.canvas) |canvas| _ = win.InvalidateRect(canvas, null, win.TRUE);
+        return;
+    };
+    const message = &a.messages[next];
+    if (message.local_path.len > 0) {
+        playVoiceNote(a, message);
+    } else if (!mediaWasAttempted(a, message.id.slice())) {
+        const pending_id = message.id.slice();
+        a.pending_id.set(pending_id);
+        downloadMedia(a, next, true);
+    } else {
+        closeAudioPlayer(a);
+        setStatus(a, "Could not download the next voice note");
+    }
+    if (a.canvas) |canvas| _ = win.InvalidateRect(canvas, null, win.TRUE);
+}
+
 fn advanceGifs(a: *App) void {
     var changed = false;
     for (a.messages[0..a.message_count]) |*message| {
@@ -1298,6 +1385,11 @@ fn refreshMessages(a: *App) void {
         }
     }
     a.scroll_y = 0;
+    if (!std.mem.eql(u8, a.displayed_jid.slice(), chat.jid.slice())) {
+        // the user switched chats: an autoplay chain belongs to the previous chat
+        closeAudioPlayer(a);
+        a.pending_id.set("");
+    }
     a.displayed_jid.set(chat.jid.slice());
     a.displayed_timestamp.set(chat.timestamp.slice());
     if (a.canvas) |canvas| _ = win.InvalidateRect(canvas, null, win.TRUE);
@@ -1902,6 +1994,7 @@ fn canvasProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win
                 if (x >= media.left and x <= media.right and y >= media.top and y <= media.bottom) {
                     a.selected_message = index;
                     if ((isVideo(item) or isAudio(item)) and item.local_path.len > 0) {
+                        a.pending_id.set("");
                         openMedia(a, item);
                         return 0;
                     }
@@ -2016,6 +2109,10 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
                 _ = win.KillTimer(hwnd, timer_search);
                 _ = win.SetTimer(hwnd, timer_search, 240, null);
             }
+            return 0;
+        },
+        wm_chain_next => {
+            advanceAudioChain(a, wparam != 0);
             return 0;
         },
         win.WM_TIMER => {
@@ -2340,4 +2437,19 @@ test fileUrl {
     const utf8 = try std.unicode.utf16LeToUtf8Alloc(std.testing.allocator, url);
     defer std.testing.allocator.free(utf8);
     try std.testing.expectEqualStrings("file:///C:/Users", utf8);
+}
+
+test nextAudioIndex {
+    var messages = [_]Message{ .{}, .{}, .{} };
+    messages[0].id.set("AAA");
+    messages[0].media_type.set("audio");
+    messages[1].id.set("BBB");
+    messages[1].media_type.set("audio");
+    messages[2].id.set("CCC");
+    try std.testing.expectEqual(@as(usize, 1), nextAudioIndex(&messages, "AAA").?);
+    try std.testing.expect(nextAudioIndex(&messages, "BBB") == null);
+    try std.testing.expect(nextAudioIndex(&messages, "ZZZ") == null);
+    try std.testing.expect(nextAudioIndex(&messages, "") == null);
+    messages[2].media_type.set("audio");
+    try std.testing.expectEqual(@as(usize, 2), nextAudioIndex(&messages, "BBB").?);
 }
