@@ -23,13 +23,21 @@ pub fn firstAnimationFrame(data: []const u8) ?[]const u8 {
     while (offset + 8 <= data.len) {
         const size = chunkSizeAt(data, offset) orelse return null;
         if (std.mem.eql(u8, data[offset .. offset + 4], "ANMF")) {
-            // ANMF payload: 16-byte frame header, then the VP8/VP8L chunk.
+            // ANMF payload: 16-byte frame header, then optional ALPH chunk and
+            // the VP8/VP8L chunk.
             var inner = offset + 8 + 16;
             const inner_size = chunkSizeAt(data, inner) orelse return null;
+            if (std.mem.eql(u8, data[inner .. inner + 4], "ALPH")) {
+                // ponytail: the bare VP8 payload decodes without the alpha
+                // plane, so lossy-with-alpha stickers lose transparency; the
+                // upgrade path is WebPAnimDecoder (vendor src/demux).
+                inner += 8 + inner_size + (inner_size & 1);
+            }
+            const bitstream_size = chunkSizeAt(data, inner) orelse return null;
             if (std.mem.startsWith(u8, data[inner .. inner + 4], "VP8")) {
                 inner += 8;
-                if (inner + inner_size > data.len) return null;
-                return data[inner .. inner + inner_size];
+                if (inner + bitstream_size > data.len) return null;
+                return data[inner .. inner + bitstream_size];
             }
             return null;
         }
@@ -47,7 +55,7 @@ test "isWebPBytes detects the RIFF/WEBP container signature" {
 }
 
 test "firstAnimationFrame extracts the VP8 payload of the first ANMF chunk" {
-    var data: [80]u8 = undefined;
+    var data: [66]u8 = undefined;
     @memcpy(data[0..12], "RIFF" ++ "\x40\x00\x00\x00" ++ "WEBP");
     @memcpy(data[12..20], "VP8X" ++ "\x0a\x00\x00\x00");
     @memset(data[20..30], 0);
@@ -56,5 +64,18 @@ test "firstAnimationFrame extracts the VP8 payload of the first ANMF chunk" {
     @memcpy(data[54..62], "VP8 " ++ "\x04\x00\x00\x00");
     @memcpy(data[62..66], "bits");
     try std.testing.expectEqualSlices(u8, "bits", firstAnimationFrame(&data).?);
+
+    // ANMF frame with an ALPH chunk before the VP8 bitstream.
+    var alpha: [82]u8 = undefined;
+    @memcpy(alpha[0..12], "RIFF" ++ "\x4a\x00\x00\x00" ++ "WEBP");
+    @memcpy(alpha[12..20], "VP8X" ++ "\x0a\x00\x00\x00");
+    @memset(alpha[20..30], 0);
+    @memcpy(alpha[30..38], "ANMF" ++ "\x2c\x00\x00\x00");
+    @memset(alpha[38..54], 0); // 16-byte frame header
+    @memcpy(alpha[54..62], "ALPH" ++ "\x04\x00\x00\x00");
+    @memcpy(alpha[62..66], "alph");
+    @memcpy(alpha[66..74], "VP8 " ++ "\x04\x00\x00\x00");
+    @memcpy(alpha[74..78], "bits");
+    try std.testing.expectEqualSlices(u8, "bits", firstAnimationFrame(&alpha).?);
     try std.testing.expect(firstAnimationFrame("RIFFshort") == null);
 }
