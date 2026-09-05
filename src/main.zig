@@ -316,6 +316,9 @@ const App = struct {
     wic_factory: [*c]win.IWICImagingFactory = null,
     displayed_jid: Utf8Text(191) = .{},
     displayed_timestamp: Utf8Text(47) = .{},
+    played: [2048]u64 = [_]u64{0} ** 2048,
+    played_count: usize = 0,
+    played_path: []u8 = &.{},
     store_watch_path: WideText(519) = .{},
     last_store_write: u64 = 0,
 };
@@ -724,6 +727,43 @@ fn isAudio(message: *const Message) bool {
     return std.ascii.eqlIgnoreCase(message.media_type.slice(), "audio");
 }
 
+fn wasPlayed(a: *App, id: []const u8) bool {
+    const hash = std.hash.Wyhash.hash(0, id);
+    for (a.played[0..@min(a.played_count, a.played.len)]) |entry| if (entry == hash) return true;
+    return false;
+}
+
+fn loadPlayed(a: *App) void {
+    if (a.played_path.len == 0) return;
+    const contents = readFileWin(a.allocator, a.played_path, 128 * 1024) orelse return;
+    defer a.allocator.free(contents);
+    var lines = std.mem.tokenizeAny(u8, contents, "\r\n");
+    while (lines.next()) |line| {
+        if (a.played_count >= a.played.len) break;
+        a.played[a.played_count] = std.fmt.parseInt(u64, line, 16) catch continue;
+        a.played_count += 1;
+    }
+}
+
+fn markPlayed(a: *App, id: []const u8) void {
+    if (id.len == 0 or wasPlayed(a, id)) return;
+    const hash = std.hash.Wyhash.hash(0, id);
+    // ponytail: fixed 2048-entry ring; once full, oldest entries are overwritten and fall back to unplayed
+    a.played[a.played_count % a.played.len] = hash;
+    a.played_count += 1;
+    if (a.played_path.len == 0) return;
+    var buffer: [40]u8 = undefined;
+    const line = std.fmt.bufPrint(&buffer, "{x}\n", .{hash}) catch return;
+    var contents = std.ArrayList(u8).empty;
+    defer contents.deinit(a.allocator);
+    if (readFileWin(a.allocator, a.played_path, 128 * 1024)) |existing| {
+        defer a.allocator.free(existing);
+        contents.appendSlice(a.allocator, existing) catch return;
+    }
+    contents.appendSlice(a.allocator, line) catch return;
+    writeFileWin(a.played_path, contents.items);
+}
+
 fn ensureAudioPlayer(a: *App) ?*audio.Player {
     if (a.audio_player) |player| return player;
     a.audio_player = audio.Player.create(a.allocator, a.io) catch null;
@@ -753,6 +793,7 @@ fn startAudioPlayback(a: *App, message: *Message) void {
     a.audio_position_ms = 0;
     a.audio_duration_ms = 0;
     setStatus(a, "Playing voice message...");
+    markPlayed(a, message.id.slice());
 }
 
 fn toggleAudio(a: *App, message: *Message) void {
@@ -3193,7 +3234,7 @@ fn drawCanvas(hwnd: win.HWND, a: *App) void {
                 _ = win.DrawTextW(hdc, lit("Voice message · click to download"), -1, &media_rect, win.DT_CENTER | win.DT_SINGLELINE | win.DT_VCENTER);
             } else {
                 const playing_now = active and a.audio_state == .playing;
-                const button_brush = win.CreateSolidBrush(color_accent) orelse continue;
+                const button_brush = win.CreateSolidBrush(if (wasPlayed(a, message.id.slice()) and !active) color_muted else color_accent) orelse continue;
                 const glyph_brush = win.CreateSolidBrush(color_text) orelse {
                     _ = win.DeleteObject(button_brush);
                     continue;
@@ -3912,6 +3953,8 @@ pub fn main(init: std.process.Init) !void {
     if (openrouter_model.len == 0) openrouter_model = "openai/gpt-5.6-luna";
     var app = App{ .allocator = init.gpa, .io = init.io, .instance = instance, .wacli_path = wacli_path, .avatar_dir = avatar_dir, .deepgram_configured = deepgram_key.len > 0, .deepgram_key = deepgram_key, .openrouter_key = openrouter_key, .openrouter_model = openrouter_model, .openrouter_configured = openrouter_key.len > 0, .dictation_language = loadDictationLanguage(), .font_scale = loadFontScale() };
     app.store_watch_path.set(init.gpa, store_watch_path);
+    app.played_path = std.fs.path.join(init.gpa, &.{ avatar_dir, "..", "played.txt" }) catch &.{};
+    loadPlayed(&app);
     app_ptr = &app;
     defer app_ptr = null;
 
@@ -4034,4 +4077,15 @@ pub fn main(init: std.process.Init) !void {
         _ = win.TranslateMessage(&message);
         _ = win.DispatchMessageW(&message);
     }
+}
+
+test "played tracking dedups and persists in memory" {
+    var app = App{ .allocator = std.testing.allocator, .io = std.testing.io };
+    markPlayed(&app, "msg-1");
+    markPlayed(&app, "msg-2");
+    markPlayed(&app, "msg-1");
+    try std.testing.expect(wasPlayed(&app, "msg-1"));
+    try std.testing.expect(wasPlayed(&app, "msg-2"));
+    try std.testing.expect(!wasPlayed(&app, "msg-3"));
+    try std.testing.expectEqual(@as(usize, 2), app.played_count);
 }
