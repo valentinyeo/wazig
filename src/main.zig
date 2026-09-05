@@ -33,6 +33,10 @@ const picker_emojis = emoji_picker.picker_emojis;
 const picker_base = emoji_picker.picker_base;
 const pickerEmojiForCommand = emoji_picker.pickerEmojiForCommand;
 const id_emoji = 1064;
+const avatar_cache = @import("avatar_cache.zig");
+const avatar_size: i32 = 42;
+const avatar_rect_left = 12;
+const avatar_rect_top = 10;
 const command_search = 2001;
 const command_compose = 2002;
 const command_unread = 2003;
@@ -145,6 +149,16 @@ const Group = struct {
     name: Utf8Text(255) = .{},
 };
 
+const AvatarState = enum { none, ready, failed };
+
+const Avatar = struct {
+    jid: Utf8Text(191) = .{},
+    bitmap: ?win.HBITMAP = null,
+    bitmap_width: i32 = 0,
+    bitmap_height: i32 = 0,
+    state: AvatarState = .none,
+};
+
 const Message = struct {
     id: Utf8Text(191) = .{},
     sender_jid: Utf8Text(191) = .{},
@@ -191,6 +205,9 @@ const App = struct {
     brush_raised: ?win.HBRUSH = null,
     chats: [max_chats]Chat = [_]Chat{.{}} ** max_chats,
     chat_count: usize = 0,
+    avatars: [max_chats]Avatar = [_]Avatar{.{}} ** max_chats,
+    avatar_count: usize = 0,
+    avatar_dir: []u8 = &.{},
     groups: [max_groups]Group = [_]Group{.{}} ** max_groups,
     group_count: usize = 0,
     messages: [max_messages]Message = [_]Message{.{}} ** max_messages,
@@ -528,6 +545,202 @@ fn refreshChats(a: *App) void {
     var status_buffer: [64]u8 = undefined;
     const status = std.fmt.bufPrint(&status_buffer, "{d} chats", .{a.chat_count}) catch "Chats loaded";
     setStatus(a, status);
+}
+
+fn avatarFor(a: *App, jid: []const u8) ?*Avatar {
+    if (jid.len == 0 or jid.len > 191) return null;
+    for (a.avatars[0..a.avatar_count]) |*avatar| {
+        if (std.mem.eql(u8, avatar.jid.slice(), jid)) return avatar;
+    }
+    if (a.avatar_count >= a.avatars.len) return null;
+    const avatar = &a.avatars[a.avatar_count];
+    avatar.* = .{};
+    avatar.jid.set(jid);
+    a.avatar_count += 1;
+    return avatar;
+}
+
+fn invalidateChatList(a: *App) void {
+    if (a.chats_hwnd) |list| _ = win.InvalidateRect(list, null, win.TRUE);
+}
+
+fn decodeAvatarFile(a: *App, wide_path: [*:0]const u16) ?win.HBITMAP {
+    if (a.wic_factory == null) return null;
+    var decoder: [*c]win.IWICBitmapDecoder = null;
+    if (a.wic_factory.*.lpVtbl.*.CreateDecoderFromFilename.?(
+        a.wic_factory,
+        wide_path,
+        null,
+        win.GENERIC_READ,
+        win.WICDecodeMetadataCacheOnLoad,
+        &decoder,
+    ) < 0 or decoder == null) return null;
+    defer _ = decoder.*.lpVtbl.*.Release.?(decoder);
+    var frame: [*c]win.IWICBitmapFrameDecode = null;
+    if (decoder.*.lpVtbl.*.GetFrame.?(decoder, 0, &frame) < 0 or frame == null) return null;
+    defer _ = frame.*.lpVtbl.*.Release.?(frame);
+    var source_width: win.UINT = 0;
+    var source_height: win.UINT = 0;
+    if (frame.*.lpVtbl.*.GetSize.?(@ptrCast(frame), &source_width, &source_height) < 0 or source_width == 0 or source_height == 0) return null;
+
+    var target_width: win.UINT = @intCast(avatar_size);
+    var target_height: win.UINT = @intCast(avatar_size);
+    // Fit inside the avatar square while keeping the picture's aspect ratio.
+    if (source_width > source_height) {
+        target_height = @intCast(@max(1, @divTrunc(@as(u64, source_height) * target_width, source_width)));
+    } else {
+        target_width = @intCast(@max(1, @divTrunc(@as(u64, source_width) * target_height, source_height)));
+    }
+
+    var converter: [*c]win.IWICFormatConverter = null;
+    if (a.wic_factory.*.lpVtbl.*.CreateFormatConverter.?(a.wic_factory, &converter) < 0 or converter == null) return null;
+    defer _ = converter.*.lpVtbl.*.Release.?(converter);
+    if (converter.*.lpVtbl.*.Initialize.?(
+        converter,
+        @ptrCast(frame),
+        &win.GUID_WICPixelFormat32bppPBGRA,
+        win.WICBitmapDitherTypeNone,
+        null,
+        0,
+        win.WICBitmapPaletteTypeCustom,
+    ) < 0) return null;
+
+    var scaler: [*c]win.IWICBitmapScaler = null;
+    if (a.wic_factory.*.lpVtbl.*.CreateBitmapScaler.?(a.wic_factory, &scaler) < 0 or scaler == null) return null;
+    defer _ = scaler.*.lpVtbl.*.Release.?(scaler);
+    if (scaler.*.lpVtbl.*.Initialize.?(scaler, @ptrCast(converter), target_width, target_height, win.WICBitmapInterpolationModeFant) < 0) return null;
+
+    const stride: win.UINT = target_width * 4;
+    const byte_count: win.UINT = stride * target_height;
+    const pixels = a.allocator.alloc(u8, byte_count) catch return null;
+    defer a.allocator.free(pixels);
+    if (scaler.*.lpVtbl.*.CopyPixels.?(@ptrCast(scaler), null, stride, byte_count, pixels.ptr) < 0) return null;
+
+    var info = std.mem.zeroes(win.BITMAPINFO);
+    info.bmiHeader.biSize = @sizeOf(win.BITMAPINFOHEADER);
+    info.bmiHeader.biWidth = @intCast(target_width);
+    info.bmiHeader.biHeight = -@as(c_int, @intCast(target_height));
+    info.bmiHeader.biPlanes = 1;
+    info.bmiHeader.biBitCount = 32;
+    info.bmiHeader.biCompression = win.BI_RGB;
+    var bits: ?*anyopaque = null;
+    const bitmap = win.CreateDIBSection(null, &info, win.DIB_RGB_COLORS, &bits, null, 0) orelse return null;
+    if (bits == null) {
+        _ = win.DeleteObject(bitmap);
+        return null;
+    }
+    const destination: [*]u8 = @ptrCast(bits.?);
+    @memcpy(destination[0..byte_count], pixels);
+    return bitmap;
+}
+
+fn avatarCachePath(a: *App, jid: []const u8) ?[]u8 {
+    if (a.avatar_dir.len == 0) return null;
+    var name_buffer: [avatar_cache.max_file_name]u8 = undefined;
+    const name = avatar_cache.cacheFileName(&name_buffer, jid) orelse return null;
+    return std.fs.path.join(a.allocator, &.{ a.avatar_dir, name }) catch null;
+}
+
+fn loadAvatarFromDisk(a: *App, avatar: *Avatar) bool {
+    const path = avatarCachePath(a, avatar.jid.slice()) orelse return false;
+    defer a.allocator.free(path);
+    const stat = std.Io.Dir.statFile(.cwd(), a.io, path, .{}) catch return false;
+    const now = std.Io.Timestamp.now(a.io, .real);
+    if (avatar_cache.isStale(now.nanoseconds, stat.mtime.nanoseconds)) return false;
+    const wide_path = std.unicode.utf8ToUtf16LeAllocZ(a.allocator, path) catch return false;
+    defer a.allocator.free(wide_path);
+    const bitmap = decodeAvatarFile(a, wide_path.ptr) orelse return false;
+    var details = std.mem.zeroes(win.BITMAP);
+    if (win.GetObjectW(bitmap, @sizeOf(win.BITMAP), &details) == 0) {
+        _ = win.DeleteObject(bitmap);
+        return false;
+    }
+    avatar.bitmap = bitmap;
+    avatar.bitmap_width = details.bmWidth;
+    avatar.bitmap_height = details.bmHeight;
+    avatar.state = .ready;
+    return true;
+}
+
+fn fetchAvatar(a: *App, avatar: *Avatar) void {
+    // picture-info is a live fetch that needs the wacli store lock, so the
+    // sync child is paused around it (same tradeoff as media downloads).
+    stopSync(a);
+    defer startSync(a);
+    const args = [_][]const u8{ a.wacli_path, "--json", "profile", "picture-info", "--jid", avatar.jid.slice() };
+    var parsed = runWacli(a, &args) catch {
+        avatar.state = .failed;
+        return;
+    };
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |object| object,
+        else => {
+            avatar.state = .failed;
+            return;
+        },
+    };
+    var object = root;
+    if (root.get("data")) |data_value| {
+        switch (data_value) {
+            .object => |inner| object = inner,
+            else => {},
+        }
+    }
+    const url = getString(object, "url");
+    if (url.len == 0) {
+        // WhatsApp reports no picture for this chat; keep the initials circle.
+        avatar.state = .failed;
+        return;
+    }
+    const path = avatarCachePath(a, avatar.jid.slice()) orelse {
+        avatar.state = .failed;
+        return;
+    };
+    defer a.allocator.free(path);
+    const wide_url = std.unicode.utf8ToUtf16LeAllocZ(a.allocator, url) catch {
+        avatar.state = .failed;
+        return;
+    };
+    defer a.allocator.free(wide_url);
+    const wide_path = std.unicode.utf8ToUtf16LeAllocZ(a.allocator, path) catch {
+        avatar.state = .failed;
+        return;
+    };
+    defer a.allocator.free(wide_path);
+    // ponytail: URLDownloadToFileW blocks the UI thread for the length of one
+    // small picture download; move to an async WinHTTP worker if that ever hurts.
+    if (win.URLDownloadToFileW(null, wide_url.ptr, wide_path.ptr, 0, null) < 0) {
+        avatar.state = .failed;
+        return;
+    }
+    if (loadAvatarFromDisk(a, avatar)) {
+        invalidateChatList(a);
+    } else {
+        avatar.state = .failed;
+    }
+}
+
+/// Runs once per refresh tick: loads every missing avatar that is already on
+/// disk, then downloads at most one new picture per tick so the UI and the
+/// wacli store lock stay responsive.
+fn refreshAvatars(a: *App) void {
+    if (a.avatar_dir.len == 0) return;
+    var fetch_target: ?*Avatar = null;
+    for (a.chats[0..a.chat_count]) |*chat| {
+        const avatar = avatarFor(a, chat.jid.slice()) orelse continue;
+        switch (avatar.state) {
+            .ready, .failed => continue,
+            .none => {
+                if (loadAvatarFromDisk(a, avatar)) {
+                    invalidateChatList(a);
+                } else if (fetch_target == null) {
+                    fetch_target = avatar;
+                }
+            },
+        }
+    }
+    if (fetch_target) |avatar| fetchAvatar(a, avatar);
 }
 
 fn clearMessages(a: *App) void {
@@ -1542,6 +1755,7 @@ fn runCommand(a: *App, command: u16) void {
             refreshGroups(a);
             refreshChats(a);
             refreshMessages(a);
+            refreshAvatars(a);
         },
         command_sync => {
             stopSync(a);
@@ -1581,19 +1795,43 @@ fn drawChat(a: *App, item: *win.DRAWITEMSTRUCT) void {
     _ = win.FillRect(item.hDC, &item.rcItem, background);
     _ = win.SetBkMode(item.hDC, win.TRANSPARENT);
 
-    const avatar_brush = win.CreateSolidBrush(rgb(59, 74, 84)) orelse return;
-    defer _ = win.DeleteObject(avatar_brush);
-    const old_brush = win.SelectObject(item.hDC, avatar_brush);
-    const old_pen = win.SelectObject(item.hDC, win.GetStockObject(win.NULL_PEN));
-    _ = win.Ellipse(item.hDC, item.rcItem.left + 12, item.rcItem.top + 10, item.rcItem.left + 54, item.rcItem.top + 52);
-    _ = win.SelectObject(item.hDC, old_brush);
-    _ = win.SelectObject(item.hDC, old_pen);
+    const chat_avatar = avatarFor(a, chat.jid.slice());
+    if (chat_avatar != null and chat_avatar.?.state == .ready and chat_avatar.?.bitmap != null) {
+        const avatar_bitmap = chat_avatar.?.bitmap.?;
+        const left = item.rcItem.left + avatar_rect_left;
+        const top = item.rcItem.top + avatar_rect_top;
+        const width = chat_avatar.?.bitmap_width;
+        const height = chat_avatar.?.bitmap_height;
+        _ = win.SaveDC(item.hDC);
+        const circle = win.CreateEllipticRgn(left, top, left + avatar_size, top + avatar_size);
+        if (circle != null) {
+            _ = win.SelectClipRgn(item.hDC, circle);
+            const memory_dc = win.CreateCompatibleDC(item.hDC);
+            if (memory_dc != null) {
+                const old_bitmap = win.SelectObject(memory_dc, @ptrCast(avatar_bitmap));
+                _ = win.BitBlt(item.hDC, left + @divTrunc(avatar_size - width, 2), top + @divTrunc(avatar_size - height, 2), width, height, memory_dc, 0, 0, win.SRCCOPY);
+                _ = win.SelectObject(memory_dc, old_bitmap);
+                _ = win.DeleteDC(memory_dc);
+            }
+            _ = win.SelectClipRgn(item.hDC, null);
+            _ = win.DeleteObject(circle);
+        }
+        _ = win.RestoreDC(item.hDC, -1);
+    } else {
+        const avatar_brush = win.CreateSolidBrush(rgb(59, 74, 84)) orelse return;
+        defer _ = win.DeleteObject(avatar_brush);
+        const old_brush = win.SelectObject(item.hDC, avatar_brush);
+        const old_pen = win.SelectObject(item.hDC, win.GetStockObject(win.NULL_PEN));
+        _ = win.Ellipse(item.hDC, item.rcItem.left + avatar_rect_left, item.rcItem.top + avatar_rect_top, item.rcItem.left + avatar_rect_left + avatar_size, item.rcItem.top + avatar_rect_top + avatar_size);
+        _ = win.SelectObject(item.hDC, old_brush);
+        _ = win.SelectObject(item.hDC, old_pen);
 
-    if (chat.name.len > 0) {
-        _ = win.SelectObject(item.hDC, @ptrCast(a.font_bold.?));
-        _ = win.SetTextColor(item.hDC, color_text);
-        var avatar_rect = win.RECT{ .left = item.rcItem.left + 12, .top = item.rcItem.top + 10, .right = item.rcItem.left + 54, .bottom = item.rcItem.top + 52 };
-        _ = win.DrawTextW(item.hDC, @ptrCast(chat.name.buf[0..chat.name.len].ptr), @intCast(avatar.initial(chat.name.buf[0..chat.name.len]).len), &avatar_rect, win.DT_CENTER | win.DT_SINGLELINE | win.DT_VCENTER);
+        if (chat.name.len > 0) {
+            _ = win.SelectObject(item.hDC, @ptrCast(a.font_bold.?));
+            _ = win.SetTextColor(item.hDC, color_text);
+            var avatar_rect = win.RECT{ .left = item.rcItem.left + avatar_rect_left, .top = item.rcItem.top + avatar_rect_top, .right = item.rcItem.left + avatar_rect_left + avatar_size, .bottom = item.rcItem.top + avatar_rect_top + avatar_size };
+            _ = win.DrawTextW(item.hDC, @ptrCast(chat.name.buf[0..chat.name.len].ptr), @intCast(avatar.initial(chat.name.buf[0..chat.name.len]).len), &avatar_rect, win.DT_CENTER | win.DT_SINGLELINE | win.DT_VCENTER);
+        }
     }
 
     _ = win.SelectObject(item.hDC, @ptrCast(a.font_bold.?));
@@ -1985,6 +2223,7 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
                     refreshChats(a);
                     if (!messagesAreCurrent(a)) refreshMessages(a);
                     autoDownloadNextMedia(a);
+                    if (a.media_child == null) refreshAvatars(a);
                 }
             } else if (wparam == timer_search) {
                 _ = win.KillTimer(hwnd, timer_search);
@@ -2137,6 +2376,13 @@ fn findWacli(init: std.process.Init, allocator: std.mem.Allocator) ![]u8 {
     return std.fs.path.join(allocator, &.{ local, "Programs", "wacli", "wacli.exe" });
 }
 
+fn findAvatarDir(init: std.process.Init, allocator: std.mem.Allocator) []u8 {
+    const local = init.environ_map.get("LOCALAPPDATA") orelse return &.{};
+    const dir = std.fs.path.join(allocator, &.{ local, "Messages", "avatars" }) catch return &.{};
+    std.Io.Dir.createDirPath(.cwd(), init.io, dir) catch {};
+    return dir;
+}
+
 fn findPlayedPath(init: std.process.Init, allocator: std.mem.Allocator) []u8 {
     const local = init.environ_map.get("LOCALAPPDATA") orelse return &.{};
     const dir = std.fs.path.join(allocator, &.{ local, "Messages" }) catch return &.{};
@@ -2169,6 +2415,7 @@ pub fn main(init: std.process.Init) !void {
     defer init.gpa.free(wacli_path);
     var app = App{ .allocator = init.gpa, .io = init.io, .instance = instance, .wacli_path = wacli_path, .deepgram_configured = init.environ_map.get("DEEPGRAM_API_KEY") != null };
     app.played_path = findPlayedPath(init, init.gpa);
+    app.avatar_dir = findAvatarDir(init, init.gpa);
     loadPlayed(&app);
     app_ptr = &app;
     defer app_ptr = null;
