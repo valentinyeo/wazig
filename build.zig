@@ -31,15 +31,18 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addWin32ResourceFile(.{ .file = b.path("assets/app.rc") });
     b.installArtifact(exe);
 
-    const tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/emoji_picker.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    const run_tests = b.addRunArtifact(tests);
-    b.step("test", "Run unit tests").dependOn(&run_tests.step);
+    const test_step = b.step("test", "Run unit tests");
+    for ([_][]const u8{ "src/emoji_picker.zig", "src/avatar.zig" }) |test_root| {
+        const tests = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(test_root),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        const run_tests = b.addRunArtifact(tests);
+        test_step.dependOn(&run_tests.step);
+    }
 
     b.installFile("assets/IBMPlexSans-Regular.ttf", "bin/IBMPlexSans-Regular.ttf");
     b.installFile("assets/IBMPlexSans-SemiBold.ttf", "bin/IBMPlexSans-SemiBold.ttf");
