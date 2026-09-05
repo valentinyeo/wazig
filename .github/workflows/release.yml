@@ -36,7 +36,7 @@ jobs:
         run: |
           cd zig-out/bin
           zip -r "${GITHUB_WORKSPACE}/Messages-${GITHUB_REF_NAME}.zip" Messages.exe IBMPlexSans-Regular.ttf IBMPlexSans-SemiBold.ttf IBM-Plex-LICENSE.txt
-          sha256sum "Messages-${GITHUB_REF_NAME}.zip" > "${GITHUB_WORKSPACE}/SHA256SUMS.txt"
+          sha256sum "${GITHUB_WORKSPACE}/Messages-${GITHUB_REF_NAME}.zip" > "${GITHUB_WORKSPACE}/SHA256SUMS.txt"
 
       - name: Publish release
         env:
