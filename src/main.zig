@@ -22,7 +22,7 @@ const max_messages = 100;
 const timer_refresh = 1;
 const timer_search = 2;
 const timer_animation = 3;
-const wm_chain_next = win.WM_APP + 1; // wparam 0 = playback ended, 1 = playback failed
+const wm_chain_next = win.WM_APP + 2; // wparam 0 = playback ended, 1 = playback failed
 const id_search = 1008;
 const id_chats = 1016;
 const id_canvas = 1024;
