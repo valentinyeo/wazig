@@ -10,3 +10,4 @@
 - The Ctrl+K command palette is the control center for all commands (search, compose, dictate, dictation language, font size, archive, archived-chats view, reactions, refresh, sync, quit). Keep new commands registered in `buildPaletteItems`.
 - Every wacli write or live-network command (send, react, archive, mark-read, media download, profile picture lookup) must pause the live-sync child first and restart it after; wacli fails with "store is locked" otherwise. Write arguments always include `--lock-wait`.
 - Dictation captures the default communications microphone through WASAPI, uploads a WAV to Deepgram with WinHTTP after recording stops, and inserts the transcript into the composer. Auto-detect, English, and German modes are persisted in the registry.
+- `main` on GitHub is the only source of truth. All development happens through pull requests from the agents; never edit or build on the laptop. Releases come from `v*` tags.
