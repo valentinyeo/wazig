@@ -36,6 +36,9 @@ jobs:
       - name: Test
         run: zig build test
 
+      - name: Stretch tests
+        run: zig test src/stretch.zig
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
