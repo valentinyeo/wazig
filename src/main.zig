@@ -19,7 +19,7 @@ const win = @cImport({
     @cInclude("mfreadwrite.h");
 });
 
-const app_version = "0.9.7";
+const app_version = @import("build_options").app_version;
 
 const max_chats = 256;
 const max_groups = 1024;

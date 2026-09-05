@@ -4,6 +4,11 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{ .preferred_optimize_mode = .ReleaseSmall });
 
+    // Release CI passes -Dversion=<tag without the v>; local builds fall back to the current line.
+    const app_version = b.option([]const u8, "version", "App version embedded in the exe") orelse "0.9.7";
+    const build_options = b.addOptions();
+    build_options.addOption([]const u8, "app_version", app_version);
+
     const exe = b.addExecutable(.{
         .name = "Messages",
         .root_module = b.createModule(.{
@@ -12,6 +17,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    exe.root_module.addOptions("build_options", build_options);
     exe.subsystem = .windows;
     exe.root_module.link_libc = true;
     for ([_][]const u8{
