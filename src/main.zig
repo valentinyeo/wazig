@@ -838,6 +838,14 @@ fn playerProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win
     return win.DefWindowProcW(hwnd, message, wparam, lparam);
 }
 
+// LoadImageW with the name argument passed as an integer (MAKEINTRESOURCE),
+// avoiding translate-c's aligned LPCWSTR pointer for resource ids.
+extern "user32" fn LoadImageW(instance: win.HINSTANCE, icon_name: usize, icon_type: u32, cx: i32, cy: i32, load_flags: u32) callconv(.c) win.HICON;
+
+fn LoadAppIcon(instance: win.HINSTANCE, cx: i32, cy: i32, flags: u32) win.HICON {
+    return LoadImageW(instance, 1, win.IMAGE_ICON, cx, cy, flags);
+}
+
 fn playVideoInline(a: *App, message: *const Message) void {
     if (message.local_path.len == 0) return;
     if (a.player_window) |hwnd| {
@@ -859,7 +867,8 @@ fn playVideoInline(a: *App, message: *const Message) void {
             .hCursor = win.LoadCursorW(null, @ptrFromInt(32512)),
             .hbrBackground = win.CreateSolidBrush(color_bg),
             .lpszClassName = lit("MessagesVideoPlayer"),
-            .hIconSm = null,
+            .hIcon = LoadAppIcon(a.instance, 0, 0, win.LR_DEFAULTSIZE | win.LR_SHARED),
+            .hIconSm = LoadAppIcon(a.instance, win.GetSystemMetrics(win.SM_CXSMICON), win.GetSystemMetrics(win.SM_CYSMICON), win.LR_SHARED),
         };
         if (win.RegisterClassExW(&class) == 0) {
             setStatus(a, "Could not open the video player");
@@ -1912,6 +1921,11 @@ pub fn main(init: std.process.Init) !void {
     _ = win.InitCommonControlsEx(&controls);
 
     const cursor = win.LoadCursorW(null, @ptrFromInt(32512));
+    // Resource id 1 in assets/app.rc; same icon serves the title bar and taskbar.
+    const icon_big = LoadAppIcon(instance, 0, 0, win.LR_DEFAULTSIZE | win.LR_SHARED);
+    const small_cx = win.GetSystemMetrics(win.SM_CXSMICON);
+    const small_cy = win.GetSystemMetrics(win.SM_CYSMICON);
+    const icon_small = LoadAppIcon(instance, small_cx, small_cy, win.LR_SHARED);
     var canvas_class = win.WNDCLASSEXW{
         .cbSize = @sizeOf(win.WNDCLASSEXW),
         .style = win.CS_HREDRAW | win.CS_VREDRAW,
@@ -1919,12 +1933,12 @@ pub fn main(init: std.process.Init) !void {
         .cbClsExtra = 0,
         .cbWndExtra = 0,
         .hInstance = instance,
-        .hIcon = null,
+        .hIcon = icon_big,
         .hCursor = cursor,
         .hbrBackground = null,
         .lpszMenuName = null,
         .lpszClassName = lit("WacliMessageCanvas"),
-        .hIconSm = null,
+        .hIconSm = icon_small,
     };
     if (win.RegisterClassExW(&canvas_class) == 0) return error.RegisterCanvasClassFailed;
 
@@ -1935,12 +1949,12 @@ pub fn main(init: std.process.Init) !void {
         .cbClsExtra = 0,
         .cbWndExtra = 0,
         .hInstance = instance,
-        .hIcon = null,
+        .hIcon = icon_big,
         .hCursor = cursor,
         .hbrBackground = null,
         .lpszMenuName = null,
         .lpszClassName = lit("MessagesZig"),
-        .hIconSm = null,
+        .hIconSm = icon_small,
     };
     if (win.RegisterClassExW(&main_class) == 0) return error.RegisterMainClassFailed;
 
