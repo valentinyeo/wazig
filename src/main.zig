@@ -17,6 +17,7 @@ const win = @cImport({
     @cInclude("mfapi.h");
     @cInclude("mfidl.h");
     @cInclude("mfreadwrite.h");
+    @cInclude("mfplay.h");
 });
 
 const app_version = "0.9.7";
@@ -58,6 +59,7 @@ const command_speed_1 = 2016;
 const command_speed_150 = 2017;
 const command_speed_200 = 2018;
 const command_copy_text = 2019;
+const command_open_external = 2030;
 const command_copy_link = 2020;
 const command_copy_selection = 2021;
 const command_copy_transcript = 2022;
@@ -279,6 +281,8 @@ const App = struct {
     audio_playing_id: Utf8Text(191) = .{},
     audio_position_ms: i64 = 0,
     audio_duration_ms: i64 = 0,
+    player_window: ?win.HWND = null,
+    mf_player: ?*win.IMFPMediaPlayer = null,
     media_child: ?std.process.Child = null,
     send_child: ?std.process.Child = null,
     pending_sends: [max_pending_sends]PendingSend = [_]PendingSend{.{}} ** max_pending_sends,
@@ -1499,6 +1503,182 @@ fn openMedia(a: *App, message: *const Message) void {
     if (@intFromPtr(result) <= 32) setStatus(a, "Windows could not open the attachment");
 }
 
+// Inline video playback through Media Foundation MFPlay (a Windows system
+// component) in its own small window; the Ogg/WASAPI pipeline in audio.zig
+// only handles voice notes.
+fn clampPlayerSize(width: u32, height: u32) [2]u32 {
+    const max_width: u32 = 800;
+    const max_height: u32 = 450;
+    if (width == 0 or height == 0) return .{ 640, 360 };
+    var w: u64 = width;
+    var h: u64 = height;
+    if (w > max_width) {
+        h = @max(1, h * max_width / w);
+        w = max_width;
+    }
+    if (h > max_height) {
+        w = @max(1, w * max_height / h);
+        h = max_height;
+    }
+    return .{ @intCast(w), @intCast(h) };
+}
+
+fn playerCallbackQueryInterface(_: [*c]win.IMFPMediaPlayerCallback, riid: [*c]const win.GUID, ppv_object: [*c]?*anyopaque) callconv(.c) win.HRESULT {
+    if (ppv_object != null and riid != null) {
+        const iid_callback = win.GUID{ .Data1 = 0x766c8ffb, .Data2 = 0x5fdb, .Data3 = 0x4fea, .Data4 = .{ 0xa2, 0x8d, 0xb9, 0x12, 0x99, 0x6f, 0x51, 0xbd } };
+        const g = riid.*;
+        const is_unknown = g.Data1 == 0 and g.Data2 == 0 and g.Data3 == 0 and g.Data4[0] == 0 and g.Data4[1] == 0 and g.Data4[2] == 0 and g.Data4[3] == 0xc0 and g.Data4[4] == 0 and g.Data4[5] == 0 and g.Data4[6] == 0 and g.Data4[7] == 0x46;
+        const is_callback = g.Data1 == iid_callback.Data1 and g.Data2 == iid_callback.Data2 and g.Data3 == iid_callback.Data3 and std.mem.eql(u8, &g.Data4, &iid_callback.Data4);
+        if (is_unknown or is_callback) {
+            ppv_object.* = @ptrCast(&player_callback);
+            _ = playerCallbackAddRef(&player_callback);
+            return 0;
+        }
+        ppv_object.* = null;
+    }
+    return win.E_NOINTERFACE;
+}
+
+fn playerCallbackAddRef(_: [*c]win.IMFPMediaPlayerCallback) callconv(.c) win.ULONG {
+    player_callback_refs += 1;
+    return player_callback_refs;
+}
+
+fn playerCallbackRelease(_: [*c]win.IMFPMediaPlayerCallback) callconv(.c) win.ULONG {
+    if (player_callback_refs > 0) player_callback_refs -= 1;
+    return player_callback_refs;
+}
+
+fn playerCallbackEvent(_: [*c]win.IMFPMediaPlayerCallback, event: [*c]win.MFP_EVENT_HEADER) callconv(.c) void {
+    if (event == null) return;
+    switch (event.*.eEventType) {
+        win.MFP_EVENT_TYPE_ERROR, win.MFP_EVENT_TYPE_PLAYBACK_ENDED => {
+            // never touch player state here; the callback runs on a Media Foundation thread
+            if (app_ptr) |a| {
+                if (a.player_window) |hwnd| _ = win.PostMessageW(hwnd, win.WM_CLOSE, 0, 0);
+            }
+        },
+        else => {},
+    }
+}
+
+var player_callback = win.IMFPMediaPlayerCallback{ .lpVtbl = &player_callback_vtable };
+var player_callback_vtable = win.IMFPMediaPlayerCallbackVtbl{
+    .QueryInterface = playerCallbackQueryInterface,
+    .AddRef = playerCallbackAddRef,
+    .Release = playerCallbackRelease,
+    .OnMediaPlayerEvent = playerCallbackEvent,
+};
+var player_callback_refs: u32 = 1;
+var player_class_registered: bool = false;
+
+fn closePlayer(a: *App) void {
+    if (a.mf_player) |player| {
+        _ = player.lpVtbl.*.Shutdown.?(player);
+        _ = player.lpVtbl.*.Release.?(player);
+        a.mf_player = null;
+    }
+    if (a.player_window) |hwnd| {
+        a.player_window = null;
+        _ = win.DestroyWindow(hwnd);
+    }
+}
+
+fn playerProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.LPARAM) callconv(.winapi) win.LRESULT {
+    const a = app_ptr orelse return win.DefWindowProcW(hwnd, message, wparam, lparam);
+    switch (message) {
+        win.WM_KEYDOWN => {
+            if (wparam == 27) { // escape
+                closePlayer(a);
+                return 0;
+            }
+        },
+        win.WM_CLOSE => {
+            closePlayer(a);
+            return 0;
+        },
+        win.WM_DESTROY => {
+            if (a.player_window != null and a.player_window.? == hwnd) a.player_window = null;
+            if (a.mf_player) |player| {
+                _ = player.lpVtbl.*.Shutdown.?(player);
+                _ = player.lpVtbl.*.Release.?(player);
+                a.mf_player = null;
+            }
+            return 0;
+        },
+        else => {},
+    }
+    return win.DefWindowProcW(hwnd, message, wparam, lparam);
+}
+
+fn playVideoInline(a: *App, message: *const Message) void {
+    if (message.local_path.len == 0) return;
+    if (a.player_window) |hwnd| {
+        _ = win.SetForegroundWindow(hwnd);
+        return;
+    }
+    const size = clampPlayerSize(@intCast(@max(message.bitmap_width, 0)), @intCast(@max(message.bitmap_height, 0)));
+    var rect = win.RECT{ .left = 0, .top = 0, .right = @intCast(size[0]), .bottom = @intCast(size[1]) };
+    _ = win.AdjustWindowRect(&rect, win.WS_OVERLAPPEDWINDOW, 0);
+
+    if (!player_class_registered) {
+        var class = win.WNDCLASSEXW{
+            .cbSize = @sizeOf(win.WNDCLASSEXW),
+            .style = win.CS_HREDRAW | win.CS_VREDRAW,
+            .lpfnWndProc = playerProc,
+            .hInstance = a.instance,
+            .hCursor = win.LoadCursorW(null, @ptrFromInt(32512)),
+            .hbrBackground = win.CreateSolidBrush(color_bg),
+            .lpszClassName = lit("MessagesVideoPlayer"),
+        };
+        if (win.RegisterClassExW(&class) == 0) {
+            setStatus(a, "Could not open the video player");
+            return;
+        }
+        player_class_registered = true;
+    }
+    const hwnd = win.CreateWindowExW(
+        0,
+        lit("MessagesVideoPlayer"),
+        lit("Messages · Video"),
+        win.WS_OVERLAPPEDWINDOW,
+        win.CW_USEDEFAULT,
+        win.CW_USEDEFAULT,
+        rect.right - rect.left,
+        rect.bottom - rect.top,
+        a.hwnd orelse null,
+        null,
+        a.instance,
+        null,
+    ) orelse {
+        setStatus(a, "Could not open the video player");
+        return;
+    };
+    a.player_window = hwnd;
+    var player: ?*win.IMFPMediaPlayer = null;
+    const hr = win.MFPCreateMediaPlayer(message.local_path.ptr(), 1, win.MFP_OPTION_NONE, &player_callback, hwnd, &player);
+    if (hr < 0 or player == null) {
+        setStatus(a, "Video playback is not available for this file");
+        a.player_window = null;
+        _ = win.DestroyWindow(hwnd);
+        return;
+    }
+    a.mf_player = player;
+    _ = win.ShowWindow(hwnd, win.SW_SHOW);
+}
+
+test clampPlayerSize {
+    const small = clampPlayerSize(320, 240);
+    try std.testing.expectEqual(@as(u32, 320), small[0]);
+    try std.testing.expectEqual(@as(u32, 240), small[1]);
+    const tall = clampPlayerSize(1080, 1920);
+    try std.testing.expect(tall[1] <= 450 and tall[0] <= 800);
+    try std.testing.expectApproxEqAbs(@as(f64, 1080.0 / 1920.0), @as(f64, @floatFromInt(tall[0])) / @as(f64, @floatFromInt(tall[1])), 0.01);
+    const empty = clampPlayerSize(0, 0);
+    try std.testing.expectEqual(@as(u32, 640), empty[0]);
+    try std.testing.expectEqual(@as(u32, 360), empty[1]);
+}
+
 fn advanceGifs(a: *App) void {
     var changed = false;
     var dirty = win.RECT{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
@@ -2012,9 +2192,9 @@ fn handleCanvasClick(a: *App, hwnd: win.HWND, x: i32, y: i32) void {
                 downloadMedia(a, index, false);
             } else if (isAudio(item)) {
                 handleAudioClick(a, item, x);
+            } else if (isVideo(item) and !isGif(item)) {
+                playVideoInline(a, item);
             } else if (!isGif(item)) {
-                // GIFs already animate in place; popping them out to
-                // an external player was unwanted.
                 openMedia(a, item);
             }
             return;
@@ -2255,6 +2435,7 @@ fn buildPaletteItems(a: *App) void {
     appendPalette(a, "React to message: 😢 Sad", "", reaction_sad);
     appendPalette(a, "React to message: 🙏 Thanks", "", reaction_thanks);
     appendPalette(a, "Remove reaction", "", reaction_remove);
+    appendPalette(a, "Open video in external player", "V", command_open_external);
     appendPalette(a, "Refresh", "R", command_refresh);
     appendPalette(a, "Restart live sync", "S", command_sync);
     appendPalette(a, "Quit Messages", "Q", command_quit);
@@ -2606,6 +2787,19 @@ fn runCommand(a: *App, command: u16) void {
             recreateFonts(a);
             saveFontScale(a.font_scale);
             setStatus(a, "Font size 80%");
+        },
+        command_open_external => {
+            var handled_video = false;
+            if (a.selected_message) |selected| {
+                if (selected < a.message_count) {
+                    const item = &a.messages[selected];
+                    if (isVideo(item) and !isGif(item) and item.local_path.len > 0) {
+                        handled_video = true;
+                        openMedia(a, item);
+                    }
+                }
+            }
+            if (!handled_video) setStatus(a, "Select a downloaded video first");
         },
         command_refresh => {
             refreshGroups(a);
@@ -3537,6 +3731,7 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
             if (a.archive_child) |*child| child.kill(a.io);
             a.archive_child = null;
             stopSync(a);
+            closePlayer(a);
             if (a.sync_job) |job| _ = win.CloseHandle(job);
             a.sync_job = null;
             if (a.audio_player) |player| {

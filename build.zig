@@ -24,6 +24,7 @@ pub fn build(b: *std.Build) void {
         "shell32",
         "dwmapi",
         "mfplat",
+        "mfplay",
         "mfreadwrite",
         "mfuuid",
         "winhttp",
