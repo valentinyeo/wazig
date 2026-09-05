@@ -29,6 +29,10 @@ const id_send = 1040;
 const id_status = 1048;
 const id_dictate = 1056;
 const emoji_picker = @import("emoji_picker.zig");
+const webp_detect = @import("webp.zig");
+const webp = @cImport({
+    @cInclude("src/webp/decode.h");
+});
 const picker_emojis = emoji_picker.picker_emojis;
 const picker_base = emoji_picker.picker_base;
 const pickerEmojiForCommand = emoji_picker.pickerEmojiForCommand;
@@ -617,36 +621,7 @@ fn ensureVideoBitmap(message: *Message) void {
     message.bitmap_height = details.bmHeight;
 }
 
-fn ensureBitmap(a: *App, message: *Message) void {
-    if (message.bitmap != null or message.local_path.len == 0) return;
-    if (isVideo(message)) {
-        ensureVideoBitmap(message);
-        return;
-    }
-    if (!isImage(message) or a.wic_factory == null) return;
-    var decoder: [*c]win.IWICBitmapDecoder = null;
-    const decoder_hr = a.wic_factory.*.lpVtbl.*.CreateDecoderFromFilename.?(
-        a.wic_factory,
-        message.local_path.ptr(),
-        null,
-        win.GENERIC_READ,
-        win.WICDecodeMetadataCacheOnLoad,
-        &decoder,
-    );
-    if (decoder_hr < 0 or decoder == null) return;
-    defer _ = decoder.*.lpVtbl.*.Release.?(decoder);
-
-    var frame_count: win.UINT = 0;
-    if (decoder.*.lpVtbl.*.GetFrameCount.?(decoder, &frame_count) < 0 or frame_count == 0) return;
-    message.gif_frame_count = if (isGif(message)) frame_count else 1;
-    if (message.gif_frame_index >= message.gif_frame_count) message.gif_frame_index = 0;
-    var frame: [*c]win.IWICBitmapFrameDecode = null;
-    if (decoder.*.lpVtbl.*.GetFrame.?(decoder, message.gif_frame_index, &frame) < 0 or frame == null) return;
-    defer _ = frame.*.lpVtbl.*.Release.?(frame);
-    var source_width: win.UINT = 0;
-    var source_height: win.UINT = 0;
-    if (frame.*.lpVtbl.*.GetSize.?(@ptrCast(frame), &source_width, &source_height) < 0 or source_width == 0 or source_height == 0) return;
-
+fn fillBitmapFromSource(a: *App, message: *Message, source: [*c]win.IWICBitmapSource, source_width: win.UINT, source_height: win.UINT) void {
     var target_width: win.UINT = @min(source_width, 420);
     var target_height: win.UINT = @intCast(@max(1, @divTrunc(@as(u64, source_height) * target_width, source_width)));
     if (target_height > 250) {
@@ -659,7 +634,7 @@ fn ensureBitmap(a: *App, message: *Message) void {
     defer _ = converter.*.lpVtbl.*.Release.?(converter);
     if (converter.*.lpVtbl.*.Initialize.?(
         converter,
-        @ptrCast(frame),
+        source,
         &win.GUID_WICPixelFormat32bppPBGRA,
         win.WICBitmapDitherTypeNone,
         null,
@@ -696,6 +671,77 @@ fn ensureBitmap(a: *App, message: *Message) void {
     message.bitmap = bitmap;
     message.bitmap_width = @intCast(target_width);
     message.bitmap_height = @intCast(target_height);
+}
+
+// Windows WIC has no WebP codec, so stickers (WebP files) would never render.
+// Decode them with the vendored libwebp; for animated stickers this returns the
+// first frame. ponytail: frames are not animated on screen; use WebPAnimDecoder
+// (vendor src/demux) if stickers should move later.
+fn ensureWebPBitmap(a: *App, message: *Message) void {
+    // local_path is a wide Windows path; convert once for std.fs.
+    const path_utf8 = std.unicode.utf16LeToUtf8Alloc(a.allocator, message.local_path.slice()) catch return;
+    defer a.allocator.free(path_utf8);
+    const data = std.Io.Dir.readFileAlloc(.cwd(), a.io, path_utf8, a.allocator, std.Io.Limit.limited(32 * 1024 * 1024)) catch return;
+    defer a.allocator.free(data);
+    if (!webp_detect.isWebPBytes(data)) return;
+    var width: c_int = 0;
+    var height: c_int = 0;
+    const pixels = webp.WebPDecodeRGBA(data.ptr, data.len, &width, &height) orelse return;
+    defer webp.WebPFree(pixels);
+    if (width <= 0 or height <= 0) return;
+
+    // Wrap the decoded pixels as a WIC bitmap so the shared convert/scale/DIB
+    // path can be reused.
+    var wic_bitmap: [*c]win.IWICBitmap = null;
+    const create_hr = a.wic_factory.*.lpVtbl.*.CreateBitmapFromMemory.?(
+        a.wic_factory,
+        @intCast(width),
+        @intCast(height),
+        &win.GUID_WICPixelFormat32bppRGBA,
+        @intCast(@as(u32, @intCast(width)) * 4),
+        @intCast(@as(u32, @intCast(width)) * @as(u32, @intCast(height)) * 4),
+        pixels,
+        &wic_bitmap,
+    );
+    if (create_hr < 0 or wic_bitmap == null) return;
+    defer _ = wic_bitmap.*.lpVtbl.*.Release.?(wic_bitmap);
+    fillBitmapFromSource(a, message, @ptrCast(wic_bitmap), @intCast(width), @intCast(height));
+}
+
+fn ensureBitmap(a: *App, message: *Message) void {
+    if (message.bitmap != null or message.local_path.len == 0) return;
+    if (isVideo(message)) {
+        ensureVideoBitmap(message);
+        return;
+    }
+    if (!isImage(message) or a.wic_factory == null) return;
+    var decoder: [*c]win.IWICBitmapDecoder = null;
+    const decoder_hr = a.wic_factory.*.lpVtbl.*.CreateDecoderFromFilename.?(
+        a.wic_factory,
+        message.local_path.ptr(),
+        null,
+        win.GENERIC_READ,
+        win.WICDecodeMetadataCacheOnLoad,
+        &decoder,
+    );
+    if (decoder_hr < 0 or decoder == null) {
+        ensureWebPBitmap(a, message);
+        return;
+    }
+    defer _ = decoder.*.lpVtbl.*.Release.?(decoder);
+
+    var frame_count: win.UINT = 0;
+    if (decoder.*.lpVtbl.*.GetFrameCount.?(decoder, &frame_count) < 0 or frame_count == 0) return;
+    message.gif_frame_count = if (isGif(message)) frame_count else 1;
+    if (message.gif_frame_index >= message.gif_frame_count) message.gif_frame_index = 0;
+    var frame: [*c]win.IWICBitmapFrameDecode = null;
+    if (decoder.*.lpVtbl.*.GetFrame.?(decoder, message.gif_frame_index, &frame) < 0 or frame == null) return;
+    defer _ = frame.*.lpVtbl.*.Release.?(frame);
+    var source_width: win.UINT = 0;
+    var source_height: win.UINT = 0;
+    if (frame.*.lpVtbl.*.GetSize.?(@ptrCast(frame), &source_width, &source_height) < 0 or source_width == 0 or source_height == 0) return;
+
+    fillBitmapFromSource(a, message, @ptrCast(frame), source_width, source_height);
 }
 
 fn downloadMedia(a: *App, message_index: usize, automatic: bool) void {
