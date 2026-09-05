@@ -192,6 +192,7 @@ const App = struct {
     played: [2048]u64 = [_]u64{0} ** 2048,
     played_count: usize = 0,
     played_path: []u8 = &.{},
+    tooltips: ?win.HWND = null,
 };
 
 var app_ptr: ?*App = null;
@@ -221,6 +222,45 @@ fn setFont(hwnd: ?win.HWND, font: ?win.HFONT) void {
     if (hwnd) |window| {
         _ = win.SendMessageW(window, win.WM_SETFONT, if (font) |value| @intFromPtr(value) else 0, 1);
     }
+}
+
+fn addTooltip(tt: win.HWND, tool: ?win.HWND, text: [*:0]const u16) void {
+    const target = tool orelse return;
+    var info = win.TOOLINFOW{
+        .cbSize = @sizeOf(win.TOOLINFOW),
+        .uFlags = win.TTF_IDISHWND | win.TTF_SUBCLASS,
+        .hwnd = win.GetParent(target),
+        .uId = @intFromPtr(target),
+        .lpszText = @constCast(text),
+    };
+    _ = win.SendMessageW(tt, win.TTM_ADDTOOLW, 0, @as(win.LPARAM, @bitCast(@intFromPtr(&info))));
+}
+
+fn createTooltips(a: *App, hwnd: win.HWND) void {
+    const tt = win.CreateWindowExW(
+        win.WS_EX_TOPMOST,
+        lit("tooltips_class32"),
+        null,
+        win.WS_POPUP | win.TTS_NOPREFIX,
+        0,
+        0,
+        0,
+        0,
+        hwnd,
+        null,
+        a.instance,
+        null,
+    ) orelse return;
+    a.tooltips = tt;
+    // TTM_SETMAXWIDTH (WM_USER + 24); not exposed by the commctrl.h import
+    _ = win.SendMessageW(tt, 0x400 + 24, 0, 260);
+    addTooltip(tt, a.search, lit("Search chats  Ctrl+F or /"));
+    addTooltip(tt, a.chats_hwnd, lit("Chats  ↑/↓ or J/K move · Enter to compose"));
+    addTooltip(tt, a.canvas, lit("Messages  Ctrl+Tab select · right-click to react"));
+    addTooltip(tt, a.compose, lit("Message box  Enter sends · Shift+Enter new line"));
+    addTooltip(tt, a.dictate, lit("Dictate  Ctrl+D"));
+    addTooltip(tt, a.send, lit("Send message  Enter"));
+    addTooltip(tt, a.emoji_btn, lit("Emoji menu"));
 }
 
 fn getString(object: std.json.ObjectMap, key: []const u8) []const u8 {
@@ -1578,6 +1618,7 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
             setFont(a.send, a.font_bold);
             setFont(a.emoji_btn, a.font_emoji);
             setFont(a.status, a.font_small);
+            createTooltips(a, hwnd);
             if (a.search) |search| _ = win.SendMessageW(search, win.EM_SETCUEBANNER, 1, @bitCast(@intFromPtr(lit("Search chats  Ctrl+F"))));
             if (a.chats_hwnd) |list| _ = win.SendMessageW(list, win.LB_SETITEMHEIGHT, 0, 64);
             _ = win.SetTimer(hwnd, timer_refresh, 3000, null);
