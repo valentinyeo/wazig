@@ -3261,8 +3261,10 @@ fn showSenderName(a: *App, index: usize) bool {
     if (index == 0) return true;
     const message = &a.messages[index];
     const previous = &a.messages[index - 1];
+    if (message.from_me != previous.from_me) return true;
     if (message.sender_jid.len > 0 and previous.sender_jid.len > 0)
         return !std.mem.eql(u8, message.sender_jid.slice(), previous.sender_jid.slice());
+    if (message.sender.len == 0 or previous.sender.len == 0) return true;
     return !std.mem.eql(u16, message.sender.slice(), previous.sender.slice());
 }
 
