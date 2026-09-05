@@ -1161,6 +1161,15 @@ fn refreshMessages(a: *App) void {
         return;
     }
     const chat = &a.chats[a.selected_chat];
+    if (chat.unread or chat.unread_count > 0) {
+        const read_args = [_][]const u8{ a.wacli_path, "--json", "chats", "mark-read", "--chat", chat.jid.slice() };
+        if (runWacli(a, &read_args)) |parsed_read| {
+            parsed_read.deinit();
+            chat.unread = false;
+            chat.unread_count = 0;
+            if (a.chats_hwnd) |list| _ = win.InvalidateRect(list, null, win.FALSE);
+        } else |_| {}
+    }
     const args = [_][]const u8{
         a.wacli_path, "--json", "--read-only", "messages", "list", "--chat", chat.jid.slice(), "--limit", "80",
     };
@@ -1699,10 +1708,10 @@ fn drawCanvas(hwnd: win.HWND, a: *App) void {
         if (in_group and !message.from_me and message.sender.len > 0) drawSenderAvatar(hdc, a, left - 38, y + 8, message);
         if (show_sender) {
             _ = win.SelectObject(hdc, @ptrCast(a.font_bold.?));
-            const in_group = std.mem.endsWith(u8, a.chats[a.selected_chat].jid.slice(), "@g.us");
+            const in_group_thread = std.mem.endsWith(u8, a.chats[a.selected_chat].jid.slice(), "@g.us");
             _ = win.SetTextColor(hdc, if (message.from_me)
                 color_text
-            else if (in_group)
+            else if (in_group_thread)
                 senderColor(if (message.sender_jid.len > 0) message.sender_jid.slice() else "unknown")
             else
                 rgb(83, 189, 235));
