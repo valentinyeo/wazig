@@ -296,7 +296,7 @@ const App = struct {
     openrouter_session: ?*dictation.TextSession = null,
     openrouter_active_id: Utf8Text(191) = .{},
     openrouter_key: []const u8 = "",
-    openrouter_model: []const u8 = "openai/gpt-5.6-luna-pro",
+    openrouter_model: []const u8 = "openai/gpt-5.6-luna",
     openrouter_configured: bool = false,
     openrouter_attempts: [512]u64 = [_]u64{0} ** 512,
     openrouter_attempt_count: usize = 0,
@@ -3865,7 +3865,7 @@ pub fn main(init: std.process.Init) !void {
             openrouter_model = stored;
         }
     }
-    if (openrouter_model.len == 0) openrouter_model = "openai/gpt-5.6-luna-pro";
+    if (openrouter_model.len == 0) openrouter_model = "openai/gpt-5.6-luna";
     var app = App{ .allocator = init.gpa, .io = init.io, .instance = instance, .wacli_path = wacli_path, .avatar_dir = avatar_dir, .deepgram_configured = deepgram_key.len > 0, .deepgram_key = deepgram_key, .openrouter_key = openrouter_key, .openrouter_model = openrouter_model, .openrouter_configured = openrouter_key.len > 0, .dictation_language = loadDictationLanguage(), .font_scale = loadFontScale() };
     app.store_watch_path.set(init.gpa, store_watch_path);
     app_ptr = &app;
