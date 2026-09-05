@@ -43,6 +43,10 @@ const libwebp_sources = [_][]const u8{
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{ .preferred_optimize_mode = .ReleaseSmall });
+    const version = b.option([]const u8, "version", "Application version (from the release tag)") orelse "0.0.0";
+
+    const build_version = b.addOptions();
+    build_version.addOption([]const u8, "version", version);
 
     const exe = b.addExecutable(.{
         .name = "Messages",
@@ -75,6 +79,7 @@ pub fn build(b: *std.Build) void {
         exe.root_module.linkSystemLibrary(library, .{});
     }
     exe.root_module.addWin32ResourceFile(.{ .file = b.path("assets/app.rc") });
+    exe.root_module.addOptions("build_version", build_version);
     b.installArtifact(exe);
 
     const test_step = b.step("test", "Run unit tests");

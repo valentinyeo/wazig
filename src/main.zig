@@ -1,5 +1,8 @@
 const std = @import("std");
 
+// exported so the version string is guaranteed to live in the binary
+export const messages_version: [*:0]const u8 = @import("build_version").version ++ "";
+
 const avatar = @import("avatar.zig");
 const win = @cImport({
     @cDefine("WIN32_LEAN_AND_MEAN", "1");
