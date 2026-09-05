@@ -59,7 +59,7 @@ const reaction_remove = 3007;
 
 const timer_update_check = 4;
 const timer_update_restart = 5;
-const wm_update_ready = win.WM_APP + 1;
+const wm_update_ready = win.WM_APP + 2;
 const update_check_interval_ms: u32 = 4 * 60 * 60 * 1000;
 const update_restart_delay_ms: u32 = 10 * 1000;
 const update_max_asset_bytes: usize = 256 * 1024 * 1024;
