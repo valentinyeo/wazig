@@ -17,9 +17,11 @@ const win = @cImport({
     @cInclude("mfapi.h");
     @cInclude("mfidl.h");
     @cInclude("mfreadwrite.h");
+    @cInclude("winhttp.h");
 });
 
 const app_version = "0.9.7";
+const update = @import("update.zig");
 
 const max_chats = 256;
 const max_groups = 1024;
@@ -30,6 +32,12 @@ const timer_refresh = 1;
 const timer_search = 2;
 const timer_animation = 3;
 const timer_chat_select = 4;
+const timer_update_check = 5;
+const timer_update_restart = 6;
+const wm_update_ready = win.WM_APP + 2;
+const update_check_interval_ms: u32 = 4 * 60 * 60 * 1000;
+const update_restart_delay_ms: u32 = 10 * 1000;
+const update_max_asset_bytes: usize = 256 * 1024 * 1024;
 const id_search = 1008;
 const id_chats = 1016;
 const id_canvas = 1024;
@@ -3435,6 +3443,13 @@ fn canvasProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win
 fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.LPARAM) callconv(.winapi) win.LRESULT {
     const a = app_ptr orelse return win.DefWindowProcW(hwnd, message, wparam, lparam);
     switch (message) {
+        wm_update_ready => {
+            if (wparam != 0) {
+                setStatus(a, "Update installed - restarting in 10 seconds");
+                _ = win.SetTimer(hwnd, timer_update_restart, update_restart_delay_ms, null);
+            }
+            return 0;
+        },
         win.WM_CREATE => {
             a.hwnd = hwnd;
             a.brush_bg = win.CreateSolidBrush(color_bg);
@@ -3453,11 +3468,13 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
             if (a.chats_hwnd) |list| _ = win.SendMessageW(list, win.LB_SETITEMHEIGHT, 0, 64);
             _ = win.SetTimer(hwnd, timer_refresh, 1000, null);
             _ = win.SetTimer(hwnd, timer_animation, 120, null);
+            _ = win.SetTimer(hwnd, timer_update_check, update_check_interval_ms, null);
             refreshGroups(a);
             refreshChats(a);
             refreshMessages(a);
             _ = storeChanged(a);
             startSync(a);
+            startUpdateCheck(hwnd);
             return 0;
         },
         win.WM_SIZE => {
@@ -3548,6 +3565,11 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
                 _ = win.KillTimer(hwnd, timer_chat_select);
                 a.chat_selection_pending = false;
                 refreshMessages(a);
+            } else if (wparam == timer_update_check) {
+                startUpdateCheck(hwnd);
+            } else if (wparam == timer_update_restart) {
+                _ = win.KillTimer(hwnd, timer_update_restart);
+                relaunchIntoUpdate(a);
             }
             return 0;
         },
@@ -4033,5 +4055,296 @@ pub fn main(init: std.process.Init) !void {
         if (handleKeyboard(&app, &message)) continue;
         _ = win.TranslateMessage(&message);
         _ = win.DispatchMessageW(&message);
+    }
+}
+
+// Self-update (WAZI-27): checks GitHub Releases for a newer version, downloads
+// and verifies the release archive, then swaps the running executable in place
+// and relaunches. All work happens on a detached worker thread; the UI only
+// receives a wm_update_ready message once a new version is installed.
+const UpdateContext = struct {
+    io: std.Io,
+    hwnd: win.HWND,
+};
+
+const UpdateOutcome = enum { none, installed };
+
+fn startUpdateCheck(hwnd: win.HWND) void {
+    const a = app_ptr orelse return;
+    const ctx = std.heap.page_allocator.create(UpdateContext) catch return;
+    ctx.* = .{ .io = a.io, .hwnd = hwnd };
+    const thread = std.Thread.spawn(.{}, updateThreadMain, .{ctx}) catch {
+        std.heap.page_allocator.destroy(ctx);
+        return;
+    };
+    thread.detach();
+}
+
+fn updateThreadMain(ctx: *UpdateContext) void {
+    defer std.heap.page_allocator.destroy(ctx);
+    // ponytail: updates are authenticated only by HTTPS plus GitHub's own asset
+    // digest; a code-signing certificate would be needed to authenticate the
+    // publisher itself. Upgrade path: verify an Authenticode signature here.
+    const outcome = performUpdate(ctx.io) catch .none;
+    if (outcome == .installed) _ = win.PostMessageW(ctx.hwnd, wm_update_ready, 1, 0);
+}
+
+fn utf8ToWide(allocator: std.mem.Allocator, text: []const u8) ![:0]u16 {
+    return std.unicode.utf8ToUtf16LeAllocZ(allocator, text);
+}
+
+fn wideToUtf8(allocator: std.mem.Allocator, wide: []const u16) ![]u8 {
+    return std.unicode.utf16LeToUtf8Alloc(allocator, wide);
+}
+
+fn httpGet(allocator: std.mem.Allocator, host: [*:0]const u16, path: [*:0]const u16, headers: [*:0]const u16, max_bytes: usize) ![]u8 {
+    const session = win.WinHttpOpen(lit("Messages updater"), win.WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, null, null, 0) orelse return error.UpdateNetwork;
+    defer _ = win.WinHttpCloseHandle(session);
+    _ = win.WinHttpSetTimeouts(session, 15000, 15000, 60000, 60000);
+    const connection = win.WinHttpConnect(session, host, win.INTERNET_DEFAULT_HTTPS_PORT, 0) orelse return error.UpdateNetwork;
+    defer _ = win.WinHttpCloseHandle(connection);
+    const request = win.WinHttpOpenRequest(connection, lit("GET"), path, null, null, null, win.WINHTTP_FLAG_SECURE) orelse return error.UpdateNetwork;
+    defer _ = win.WinHttpCloseHandle(request);
+    var policy = win.WINHTTP_OPTION_REDIRECT_POLICY_DISALLOW_HTTPS_TO_HTTP;
+    _ = win.WinHttpSetOption(request, win.WINHTTP_OPTION_REDIRECT_POLICY, &policy, @sizeOf(@TypeOf(policy)));
+    _ = win.WinHttpAddRequestHeaders(request, headers, std.math.maxInt(win.DWORD), win.WINHTTP_ADDREQ_FLAG_ADD);
+    if (win.WinHttpSendRequest(request, null, 0, null, 0, 0, 0) == 0) return error.UpdateNetwork;
+    if (win.WinHttpReceiveResponse(request, null) == 0) return error.UpdateNetwork;
+    var status: win.DWORD = 0;
+    var status_size: win.DWORD = @sizeOf(win.DWORD);
+    if (win.WinHttpQueryHeaders(request, win.WINHTTP_QUERY_STATUS_CODE | win.WINHTTP_QUERY_FLAG_NUMBER, null, &status, &status_size, null) == 0 or status != 200) {
+        return error.UpdateHttpStatus;
+    }
+    var body: std.ArrayList(u8) = .empty;
+    errdefer body.deinit(allocator);
+    var chunk: [16384]u8 = undefined;
+    while (true) {
+        var read: win.DWORD = 0;
+        if (win.WinHttpReadData(request, &chunk, chunk.len, &read) == 0) return error.UpdateNetwork;
+        if (read == 0) break;
+        if (body.items.len + read > max_bytes) return error.UpdateTooLarge;
+        try body.appendSlice(allocator, chunk[0..read]);
+    }
+    return body.toOwnedSlice(allocator);
+}
+
+fn httpGetUrl(allocator: std.mem.Allocator, url_wide: []const u16, headers: [*:0]const u16, max_bytes: usize) ![]u8 {
+    var components: win.URL_COMPONENTSW = std.mem.zeroes(win.URL_COMPONENTSW);
+    components.dwStructSize = @sizeOf(win.URL_COMPONENTSW);
+    var host_buf: [256]u16 = undefined;
+    var path_buf: [2048]u16 = undefined;
+    components.lpszHostName = &host_buf;
+    components.dwHostNameLength = host_buf.len;
+    components.lpszUrlPath = &path_buf;
+    components.dwUrlPathLength = path_buf.len;
+    if (win.WinHttpCrackUrl(url_wide.ptr, @intCast(url_wide.len), 0, &components) == 0) return error.UpdateBadUrl;
+    if (components.nScheme != win.INTERNET_SCHEME_HTTPS) return error.UpdateBadUrl;
+    if (components.dwHostNameLength == 0 or components.dwHostNameLength >= host_buf.len) return error.UpdateBadUrl;
+    // Downloads only ever come from GitHub release hosts.
+    const host_utf8 = try wideToUtf8(allocator, host_buf[0..components.dwHostNameLength]);
+    defer allocator.free(host_utf8);
+    const github_suffixes = [_][]const u8{ "api.github.com", "objects.githubusercontent.com", "github.com" };
+    var host_allowed = false;
+    for (github_suffixes) |allowed| {
+        if (std.mem.eql(u8, host_utf8, allowed)) host_allowed = true;
+    }
+    if (!host_allowed) return error.UpdateBadUrl;
+    if (components.dwUrlPathLength >= path_buf.len) return error.UpdateBadUrl;
+    host_buf[components.dwHostNameLength] = 0;
+    path_buf[components.dwUrlPathLength] = 0;
+    return httpGet(
+        allocator,
+        host_buf[0..components.dwHostNameLength :0].ptr,
+        path_buf[0..components.dwUrlPathLength :0].ptr,
+        headers,
+        max_bytes,
+    );
+}
+
+fn performUpdate(io: std.Io) !UpdateOutcome {
+    const allocator = std.heap.page_allocator;
+    const current = update.parseVersion(app_version) orelse return error.UpdateBadVersion;
+
+    // One updater at a time across every running copy of the app.
+    const mutex = win.CreateMutexW(null, win.FALSE, lit("Local\\MessagesUpdateMutex")) orelse return error.UpdateMutexFailed;
+    defer _ = win.CloseHandle(mutex);
+    if (win.WaitForSingleObject(mutex, 0) != win.WAIT_OBJECT_0) return .none;
+    defer _ = win.ReleaseMutex(mutex);
+
+    var exe_wide_buf: [519]u16 = undefined;
+    const exe_len: usize = @intCast(win.GetModuleFileNameW(null, &exe_wide_buf, exe_wide_buf.len));
+    if (exe_len == 0 or exe_len >= exe_wide_buf.len) return error.UpdateNoExePath;
+    const exe_path = try wideToUtf8(allocator, exe_wide_buf[0..exe_len]);
+    defer allocator.free(exe_path);
+    const exe_dir = std.fs.path.dirname(exe_path) orelse return error.UpdateNoExePath;
+
+    var local_buf: [256]u16 = undefined;
+    const local_len: usize = @intCast(win.GetEnvironmentVariableW(lit("LOCALAPPDATA"), &local_buf, local_buf.len));
+    if (local_len == 0 or local_len >= local_buf.len) return error.UpdateNoLocalAppData;
+    const local_dir = try wideToUtf8(allocator, local_buf[0..local_len]);
+    defer allocator.free(local_dir);
+    const update_root = try std.fmt.allocPrint(allocator, "{s}\\Wazig\\update", .{local_dir});
+    defer allocator.free(update_root);
+
+    const cwd = std.Io.Dir.cwd();
+    // Fresh staging area; also clears leftovers from any earlier attempt.
+    cwd.deleteTree(io, update_root) catch {};
+    const root = try cwd.createDirPathOpen(io, update_root, .{});
+    defer root.close(io);
+
+    // A .old backup left by a completed earlier swap is safe to drop now.
+    {
+        const exe_old = try std.fmt.allocPrint(allocator, "{s}\\Messages.exe.old", .{exe_dir});
+        defer allocator.free(exe_old);
+        const exe_old_wide = try utf8ToWide(allocator, exe_old);
+        defer allocator.free(exe_old_wide);
+        _ = win.DeleteFileW(exe_old_wide.ptr);
+    }
+
+    const api_headers = try utf8ToWide(allocator, "User-Agent: Messages updater\r\nAccept: application/vnd.github+json\r\n");
+    defer allocator.free(api_headers);
+    const json = try httpGet(allocator, lit("api.github.com"), lit("/repos/valentinyeo/wazig/releases/latest"), api_headers.ptr, 4 * 1024 * 1024);
+    defer allocator.free(json);
+
+    var parsed: std.json.Parsed(std.json.Value) = undefined;
+    const asset = (try update.pickAsset(allocator, json, &parsed)) orelse return .none;
+    defer parsed.deinit();
+    if (!update.isNewer(asset.tag, current)) return .none;
+
+    const asset_url = try utf8ToWide(allocator, asset.url);
+    defer allocator.free(asset_url);
+    const download_headers = try utf8ToWide(allocator, "User-Agent: Messages updater\r\n");
+    defer allocator.free(download_headers);
+    const body = try httpGetUrl(allocator, asset_url, download_headers.ptr, update_max_asset_bytes);
+    defer allocator.free(body);
+    if (asset.size != 0 and body.len != asset.size) return error.UpdateSizeMismatch;
+    if (!update.digestMatches(body, asset.digest)) return error.UpdateDigestMismatch;
+
+    // Save the verified archive; the std.zip extractor needs a seekable file.
+    {
+        const zip_file = try root.createFile(io, "Messages.zip", .{});
+        defer zip_file.close(io);
+        var buffer: [64 * 1024]u8 = undefined;
+        var zip_writer = zip_file.writer(io, &buffer);
+        try zip_writer.interface.writeAll(body);
+        try zip_writer.interface.flush();
+    }
+    const stage = try root.createDirPathOpen(io, "stage", .{});
+    defer stage.close(io);
+    // Bound the archive before trusting it: entry count and decompressed size.
+    {
+        const scan_file = try root.openFile(io, "Messages.zip", .{});
+        defer scan_file.close(io);
+        var scan_buffer: [64 * 1024]u8 align(16) = undefined;
+        var scan_reader = scan_file.reader(io, &scan_buffer);
+        var scan = try std.zip.Iterator.init(&scan_reader);
+        var entry_count: u64 = 0;
+        var total_uncompressed: u64 = 0;
+        while (try scan.next()) |entry| {
+            entry_count += 1;
+            if (entry_count > 4096) return error.UpdateZipTooLarge;
+            total_uncompressed += entry.uncompressed_size;
+            if (entry.uncompressed_size > 512 * 1024 * 1024 or total_uncompressed > 512 * 1024 * 1024) return error.UpdateZipTooLarge;
+        }
+    }
+    var diagnostics: std.zip.Diagnostics = .{ .allocator = allocator };
+    defer diagnostics.deinit();
+    {
+        const zip_file = try root.openFile(io, "Messages.zip", .{});
+        defer zip_file.close(io);
+        var buffer: [64 * 1024]u8 align(16) = undefined;
+        var zip_reader = zip_file.reader(io, &buffer);
+        try std.zip.extract(stage, &zip_reader, .{ .diagnostics = &diagnostics });
+    }
+
+    const inner_root = if (diagnostics.root_dir.len > 0) diagnostics.root_dir else "";
+    const new_exe_rel = try std.fmt.allocPrint(allocator, "{s}/Messages.exe", .{inner_root});
+    defer allocator.free(new_exe_rel);
+    _ = try stage.statFile(io, new_exe_rel, .{});
+
+    // Swap: rename the running exe aside (always allowed on Windows), copy the
+    // new files in, and roll the rename back if any copy fails.
+    const exe_old = try std.fmt.allocPrint(allocator, "{s}\\Messages.exe.old", .{exe_dir});
+    defer allocator.free(exe_old);
+    const exe_old_wide = try utf8ToWide(allocator, exe_old);
+    defer allocator.free(exe_old_wide);
+    const exe_wide = try utf8ToWide(allocator, exe_path);
+    defer allocator.free(exe_wide);
+    if (win.MoveFileExW(exe_wide.ptr, exe_old_wide.ptr, win.MOVEFILE_REPLACE_EXISTING) == 0) return error.UpdateSwapFailed;
+    const stage_path = try std.fmt.allocPrint(allocator, "{s}\\stage", .{update_root});
+    defer allocator.free(stage_path);
+    if (installStagedFiles(io, allocator, stage, stage_path, inner_root, exe_dir)) {
+        _ = win.DeleteFileW(exe_old_wide.ptr); // best effort; a leftover is removed on next start
+        return .installed;
+    }
+    // Rollback: restore the old executable over the partially copied install.
+    _ = win.MoveFileExW(exe_old_wide.ptr, exe_wide.ptr, win.MOVEFILE_REPLACE_EXISTING);
+    return error.UpdateCopyFailed;
+}
+
+/// Copies every staged file (below `inner_root` inside `stage_path`) into
+/// `exe_dir`. Returns false when any copy fails; files copied before the
+/// failure stay in place but the caller restores the renamed backup over the
+/// main executable.
+fn installStagedFiles(io: std.Io, allocator: std.mem.Allocator, stage: std.Io.Dir, stage_path: []const u8, inner_root: []const u8, exe_dir: []const u8) bool {
+    var walker = stage.walk(allocator) catch return false;
+    defer walker.deinit();
+    while (walker.next(io) catch return false) |entry| {
+        if (entry.kind != .file) continue;
+        const relative = if (inner_root.len > 0 and std.mem.startsWith(u8, entry.path, inner_root))
+            entry.path[inner_root.len + 1 ..]
+        else
+            entry.path;
+        // Never install anything that escapes the application directory.
+        var components = std.mem.splitScalar(u8, relative, '/');
+        while (components.next()) |component| {
+            if (std.mem.eql(u8, component, "..")) return false;
+        }
+        var windows_relative_buf: [512]u8 = undefined;
+        if (relative.len >= windows_relative_buf.len) return false;
+        for (relative, 0..) |c, i| windows_relative_buf[i] = if (c == '/') '\\' else c;
+        const windows_relative = windows_relative_buf[0..relative.len];
+        const destination = std.fmt.allocPrint(allocator, "{s}\\{s}", .{ exe_dir, windows_relative }) catch return false;
+        defer allocator.free(destination);
+        if (std.fs.path.dirname(destination)) |parent| {
+            // Create every missing ancestor; archive entries may nest arbitrarily.
+            var depth: usize = 0;
+            while (depth < parent.len) : (depth += 1) {
+                if (parent[depth] == '\\') {
+                    const prefix_wide = utf8ToWide(allocator, parent[0..depth]) catch return false;
+                    defer allocator.free(prefix_wide);
+                    _ = win.CreateDirectoryW(prefix_wide.ptr, null); // exists already is fine
+                }
+            }
+            const parent_wide = utf8ToWide(allocator, parent) catch return false;
+            defer allocator.free(parent_wide);
+            _ = win.CreateDirectoryW(parent_wide.ptr, null); // exists already is fine
+        }
+        const source = std.fmt.allocPrint(allocator, "{s}\\{s}", .{ stage_path, entry.path }) catch return false;
+        defer allocator.free(source);
+        const source_wide = utf8ToWide(allocator, source) catch return false;
+        defer allocator.free(source_wide);
+        const destination_wide = utf8ToWide(allocator, destination) catch return false;
+        defer allocator.free(destination_wide);
+        if (win.CopyFileW(source_wide.ptr, destination_wide.ptr, win.FALSE) == 0) return false;
+    }
+    return true;
+}
+
+fn relaunchIntoUpdate(a: *App) void {
+    var exe_buf: [519]u16 = undefined;
+    const exe_len: usize = @intCast(win.GetModuleFileNameW(null, &exe_buf, exe_buf.len));
+    if (exe_len == 0 or exe_len >= exe_buf.len) {
+        setStatus(a, "Update installed - restart the app to finish");
+        return;
+    }
+    exe_buf[exe_len] = 0;
+    var startup: win.STARTUPINFOW = std.mem.zeroes(win.STARTUPINFOW);
+    startup.cb = @sizeOf(win.STARTUPINFOW);
+    var process: win.PROCESS_INFORMATION = std.mem.zeroes(win.PROCESS_INFORMATION);
+    if (win.CreateProcessW(exe_buf[0..exe_len :0].ptr, null, null, null, win.FALSE, 0, null, null, &startup, &process) != 0) {
+        _ = win.PostQuitMessage(0);
+    } else {
+        setStatus(a, "Update installed - restart the app to finish");
     }
 }
