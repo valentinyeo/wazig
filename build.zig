@@ -70,6 +70,7 @@ pub fn build(b: *std.Build) void {
         "dwmapi",
         "mfplat",
         "mfplay",
+        "winhttp",
     }) |library| {
         exe.root_module.linkSystemLibrary(library, .{});
     }
@@ -77,7 +78,7 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(exe);
 
     const test_step = b.step("test", "Run unit tests");
-    for ([_][]const u8{ "src/emoji_picker.zig", "src/avatar.zig", "src/webp.zig" }) |test_root| {
+    for ([_][]const u8{ "src/emoji_picker.zig", "src/avatar.zig", "src/webp.zig", "src/update.zig" }) |test_root| {
         const tests = b.addTest(.{
             .root_module = b.createModule(.{
                 .root_source_file = b.path(test_root),
