@@ -31,6 +31,7 @@ pub fn build(b: *std.Build) void {
     }) |library| {
         exe.root_module.linkSystemLibrary(library, .{});
     }
+    exe.root_module.addWin32ResourceFile(.{ .file = b.path("assets/app.rc") });
     b.installArtifact(exe);
     b.installFile("assets/IBMPlexSans-Regular.ttf", "bin/IBMPlexSans-Regular.ttf");
     b.installFile("assets/IBMPlexSans-SemiBold.ttf", "bin/IBMPlexSans-SemiBold.ttf");
