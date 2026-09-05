@@ -657,6 +657,17 @@ fn refreshChats(a: *App) void {
             a.chats[j] = temporary;
         }
     }
+    // A mark-read write may still be queued or running: keep those chats
+    // shown as read until the write lands and the next refresh reflects it.
+    for (a.chats[0..a.chat_count]) |*chat| {
+        var queued: usize = 0;
+        while (queued < a.pending_read_count) : (queued += 1) {
+            if (std.mem.eql(u8, a.pending_reads[queued].slice(), chat.jid.slice())) {
+                chat.unread = false;
+                chat.unread_count = 0;
+            }
+        }
+    }
 
     a.selected_chat = 0;
     if (selected_len > 0) {
@@ -689,11 +700,18 @@ fn markChatRead(a: *App) void {
     if (!a.user_viewed or a.selected_chat >= a.chat_count) return;
     const chat = &a.chats[a.selected_chat];
     if (!chat.unread and chat.unread_count == 0) return;
-    // Clear the badge only once the request is queued: if the queue is
-    // full, keep the unread state so the next view of this chat retries.
-    if (a.pending_read_count < a.pending_reads.len) {
-        a.pending_reads[a.pending_read_count].set(chat.jid.slice());
-        a.pending_read_count += 1;
+    // Clear the badge once the request is queued or already in flight; if
+    // the queue is full, keep the unread state so the next view retries.
+    var already_queued = false;
+    var index: usize = 0;
+    while (index < a.pending_read_count) : (index += 1) {
+        if (std.mem.eql(u8, a.pending_reads[index].slice(), chat.jid.slice())) already_queued = true;
+    }
+    if (already_queued or a.pending_read_count < a.pending_reads.len) {
+        if (!already_queued) {
+            a.pending_reads[a.pending_read_count].set(chat.jid.slice());
+            a.pending_read_count += 1;
+        }
         chat.unread = false;
         chat.unread_count = 0;
         if (a.chats_hwnd) |list| _ = win.InvalidateRect(list, null, win.TRUE);
@@ -723,12 +741,12 @@ fn startNextMarkRead(a: *App) void {
         .stderr = .ignore,
         .create_no_window = true,
     }) catch {
-        removeFirstPendingRead(a);
-        startSync(a);
+        // Keep the jid queued; the timer retries the spawn each tick and
+        // the status bar says why the badge may lag.
+        setStatus(a, "Could not start mark as read; retrying");
         return;
     };
     a.read_child = child;
-    removeFirstPendingRead(a);
 }
 
 fn checkMarkRead(a: *App) void {
@@ -738,6 +756,7 @@ fn checkMarkRead(a: *App) void {
         if (win.GetExitCodeProcess(handle, &code) == 0 or code == win.STILL_ACTIVE) return;
         _ = child.wait(a.io) catch {};
         a.read_child = null;
+        removeFirstPendingRead(a);
         // Release any sends or archives that queued up while the store was
         // held, then bring live sync back. startSync skips itself while a
         // write job is running.
@@ -1242,7 +1261,7 @@ fn checkAvatarDownload(a: *App) void {
 }
 
 fn requestSelectedAvatar(a: *App) void {
-    if (a.media_child != null or a.send_child != null or a.archive_child != null or a.pending_archive_count > 0 or avatarBusy(a)) return;
+    if (a.read_child != null or a.pending_read_count > 0 or a.media_child != null or a.send_child != null or a.archive_child != null or a.pending_archive_count > 0 or avatarBusy(a)) return;
     if (a.chat_count == 0 or a.selected_chat >= a.chat_count) return;
     const entry = avatarForChat(a, a.chats[a.selected_chat].jid.slice()) orelse return;
     if (entry.status != .unknown or entry.path.len == 0) return;
