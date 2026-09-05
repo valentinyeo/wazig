@@ -12,7 +12,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
-    exe.subsystem = .windows;
+    exe.subsystem = .Windows;
     exe.root_module.link_libc = true;
     for ([_][]const u8{
         "user32",
@@ -23,6 +23,8 @@ pub fn build(b: *std.Build) void {
         "windowscodecs",
         "shell32",
         "dwmapi",
+        "mfplat",
+        "mfplay",
     }) |library| {
         exe.root_module.linkSystemLibrary(library, .{});
     }
