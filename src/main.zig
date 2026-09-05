@@ -1474,11 +1474,17 @@ fn archiveSelectedChat(a: *App) void {
     const should_unarchive = a.show_archived or chat.archived;
     const args = [_][]const u8{ a.wacli_path, "--json", "chats", if (should_unarchive) "unarchive" else "archive", "--chat", chat.jid.slice() };
     setStatus(a, if (should_unarchive) "Unarchiving chat..." else "Archiving chat...");
+    // The live sync process holds the wacli store lock for its lifetime, and
+    // chat-state commands like archive have no send-style IPC delegate, so the
+    // sync child must be stopped or the archive call fails on the lock.
+    stopSync(a);
     var parsed = runWacli(a, &args) catch {
+        startSync(a);
         setStatus(a, if (should_unarchive) "Could not unarchive chat" else "Could not archive chat");
         return;
     };
     parsed.deinit();
+    startSync(a);
     refreshChats(a);
     refreshMessages(a);
     setStatus(a, if (should_unarchive) "Chat unarchived" else "Chat archived");
