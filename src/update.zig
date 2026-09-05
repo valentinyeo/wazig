@@ -1,13 +1,17 @@
 // Self-update logic for WAZI-27: pure, testable parts of the GitHub Releases
 // updater. The Win32 transport (WinHTTP, file swap, relaunch) lives in main.zig.
 //
-// Release contract shared with WAZI-26 (release workflow): a release tagged
-// "vMAJOR.MINOR.PATCH" (no pre-release suffix) with an asset named
-// "Messages-windows-x86_64.zip" that contains the zig-out/bin contents.
+// Release contract with the live WAZI-26 release workflow: a release tagged
+// "vMAJOR.MINOR.PATCH" (no pre-release suffix) with one asset named
+// "Messages-<something>.zip" that contains the zig-out/bin contents.
 const std = @import("std");
 
 pub const app_version = "0.1.0";
-pub const zip_asset_name = "Messages-windows-x86_64.zip";
+pub const zip_asset_prefix = "Messages-";
+
+pub fn isZipAssetName(name: []const u8) bool {
+    return std.mem.startsWith(u8, name, zip_asset_prefix) and std.mem.endsWith(u8, name, ".zip");
+}
 
 pub const Version = struct {
     major: u32,
@@ -94,7 +98,7 @@ fn findAsset(root: std.json.Value) ?Asset {
         if (asset_value != .object) continue;
         const asset = asset_value.object;
         const name = asset.get("name") orelse continue;
-        if (name != .string or !std.mem.eql(u8, name.string, zip_asset_name)) continue;
+        if (name != .string or !isZipAssetName(name.string)) continue;
         const url = asset.get("browser_download_url") orelse continue;
         if (url != .string) continue;
         // No digest means no verification is possible: refuse the update.
@@ -220,4 +224,12 @@ test pickAsset {
     try std.testing.expectError(error.SyntaxError, pickAsset(std.testing.allocator, "not json", &parsed4));
     var parsed5: std.json.Parsed(std.json.Value) = undefined;
     try std.testing.expectEqual(@as(?Asset, null), try pickAsset(std.testing.allocator, "{}", &parsed5));
+}
+
+test isZipAssetName {
+    try std.testing.expect(isZipAssetName("Messages-v0.0.0.zip"));
+    try std.testing.expect(isZipAssetName("Messages-windows-x86_64.zip"));
+    try std.testing.expect(!isZipAssetName("Messages-v0.0.0"));
+    try std.testing.expect(!isZipAssetName("SHA256SUMS.txt"));
+    try std.testing.expect(!isZipAssetName("Other-v1.0.0.zip"));
 }
