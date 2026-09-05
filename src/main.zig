@@ -179,6 +179,9 @@ const App = struct {
     wic_factory: [*c]win.IWICImagingFactory = null,
     displayed_jid: Utf8Text(191) = .{},
     displayed_timestamp: Utf8Text(47) = .{},
+    played: [2048]u64 = [_]u64{0} ** 2048,
+    played_count: usize = 0,
+    played_path: []u8 = &.{},
 };
 
 var app_ptr: ?*App = null;
@@ -472,6 +475,48 @@ fn isImage(message: *const Message) bool {
 
 fn isVideo(message: *const Message) bool {
     return std.ascii.eqlIgnoreCase(message.media_type.slice(), "video");
+}
+
+fn isAudio(message: *const Message) bool {
+    return std.ascii.eqlIgnoreCase(message.media_type.slice(), "audio") or
+        std.mem.startsWith(u8, message.mime_type.slice(), "audio/");
+}
+
+fn wasPlayed(a: *App, id: []const u8) bool {
+    const hash = std.hash.Wyhash.hash(0, id);
+    for (a.played[0..@min(a.played_count, a.played.len)]) |entry| if (entry == hash) return true;
+    return false;
+}
+
+fn loadPlayed(a: *App) void {
+    if (a.played_path.len == 0) return;
+    const contents = std.Io.Dir.readFileAlloc(.cwd(), a.io, a.played_path, a.allocator, std.Io.Limit.limited(128 * 1024)) catch return;
+    defer a.allocator.free(contents);
+    var lines = std.mem.tokenizeAny(u8, contents, "\r\n");
+    while (lines.next()) |line| {
+        if (a.played_count >= a.played.len) break;
+        a.played[a.played_count] = std.fmt.parseInt(u64, line, 16) catch continue;
+        a.played_count += 1;
+    }
+}
+
+fn markPlayed(a: *App, id: []const u8) void {
+    if (id.len == 0 or wasPlayed(a, id)) return;
+    const hash = std.hash.Wyhash.hash(0, id);
+    // ponytail: fixed 2048-entry ring; once full, oldest entries are overwritten and fall back to unplayed
+    a.played[a.played_count % a.played.len] = hash;
+    a.played_count += 1;
+    if (a.played_path.len == 0) return;
+    var buffer: [40]u8 = undefined;
+    const line = std.fmt.bufPrint(&buffer, "{x}\n", .{hash}) catch return;
+    var contents = std.ArrayList(u8).empty;
+    defer contents.deinit(a.allocator);
+    if (std.Io.Dir.readFileAlloc(.cwd(), a.io, a.played_path, a.allocator, std.Io.Limit.limited(128 * 1024))) |existing| {
+        defer a.allocator.free(existing);
+        contents.appendSlice(a.allocator, existing) catch return;
+    } else |_| {}
+    contents.appendSlice(a.allocator, line) catch return;
+    std.Io.Dir.writeFile(.cwd(), a.io, .{ .sub_path = a.played_path, .data = contents.items }) catch return;
 }
 
 fn isGif(message: *const Message) bool {
@@ -1172,10 +1217,16 @@ fn drawCanvas(hwnd: win.HWND, a: *App) void {
             text_top += message.bitmap_height + 8;
         } else if (message.media_type.len > 0) {
             _ = win.SelectObject(hdc, @ptrCast(a.font_small.?));
-            _ = win.SetTextColor(hdc, color_accent);
             var media_rect = win.RECT{ .left = left + 12, .top = text_top + 4, .right = right - 12, .bottom = text_top + 46 };
             const local = message.local_path.len > 0;
-            const label = if (isVideo(message))
+            const played = local and isAudio(message) and wasPlayed(a, message.id.slice());
+            _ = win.SetTextColor(hdc, if (played) color_muted else color_accent);
+            const label = if (isAudio(message))
+                (if (local)
+                    (if (played) lit("Voice note · played") else lit("Voice note · click to play"))
+                else
+                    lit("Voice note · click to download"))
+            else if (isVideo(message))
                 (if (local) lit("Video · click to play") else lit("Video · click to download"))
             else if (isImage(message))
                 (if (local) lit("Image · click to open") else lit("Image · click to download"))
@@ -1227,7 +1278,13 @@ fn canvasProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win
                 const bubble = item.bubble_hit;
                 if (x >= media.left and x <= media.right and y >= media.top and y <= media.bottom) {
                     a.selected_message = index;
-                    if (item.local_path.len > 0) openMedia(a, item) else downloadMedia(a, index, false);
+                    if (item.local_path.len > 0) {
+                        openMedia(a, item);
+                        if (isAudio(item)) {
+                            markPlayed(a, item.id.slice());
+                            _ = win.InvalidateRect(hwnd, null, win.TRUE);
+                        }
+                    } else downloadMedia(a, index, false);
                     break;
                 }
                 if (x >= bubble.left and x <= bubble.right and y >= bubble.top and y <= bubble.bottom) {
@@ -1510,6 +1567,18 @@ fn findWacli(init: std.process.Init, allocator: std.mem.Allocator) ![]u8 {
     return std.fs.path.join(allocator, &.{ local, "Programs", "wacli", "wacli.exe" });
 }
 
+fn findPlayedPath(init: std.process.Init, allocator: std.mem.Allocator) []u8 {
+    const local = init.environ_map.get("LOCALAPPDATA") orelse return &.{};
+    const dir = std.fs.path.join(allocator, &.{ local, "Messages" }) catch return &.{};
+    std.Io.Dir.createDirPath(.cwd(), init.io, dir) catch {};
+    const path = std.fs.path.join(allocator, &.{ dir, "played.txt" }) catch {
+        allocator.free(dir);
+        return &.{};
+    };
+    allocator.free(dir);
+    return path;
+}
+
 fn bundledFilePath(comptime filename: []const u8) WideText(519) {
     var result = WideText(519){};
     const length: usize = @intCast(win.GetModuleFileNameW(null, &result.buf, result.buf.len));
@@ -1529,6 +1598,8 @@ pub fn main(init: std.process.Init) !void {
     const wacli_path = try findWacli(init, init.gpa);
     defer init.gpa.free(wacli_path);
     var app = App{ .allocator = init.gpa, .io = init.io, .instance = instance, .wacli_path = wacli_path, .deepgram_configured = init.environ_map.get("DEEPGRAM_API_KEY") != null };
+    app.played_path = findPlayedPath(init, init.gpa);
+    loadPlayed(&app);
     app_ptr = &app;
     defer app_ptr = null;
 
