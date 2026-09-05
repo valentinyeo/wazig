@@ -60,6 +60,9 @@ const command_speed_150 = 2017;
 const command_speed_200 = 2018;
 const command_copy_text = 2019;
 const command_open_external = 2030;
+// posted from the Media Foundation callback to the main window, which forwards
+// the close to the player on the UI thread (no player state touched off-thread)
+const wm_player_close = 0x8000 + 1; // WM_APP + 1
 const command_copy_link = 2020;
 const command_copy_selection = 2021;
 const command_copy_transcript = 2022;
@@ -1553,9 +1556,10 @@ fn playerCallbackEvent(_: [*c]win.IMFPMediaPlayerCallback, event: [*c]win.MFP_EV
     if (event == null) return;
     switch (event.*.eEventType) {
         win.MFP_EVENT_TYPE_ERROR, win.MFP_EVENT_TYPE_PLAYBACK_ENDED => {
-            // never touch player state here; the callback runs on a Media Foundation thread
+            // runs on a Media Foundation thread: only post to the main window,
+            // which closes the player on the UI thread
             if (app_ptr) |a| {
-                if (a.player_window) |hwnd| _ = win.PostMessageW(hwnd, win.WM_CLOSE, 0, 0);
+                if (a.hwnd) |hwnd| _ = win.PostMessageW(hwnd, wm_player_close, 0, 0);
             }
         },
         else => {},
@@ -1604,6 +1608,13 @@ fn playerProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win
                 _ = player.lpVtbl.*.Release.?(player);
                 a.mf_player = null;
             }
+            return 0;
+        },
+        win.WM_PAINT => {
+            var paint: win.PAINTSTRUCT = undefined;
+            const hdc = win.BeginPaint(hwnd, &paint);
+            _ = win.EndPaint(hwnd, &paint);
+            _ = hdc;
             return 0;
         },
         else => {},
@@ -3592,6 +3603,10 @@ fn canvasProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win
 fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.LPARAM) callconv(.winapi) win.LRESULT {
     const a = app_ptr orelse return win.DefWindowProcW(hwnd, message, wparam, lparam);
     switch (message) {
+        wm_player_close => {
+            closePlayer(a);
+            return 0;
+        },
         win.WM_CREATE => {
             a.hwnd = hwnd;
             a.brush_bg = win.CreateSolidBrush(color_bg);
