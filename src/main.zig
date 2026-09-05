@@ -835,13 +835,13 @@ fn scrollToSelectedMessage(a: *App) void {
     _ = win.GetClientRect(canvas, &client);
     const bubble_width = std.math.clamp(@divTrunc((client.right - client.left) * 7, 10), 280, 620);
     var total_height: i32 = 18;
-    for (a.messages[0..a.message_count]) |*message| total_height += measureMessage(hdc, a, message, bubble_width) + 8;
+    for (a.messages[0..a.message_count], 0..) |*message, index| total_height += measureMessage(hdc, a, message, bubble_width, showSenderName(a, index)) + 8;
     a.max_scroll = @max(0, total_height - (client.bottom - client.top));
     var y = client.bottom - 14 + a.scroll_y;
     var index = a.message_count;
     while (index > 0) {
         index -= 1;
-        const height = measureMessage(hdc, a, &a.messages[index], bubble_width);
+        const height = measureMessage(hdc, a, &a.messages[index], bubble_width, showSenderName(a, index));
         y -= height + 8;
         if (index != selected) continue;
         if (y < client.top + 8) a.scroll_y += client.top + 8 - y;
@@ -1075,18 +1075,30 @@ fn drawChat(a: *App, item: *win.DRAWITEMSTRUCT) void {
     }
 }
 
-fn measureMessage(hdc: win.HDC, a: *App, message: *const Message, width: i32) i32 {
+// Consecutive messages from the same sender hide the name header to save space.
+fn showSenderName(a: *App, index: usize) bool {
+    if (index == 0) return true;
+    const message = &a.messages[index];
+    const previous = &a.messages[index - 1];
+    if (message.sender_jid.len > 0 and previous.sender_jid.len > 0)
+        return !std.mem.eql(u8, message.sender_jid.slice(), previous.sender_jid.slice());
+    return !std.mem.eql(u16, message.sender.slice(), previous.sender.slice());
+}
+
+fn measureMessage(hdc: win.HDC, a: *App, message: *const Message, width: i32, show_sender: bool) i32 {
     _ = win.SelectObject(hdc, @ptrCast(a.font.?));
     var rect = win.RECT{ .left = 0, .top = 0, .right = width - 28, .bottom = 0 };
     const text = if (message.text.len > 0) message.text.ptr() else lit(" ");
     const len: c_int = if (message.text.len > 0) @intCast(message.text.len) else 1;
     _ = win.DrawTextW(hdc, text, len, &rect, win.DT_CALCRECT | win.DT_WORDBREAK | win.DT_NOPREFIX);
-    var height = (rect.bottom - rect.top) + 42;
+    const header_height: i32 = if (show_sender) 42 else 22;
+    var height = (rect.bottom - rect.top) + header_height;
     if (message.bitmap_height > 0) {
         height += message.bitmap_height + 8;
     } else if (message.media_type.len > 0) height += 54;
     if (message.reaction.len > 0) height += 18;
-    return @max(height, 58);
+    const min_height: i32 = if (show_sender) 58 else 38;
+    return @max(height, min_height);
 }
 
 fn drawCanvas(hwnd: win.HWND, a: *App) void {
@@ -1100,7 +1112,7 @@ fn drawCanvas(hwnd: win.HWND, a: *App) void {
     const available_width = client.right - client.left;
     const bubble_width = std.math.clamp(@divTrunc(available_width * 7, 10), 280, 620);
     var total_height: i32 = 18;
-    for (a.messages[0..a.message_count]) |*message| total_height += measureMessage(hdc, a, message, bubble_width) + 8;
+    for (a.messages[0..a.message_count], 0..) |*message, index| total_height += measureMessage(hdc, a, message, bubble_width, showSenderName(a, index)) + 8;
     a.max_scroll = @max(0, total_height - (client.bottom - client.top));
     a.scroll_y = std.math.clamp(a.scroll_y, 0, a.max_scroll);
     var y = client.bottom - 14 + a.scroll_y;
@@ -1110,11 +1122,12 @@ fn drawCanvas(hwnd: win.HWND, a: *App) void {
         const message = &a.messages[index];
         message.media_hit = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
         message.bubble_hit = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
-        const estimated_height = measureMessage(hdc, a, message, bubble_width);
+        const show_sender = showSenderName(a, index);
+        const estimated_height = measureMessage(hdc, a, message, bubble_width, show_sender);
         y -= estimated_height + 8;
         if (y > client.bottom or y + estimated_height < client.top) continue;
         ensureBitmap(a, message);
-        const height = measureMessage(hdc, a, message, bubble_width);
+        const height = measureMessage(hdc, a, message, bubble_width, show_sender);
         y -= height - estimated_height;
         if (y > client.bottom or y + height < client.top) continue;
         const left = if (message.from_me) client.right - bubble_width - 24 else 24;
@@ -1131,11 +1144,14 @@ fn drawCanvas(hwnd: win.HWND, a: *App) void {
         if (selection_pen) |pen| _ = win.DeleteObject(pen);
         _ = win.DeleteObject(brush);
 
-        _ = win.SelectObject(hdc, @ptrCast(a.font_bold.?));
-        _ = win.SetTextColor(hdc, if (message.from_me) color_text else rgb(83, 189, 235));
-        var sender_rect = win.RECT{ .left = left + 12, .top = y + 8, .right = right - 52, .bottom = y + 28 };
-        _ = win.DrawTextW(hdc, message.sender.ptr(), @intCast(message.sender.len), &sender_rect, win.DT_LEFT | win.DT_SINGLELINE | win.DT_END_ELLIPSIS);
-        var text_top = y + 28;
+        var text_top = y + 8;
+        if (show_sender) {
+            _ = win.SelectObject(hdc, @ptrCast(a.font_bold.?));
+            _ = win.SetTextColor(hdc, if (message.from_me) color_text else rgb(83, 189, 235));
+            var sender_rect = win.RECT{ .left = left + 12, .top = y + 8, .right = right - 52, .bottom = y + 28 };
+            _ = win.DrawTextW(hdc, message.sender.ptr(), @intCast(message.sender.len), &sender_rect, win.DT_LEFT | win.DT_SINGLELINE | win.DT_END_ELLIPSIS);
+            text_top = y + 28;
+        }
         if (message.bitmap) |bitmap| {
             const image_left = left + @divTrunc(bubble_width - message.bitmap_width, 2);
             const image_top = text_top + 4;
