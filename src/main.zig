@@ -3125,8 +3125,10 @@ fn drawSenderAvatar(hdc: win.HDC, a: *App, x: i32, top: i32, message: *const Mes
     // the jid is missing (both are stable per person).
     const seed = if (message.sender_jid.len > 0)
         message.sender_jid.slice()
-    else
-        std.mem.asBytes(&message.sender.buf[0])[0..2];
+    else blk: {
+        const units = message.sender.slice();
+        break :blk std.mem.sliceAsBytes(units[0..@min(units.len, 2)]);
+    };
     const tint = senderColorFor(seed);
     const circle_brush = win.CreateSolidBrush(rgb(tint.r, tint.g, tint.b)) orelse return;
     defer _ = win.DeleteObject(circle_brush);
