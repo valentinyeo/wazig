@@ -3585,6 +3585,10 @@ fn handleKeyboard(a: *App, message: *const win.MSG) bool {
     const control = win.GetKeyState(win.VK_CONTROL) < 0;
     const shift = win.GetKeyState(win.VK_SHIFT) < 0;
     const alt = win.GetKeyState(win.VK_MENU) < 0;
+    // Swallow a bare Alt keydown: if it reaches the edit control's default
+    // proc it enters menu mode, which hides the caret, and because Alt+J/K
+    // are consumed here the mode never exits and the caret stays hidden.
+    if (alt and key == win.VK_MENU) return true;
     if (control and key == 'F') {
         if (a.search) |search| {
             _ = win.SetFocus(search);
