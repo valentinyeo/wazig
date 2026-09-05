@@ -11,6 +11,7 @@ const win = @cImport({
     @cInclude("shellapi.h");
     @cInclude("shobjidl.h");
     @cInclude("wincodec.h");
+    @cInclude("mfplay.h");
 });
 
 const max_chats = 256;
@@ -177,6 +178,8 @@ const App = struct {
     media_attempts: [512]u64 = [_]u64{0} ** 512,
     media_attempt_count: usize = 0,
     wic_factory: [*c]win.IWICImagingFactory = null,
+    player_window: ?win.HWND = null,
+    mf_player: ?*win.IMFPMediaPlayer = null,
     displayed_jid: Utf8Text(191) = .{},
     displayed_timestamp: Utf8Text(47) = .{},
     played: [2048]u64 = [_]u64{0} ** 2048,
@@ -626,7 +629,10 @@ fn downloadMedia(a: *App, message_index: usize, automatic: bool) void {
     if (a.media_child != null) return;
     const message = &a.messages[message_index];
     if (message.media_type.len == 0 or message.id.len == 0) return;
-    setStatus(a, if (automatic) "Downloading image..." else "Downloading attachment...");
+    setStatus(a, if (automatic)
+        (if (isVideo(message)) "Downloading video..." else "Downloading image...")
+    else
+        "Downloading attachment...");
     if (a.hwnd) |hwnd| _ = win.UpdateWindow(hwnd);
     stopSync(a);
     const chat = &a.chats[a.selected_chat];
@@ -654,10 +660,10 @@ fn mediaWasAttempted(a: *App, id: []const u8) bool {
     return false;
 }
 
-fn autoDownloadNextImage(a: *App) void {
+fn autoDownloadNextMedia(a: *App) void {
     if (a.media_child != null) return;
     for (a.messages[0..a.message_count], 0..) |*message, index| {
-        if (!isImage(message) or message.local_path.len > 0 or message.id.len == 0) continue;
+        if ((!isImage(message) and !isVideo(message)) or message.local_path.len > 0 or message.id.len == 0) continue;
         if (mediaWasAttempted(a, message.id.slice())) continue;
         downloadMedia(a, index, true);
         return;
@@ -682,6 +688,168 @@ fn openMedia(a: *App, message: *const Message) void {
     const result = win.ShellExecuteW(a.hwnd.?, lit("open"), message.local_path.ptr(), null, null, win.SW_SHOWNORMAL);
     if (@intFromPtr(result) <= 32) setStatus(a, "Windows could not open the attachment");
 }
+
+fn clampPlayerSize(width: u32, height: u32) [2]u32 {
+    const max_width: u32 = 800;
+    const max_height: u32 = 450;
+    if (width == 0 or height == 0) return .{ 640, 360 };
+    var w: u64 = width;
+    var h: u64 = height;
+    if (w > max_width) {
+        h = @max(1, h * max_width / w);
+        w = max_width;
+    }
+    if (h > max_height) {
+        w = @max(1, w * max_height / h);
+        h = max_height;
+    }
+    return .{ @intCast(w), @intCast(h) };
+}
+
+fn playerCallbackQueryInterface(_: [*c]win.IMFPMediaPlayerCallback, riid: [*c]const win.GUID, ppv_object: [*c]?*anyopaque) callconv(.c) win.HRESULT {
+    if (ppv_object != null and riid != null) {
+        const iid_callback = win.GUID{ .Data1 = 0x766c8ffb, .Data2 = 0x5fdb, .Data3 = 0x4fea, .Data4 = .{ 0xa2, 0x8d, 0xb9, 0x12, 0x99, 0x6f, 0x51, 0xbd } };
+        const g = riid.*;
+        const is_unknown = g.Data1 == 0 and g.Data2 == 0 and g.Data3 == 0 and g.Data4[0] == 0 and g.Data4[1] == 0 and g.Data4[2] == 0 and g.Data4[3] == 0xc0 and g.Data4[4] == 0 and g.Data4[5] == 0 and g.Data4[6] == 0 and g.Data4[7] == 0x46;
+        const is_callback = g.Data1 == iid_callback.Data1 and g.Data2 == iid_callback.Data2 and g.Data3 == iid_callback.Data3 and std.mem.eql(u8, &g.Data4, &iid_callback.Data4);
+        if (is_unknown or is_callback) {
+            ppv_object.* = @ptrCast(&player_callback);
+            _ = playerCallbackAddRef(&player_callback);
+            return 0;
+        }
+        ppv_object.* = null;
+    }
+    return win.E_NOINTERFACE;
+}
+
+fn playerCallbackAddRef(_: [*c]win.IMFPMediaPlayerCallback) callconv(.c) win.ULONG {
+    player_callback_refs += 1;
+    return player_callback_refs;
+}
+
+fn playerCallbackRelease(_: [*c]win.IMFPMediaPlayerCallback) callconv(.c) win.ULONG {
+    if (player_callback_refs > 0) player_callback_refs -= 1;
+    return player_callback_refs;
+}
+
+fn playerCallbackEvent(_: [*c]win.IMFPMediaPlayerCallback, event: [*c]win.MFP_EVENT_HEADER) callconv(.c) void {
+    if (event == null) return;
+    if (event.*.eEventType == win.MFP_EVENT_TYPE_ERROR) {
+        if (app_ptr) |a| {
+            if (a.player_window) |hwnd| _ = win.SetWindowTextW(hwnd, lit("Messages · Video (playback failed)"));
+        }
+    }
+}
+
+var player_callback = win.IMFPMediaPlayerCallback{ .lpVtbl = &player_callback_vtable };
+var player_callback_vtable = win.IMFPMediaPlayerCallbackVtbl{
+    .QueryInterface = playerCallbackQueryInterface,
+    .AddRef = playerCallbackAddRef,
+    .Release = playerCallbackRelease,
+    .OnMediaPlayerEvent = playerCallbackEvent,
+};
+var player_callback_refs: u32 = 1;
+
+var player_class_registered: bool = false;
+
+fn closePlayer(a: *App) void {
+    if (a.mf_player) |player| {
+        _ = player.lpVtbl.*.Shutdown.?(player);
+        _ = player.lpVtbl.*.Release.?(player);
+        a.mf_player = null;
+    }
+    if (a.player_window) |hwnd| {
+        a.player_window = null;
+        _ = win.DestroyWindow(hwnd);
+    }
+}
+
+fn playerProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.LPARAM) callconv(.winapi) win.LRESULT {
+    const a = app_ptr orelse return win.DefWindowProcW(hwnd, message, wparam, lparam);
+    switch (message) {
+        win.WM_KEYDOWN => {
+            if (wparam == 27) { // escape
+                closePlayer(a);
+                return 0;
+            }
+        },
+        win.WM_CLOSE => {
+            closePlayer(a);
+            return 0;
+        },
+        win.WM_DESTROY => {
+            if (a.player_window != null and a.player_window.? == hwnd) a.player_window = null;
+            if (a.mf_player) |player| {
+                _ = player.lpVtbl.*.Shutdown.?(player);
+                _ = player.lpVtbl.*.Release.?(player);
+                a.mf_player = null;
+            }
+            return 0;
+        },
+        else => {},
+    }
+    return win.DefWindowProcW(hwnd, message, wparam, lparam);
+}
+
+fn playVideoInline(a: *App, message: *const Message) void {
+    if (message.local_path.len == 0) return;
+    if (a.player_window) |hwnd| {
+        _ = win.SetForegroundWindow(hwnd);
+        return;
+    }
+    const size = clampPlayerSize(@intCast(@max(message.bitmap_width, 0)), @intCast(@max(message.bitmap_height, 0)));
+    var rect = win.RECT{ .left = 0, .top = 0, .right = @intCast(size[0]), .bottom = @intCast(size[1]) };
+    _ = win.AdjustWindowRect(&rect, win.WS_OVERLAPPEDWINDOW, 0);
+    const width = rect.right - rect.left;
+    const height = rect.bottom - rect.top;
+
+    if (!player_class_registered) {
+        var class = win.WNDCLASSEXW{
+            .cbSize = @sizeOf(win.WNDCLASSEXW),
+            .style = win.CS_HREDRAW | win.CS_VREDRAW,
+            .lpfnWndProc = playerProc,
+            .hInstance = a.instance,
+            .hCursor = win.LoadCursorW(null, @ptrFromInt(32512)),
+            .hbrBackground = win.CreateSolidBrush(color_bg),
+            .lpszClassName = lit("MessagesVideoPlayer"),
+            .hIconSm = null,
+        };
+        if (win.RegisterClassExW(&class) == 0) {
+            setStatus(a, "Could not open the video player");
+            return;
+        }
+        player_class_registered = true;
+    }
+    const hwnd = win.CreateWindowExW(
+        0,
+        lit("MessagesVideoPlayer"),
+        lit("Messages · Video"),
+        win.WS_OVERLAPPEDWINDOW,
+        win.CW_USEDEFAULT,
+        win.CW_USEDEFAULT,
+        width,
+        height,
+        a.hwnd orelse null,
+        null,
+        a.instance,
+        null,
+    ) orelse {
+        setStatus(a, "Could not open the video player");
+        return;
+    };
+    a.player_window = hwnd;
+    var player: ?*win.IMFPMediaPlayer = null;
+    const hr = win.MFPCreateMediaPlayer(message.local_path.ptr(), 1, win.MFP_OPTION_NONE, &player_callback, hwnd, &player);
+    if (hr < 0 or player == null) {
+        setStatus(a, "Video playback is not available for this file");
+        a.player_window = null;
+        _ = win.DestroyWindow(hwnd);
+        return;
+    }
+    a.mf_player = player;
+    _ = win.ShowWindow(hwnd, win.SW_SHOW);
+}
+
 
 fn advanceGifs(a: *App) void {
     var changed = false;
@@ -1140,6 +1308,7 @@ fn measureMessage(hdc: win.HDC, a: *App, message: *const Message, width: i32, sh
     var height = (rect.bottom - rect.top) + header_height;
     if (message.bitmap_height > 0) {
         height += message.bitmap_height + 8;
+        if (isVideo(message)) height += 18;
     } else if (message.media_type.len > 0) height += 54;
     if (message.reaction.len > 0) height += 18;
     const min_height: i32 = if (show_sender) 58 else 38;
@@ -1209,12 +1378,30 @@ fn drawCanvas(hwnd: win.HWND, a: *App) void {
             }
             message.media_hit = .{ .left = image_left, .top = image_top, .right = image_left + message.bitmap_width, .bottom = image_top + message.bitmap_height };
             if (isVideo(message)) {
+                const center_x = image_left + @divTrunc(message.bitmap_width, 2);
+                const center_y = image_top + @divTrunc(message.bitmap_height, 2);
+                const button_brush = win.CreateSolidBrush(color_bg) orelse null;
+                const button_pen = win.CreatePen(win.PS_SOLID, 2, color_accent);
+                const old_pen2 = win.SelectObject(hdc, button_pen);
+                const old_brush2 = win.SelectObject(hdc, if (button_brush) |bb| @ptrCast(bb) else win.GetStockObject(win.BLACK_BRUSH));
+                _ = win.Ellipse(hdc, center_x - 26, center_y - 26, center_x + 26, center_y + 26);
+                _ = win.SelectObject(hdc, old_brush2);
+                _ = win.SelectObject(hdc, old_pen2);
+                if (button_pen) |pen| _ = win.DeleteObject(pen);
+                if (button_brush) |dead_brush| _ = win.DeleteObject(dead_brush);
                 _ = win.SelectObject(hdc, @ptrCast(a.font_bold.?));
                 _ = win.SetTextColor(hdc, color_text);
-                var play_rect = message.media_hit;
+                var play_rect = win.RECT{ .left = center_x - 26, .top = center_y - 26, .right = center_x + 26, .bottom = center_y + 26 };
                 _ = win.DrawTextW(hdc, lit("▶"), -1, &play_rect, win.DT_CENTER | win.DT_SINGLELINE | win.DT_VCENTER);
             }
             text_top += message.bitmap_height + 8;
+            if (isVideo(message)) {
+                _ = win.SelectObject(hdc, @ptrCast(a.font_small.?));
+                _ = win.SetTextColor(hdc, color_muted);
+                var hint_rect = win.RECT{ .left = left + 12, .top = text_top, .right = right - 12, .bottom = text_top + 18 };
+                _ = win.DrawTextW(hdc, lit("click to play · right-click to open in your player"), -1, &hint_rect, win.DT_CENTER | win.DT_SINGLELINE);
+                text_top += 18;
+            }
         } else if (message.media_type.len > 0) {
             _ = win.SelectObject(hdc, @ptrCast(a.font_small.?));
             var media_rect = win.RECT{ .left = left + 12, .top = text_top + 4, .right = right - 12, .bottom = text_top + 46 };
@@ -1227,7 +1414,7 @@ fn drawCanvas(hwnd: win.HWND, a: *App) void {
                 else
                     lit("Voice note · click to download"))
             else if (isVideo(message))
-                (if (local) lit("Video · click to play") else lit("Video · click to download"))
+                (if (local) lit("Video · click to play · right-click to open") else lit("Video · click to download"))
             else if (isImage(message))
                 (if (local) lit("Image · click to open") else lit("Image · click to download"))
             else
@@ -1278,13 +1465,17 @@ fn canvasProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win
                 const bubble = item.bubble_hit;
                 if (x >= media.left and x <= media.right and y >= media.top and y <= media.bottom) {
                     a.selected_message = index;
-                    if (item.local_path.len > 0) {
+                    if (isVideo(item)) {
+                        if (item.local_path.len > 0) playVideoInline(a, item) else downloadMedia(a, index, false);
+                    } else if (item.local_path.len > 0) {
                         openMedia(a, item);
                         if (isAudio(item)) {
                             markPlayed(a, item.id.slice());
                             _ = win.InvalidateRect(hwnd, null, win.TRUE);
                         }
-                    } else downloadMedia(a, index, false);
+                    } else {
+                        downloadMedia(a, index, false);
+                    }
                     break;
                 }
                 if (x >= bubble.left and x <= bubble.right and y >= bubble.top and y <= bubble.bottom) {
@@ -1299,7 +1490,15 @@ fn canvasProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win
             const x: i32 = @as(i16, @bitCast(loword(@as(usize, @bitCast(lparam)))));
             const y: i32 = @as(i16, @bitCast(hiword(@as(usize, @bitCast(lparam)))));
             for (a.messages[0..a.message_count], 0..) |*item, index| {
+                const media = item.media_hit;
                 const bubble = item.bubble_hit;
+                if (x >= media.left and x <= media.right and y >= media.top and y <= media.bottom) {
+                    a.selected_message = index;
+                    if (isVideo(item) and item.local_path.len > 0) {
+                        openMedia(a, item);
+                        return 0;
+                    }
+                }
                 if (x >= bubble.left and x <= bubble.right and y >= bubble.top and y <= bubble.bottom) {
                     a.selected_message = index;
                     _ = win.InvalidateRect(hwnd, null, win.TRUE);
@@ -1417,7 +1616,7 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
                     }
                     refreshChats(a);
                     if (!messagesAreCurrent(a)) refreshMessages(a);
-                    autoDownloadNextImage(a);
+                    autoDownloadNextMedia(a);
                 }
             } else if (wparam == timer_search) {
                 _ = win.KillTimer(hwnd, timer_search);
@@ -1443,6 +1642,7 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
             return 0;
         },
         win.WM_DESTROY => {
+            closePlayer(a);
             _ = win.KillTimer(hwnd, timer_refresh);
             _ = win.KillTimer(hwnd, timer_search);
             _ = win.KillTimer(hwnd, timer_animation);
@@ -1686,4 +1886,18 @@ pub fn main(init: std.process.Init) !void {
         _ = win.TranslateMessage(&message);
         _ = win.DispatchMessageW(&message);
     }
+}
+
+test clampPlayerSize {
+    const small = clampPlayerSize(320, 240);
+    try std.testing.expectEqual(@as(u32, 320), small[0]);
+    try std.testing.expectEqual(@as(u32, 240), small[1]);
+    const wide = clampPlayerSize(1920, 1080);
+    try std.testing.expectEqual(@as(u32, 800), wide[0]);
+    try std.testing.expectEqual(@as(u32, 450), wide[1]);
+    const tall = clampPlayerSize(1080, 1920);
+    try std.testing.expect(@as(u32, 450) == tall[1]);
+    try std.testing.expect(@as(u32, 253) == tall[0]);
+    const empty = clampPlayerSize(0, 0);
+    try std.testing.expectEqual(@as(u32, 640), empty[0]);
 }
