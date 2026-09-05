@@ -25,6 +25,7 @@ const max_chats = 256;
 const max_groups = 1024;
 const max_messages = 100;
 const max_pending_sends = 32;
+const max_pending_reads = 8;
 const max_avatars = 256;
 const timer_refresh = 1;
 const timer_search = 2;
@@ -287,7 +288,8 @@ const App = struct {
     audio_duration_ms: i64 = 0,
     media_child: ?std.process.Child = null,
     read_child: ?std.process.Child = null,
-    pending_read_jid: Utf8Text(191) = .{},
+    pending_reads: [max_pending_reads]Utf8Text(191) = [_]Utf8Text(191){.{}} ** max_pending_reads,
+    pending_read_count: usize = 0,
     send_child: ?std.process.Child = null,
     pending_sends: [max_pending_sends]PendingSend = [_]PendingSend{.{}} ** max_pending_sends,
     pending_send_count: usize = 0,
@@ -689,37 +691,42 @@ fn markChatRead(a: *App) void {
     if (!chat.unread and chat.unread_count == 0) return;
     chat.unread = false;
     chat.unread_count = 0;
-    a.pending_read_jid.set(chat.jid.slice());
+    if (a.pending_read_count < a.pending_reads.len) {
+        a.pending_reads[a.pending_read_count].set(chat.jid.slice());
+        a.pending_read_count += 1;
+    }
     if (a.chats_hwnd) |list| _ = win.InvalidateRect(list, null, win.TRUE);
     startNextMarkRead(a);
 }
 
-fn markReadBusy(a: *const App) bool {
-    return a.media_child != null or a.send_child != null or a.pending_send_count > 0 or
-        a.archive_child != null or a.pending_archive_count > 0 or avatarBusy(a);
+fn removeFirstPendingRead(a: *App) void {
+    if (a.pending_read_count == 0) return;
+    var index: usize = 1;
+    while (index < a.pending_read_count) : (index += 1) a.pending_reads[index - 1] = a.pending_reads[index];
+    a.pending_read_count -= 1;
 }
 
 // The mark-read write used to run on the UI thread with the sync child
 // stopped, so opening any unread chat froze the window for as long as the
 // store lock took. Run it as a background job like sends and archives.
 fn startNextMarkRead(a: *App) void {
-    if (a.read_child != null or a.pending_read_jid.len == 0) return;
-    if (markReadBusy(a)) return;
+    if (a.read_child != null or a.pending_read_count == 0) return;
+    if (a.media_child != null or a.send_child != null or a.pending_send_count > 0 or
+        a.archive_child != null or a.pending_archive_count > 0 or avatarBusy(a)) return;
     stopSync(a);
     const child = std.process.spawn(a.io, .{
-        .argv = &.{ a.wacli_path, "--json", "--lock-wait", "10s", "chats", "mark-read", "--chat", a.pending_read_jid.slice() },
+        .argv = &.{ a.wacli_path, "--json", "--lock-wait", "10s", "chats", "mark-read", "--chat", a.pending_reads[0].slice() },
         .stdin = .ignore,
         .stdout = .ignore,
         .stderr = .ignore,
         .create_no_window = true,
     }) catch {
-        a.pending_read_jid.set("");
+        removeFirstPendingRead(a);
         startSync(a);
         return;
     };
-    // Cleared once CreateProcessW has copied the argument block.
     a.read_child = child;
-    a.pending_read_jid.set("");
+    removeFirstPendingRead(a);
 }
 
 fn checkMarkRead(a: *App) void {
@@ -730,13 +737,14 @@ fn checkMarkRead(a: *App) void {
         _ = child.wait(a.io) catch {};
         a.read_child = null;
         // Release any sends or archives that queued up while the store was
-        // held, then bring live sync back.
+        // held, then bring live sync back. startSync skips itself while a
+        // write job is running.
         startNextSend(a);
         startNextArchive(a);
         startSync(a);
         refreshChats(a);
         setStatus(a, if (code == 0) "Chat marked as read" else "Mark as read failed");
-    } else if (a.pending_read_jid.len > 0) startNextMarkRead(a);
+    } else startNextMarkRead(a);
 }
 
 fn clearMessages(a: *App) void {
@@ -1687,9 +1695,12 @@ fn refreshMessages(a: *App) void {
 }
 
 fn startSync(a: *App) void {
-    // Hold off while a background mark-read is pending: the write jobs pause
-    // live sync and serialize on the store lock, so don't fight them.
-    if (a.sync_child != null or a.read_child != null or a.pending_read_jid.len > 0) return;
+    // Hold off while any write job is pending: they pause live sync and
+    // serialize on the store lock, so don't fight them. checkSync restarts
+    // sync once the last job finishes.
+    if (a.sync_child != null or a.read_child != null or a.pending_read_count > 0 or
+        a.media_child != null or a.send_child != null or a.pending_send_count > 0 or
+        a.archive_child != null or a.pending_archive_count > 0 or avatarBusy(a)) return;
     const child = std.process.spawn(a.io, .{
         .argv = &.{ a.wacli_path, "--events", "sync", "--follow", "--max-reconnect", "0", "--stale-threshold", "1m", "--refresh-contacts", "--refresh-groups", "--download-media" },
         .stdin = .ignore,
