@@ -286,6 +286,8 @@ const App = struct {
     audio_position_ms: i64 = 0,
     audio_duration_ms: i64 = 0,
     media_child: ?std.process.Child = null,
+    read_child: ?std.process.Child = null,
+    pending_read_jid: Utf8Text(191) = .{},
     send_child: ?std.process.Child = null,
     pending_sends: [max_pending_sends]PendingSend = [_]PendingSend{.{}} ** max_pending_sends,
     pending_send_count: usize = 0,
@@ -687,11 +689,54 @@ fn markChatRead(a: *App) void {
     if (!chat.unread and chat.unread_count == 0) return;
     chat.unread = false;
     chat.unread_count = 0;
-    const args = [_][]const u8{ a.wacli_path, "--json", "--lock-wait", "10s", "chats", "mark-read", "--chat", chat.jid.slice() };
-    if (runWacliExclusive(a, &args)) |parsed| {
-        parsed.deinit();
-    } else |_| {}
-    refreshChats(a);
+    a.pending_read_jid.set(chat.jid.slice());
+    if (a.chats_hwnd) |list| _ = win.InvalidateRect(list, null, win.TRUE);
+    startNextMarkRead(a);
+}
+
+fn markReadBusy(a: *const App) bool {
+    return a.media_child != null or a.send_child != null or a.pending_send_count > 0 or
+        a.archive_child != null or a.pending_archive_count > 0 or avatarBusy(a);
+}
+
+// The mark-read write used to run on the UI thread with the sync child
+// stopped, so opening any unread chat froze the window for as long as the
+// store lock took. Run it as a background job like sends and archives.
+fn startNextMarkRead(a: *App) void {
+    if (a.read_child != null or a.pending_read_jid.len == 0) return;
+    if (markReadBusy(a)) return;
+    stopSync(a);
+    const child = std.process.spawn(a.io, .{
+        .argv = &.{ a.wacli_path, "--json", "--lock-wait", "10s", "chats", "mark-read", "--chat", a.pending_read_jid.slice() },
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+        .create_no_window = true,
+    }) catch {
+        a.pending_read_jid.set("");
+        startSync(a);
+        return;
+    };
+    // Cleared once CreateProcessW has copied the argument block.
+    a.read_child = child;
+    a.pending_read_jid.set("");
+}
+
+fn checkMarkRead(a: *App) void {
+    if (a.read_child) |*child| {
+        const handle = child.id orelse return;
+        var code: win.DWORD = 0;
+        if (win.GetExitCodeProcess(handle, &code) == 0 or code == win.STILL_ACTIVE) return;
+        _ = child.wait(a.io) catch {};
+        a.read_child = null;
+        // Release any sends or archives that queued up while the store was
+        // held, then bring live sync back.
+        startNextSend(a);
+        startNextArchive(a);
+        startSync(a);
+        refreshChats(a);
+        setStatus(a, if (code == 0) "Chat marked as read" else "Mark as read failed");
+    } else if (a.pending_read_jid.len > 0) startNextMarkRead(a);
 }
 
 fn clearMessages(a: *App) void {
@@ -1108,7 +1153,7 @@ fn ensureBitmap(a: *App, message: *Message) void {
 
 fn downloadMedia(a: *App, message_index: usize, automatic: bool) void {
     if (message_index >= a.message_count or a.selected_chat >= a.chat_count) return;
-    if (a.media_child != null) {
+    if (a.media_child != null or a.read_child != null) {
         if (!automatic) setStatus(a, "Waiting for the current download to finish");
         return;
     }
@@ -1148,7 +1193,7 @@ fn isDownloadableMedia(message: *const Message) bool {
 }
 
 fn autoDownloadNextMedia(a: *App) void {
-    if (a.media_child != null or a.archive_child != null or a.pending_archive_count > 0) return;
+    if (a.media_child != null or a.read_child != null or a.archive_child != null or a.pending_archive_count > 0) return;
     for (a.messages[0..a.message_count], 0..) |*message, index| {
         if (!isDownloadableMedia(message) or message.local_path.len > 0 or message.id.len == 0) continue;
         if (mediaWasAttempted(a, message.id.slice())) continue;
@@ -1642,7 +1687,9 @@ fn refreshMessages(a: *App) void {
 }
 
 fn startSync(a: *App) void {
-    if (a.sync_child != null) return;
+    // Hold off while a background mark-read is pending: the write jobs pause
+    // live sync and serialize on the store lock, so don't fight them.
+    if (a.sync_child != null or a.read_child != null or a.pending_read_jid.len > 0) return;
     const child = std.process.spawn(a.io, .{
         .argv = &.{ a.wacli_path, "--events", "sync", "--follow", "--max-reconnect", "0", "--stale-threshold", "1m", "--refresh-contacts", "--refresh-groups", "--download-media" },
         .stdin = .ignore,
@@ -1674,7 +1721,7 @@ fn stopSync(a: *App) void {
 }
 
 fn checkSync(a: *App) void {
-    if (a.media_child != null or a.send_child != null or a.pending_send_count > 0 or a.archive_child != null or a.pending_archive_count > 0 or avatarBusy(a)) return;
+    if (a.media_child != null or a.read_child != null or a.send_child != null or a.pending_send_count > 0 or a.archive_child != null or a.pending_archive_count > 0 or avatarBusy(a)) return;
     if (a.sync_child) |*child| {
         if (child.id) |handle| {
             var code: win.DWORD = 0;
@@ -1705,7 +1752,7 @@ fn removeFirstPendingSend(a: *App) void {
 }
 
 fn startNextSend(a: *App) void {
-    if (a.send_child != null or a.pending_send_count == 0) return;
+    if (a.send_child != null or a.read_child != null or a.pending_send_count == 0) return;
     stopSync(a);
     const pending = &a.pending_sends[0];
     const child = std.process.spawn(a.io, .{
@@ -2191,7 +2238,7 @@ fn removeFirstPendingArchive(a: *App) void {
 }
 
 fn startNextArchive(a: *App) void {
-    if (a.archive_child != null or a.pending_archive_count == 0) return;
+    if (a.archive_child != null or a.read_child != null or a.pending_archive_count == 0) return;
     if (a.media_child != null or a.send_child != null or a.pending_send_count > 0 or avatarBusy(a)) return;
     stopSync(a);
     const pending = &a.pending_archives[0];
@@ -3512,6 +3559,7 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
             if (wparam == timer_refresh) {
                 checkMediaDownload(a);
                 checkSend(a);
+                checkMarkRead(a);
                 checkAvatarDownload(a);
                 checkArchive(a);
                 if (a.media_child == null) {
@@ -3576,6 +3624,8 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
             a.send_child = null;
             if (a.archive_child) |*child| child.kill(a.io);
             a.archive_child = null;
+            if (a.read_child) |*child| child.kill(a.io);
+            a.read_child = null;
             stopSync(a);
             if (a.sync_job) |job| _ = win.CloseHandle(job);
             a.sync_job = null;
