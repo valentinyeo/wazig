@@ -549,15 +549,15 @@ fn refreshChats(a: *App) void {
 
 fn avatarFor(a: *App, jid: []const u8) ?*Avatar {
     if (jid.len == 0 or jid.len > 191) return null;
-    for (a.avatars[0..a.avatar_count]) |*avatar| {
-        if (std.mem.eql(u8, avatar.jid.slice(), jid)) return avatar;
+    for (a.avatars[0..a.avatar_count]) |*entry| {
+        if (std.mem.eql(u8, entry.jid.slice(), jid)) return entry;
     }
     if (a.avatar_count >= a.avatars.len) return null;
-    const avatar = &a.avatars[a.avatar_count];
-    avatar.* = .{};
-    avatar.jid.set(jid);
+    const entry = &a.avatars[a.avatar_count];
+    entry.* = .{};
+    entry.jid.set(jid);
     a.avatar_count += 1;
-    return avatar;
+    return entry;
 }
 
 fn invalidateChatList(a: *App) void {
@@ -641,8 +641,8 @@ fn avatarCachePath(a: *App, jid: []const u8) ?[]u8 {
     return std.fs.path.join(a.allocator, &.{ a.avatar_dir, name }) catch null;
 }
 
-fn loadAvatarFromDisk(a: *App, avatar: *Avatar) bool {
-    const path = avatarCachePath(a, avatar.jid.slice()) orelse return false;
+fn loadAvatarFromDisk(a: *App, entry: *Avatar) bool {
+    const path = avatarCachePath(a, entry.jid.slice()) orelse return false;
     defer a.allocator.free(path);
     const stat = std.Io.Dir.statFile(.cwd(), a.io, path, .{}) catch return false;
     const now = std.Io.Timestamp.now(a.io, .real);
@@ -655,28 +655,28 @@ fn loadAvatarFromDisk(a: *App, avatar: *Avatar) bool {
         _ = win.DeleteObject(bitmap);
         return false;
     }
-    avatar.bitmap = bitmap;
-    avatar.bitmap_width = details.bmWidth;
-    avatar.bitmap_height = details.bmHeight;
-    avatar.state = .ready;
+    entry.bitmap = bitmap;
+    entry.bitmap_width = details.bmWidth;
+    entry.bitmap_height = details.bmHeight;
+    entry.state = .ready;
     return true;
 }
 
-fn fetchAvatar(a: *App, avatar: *Avatar) void {
+fn fetchAvatar(a: *App, entry: *Avatar) void {
     // picture-info is a live fetch that needs the wacli store lock, so the
     // sync child is paused around it (same tradeoff as media downloads).
     stopSync(a);
     defer startSync(a);
-    const args = [_][]const u8{ a.wacli_path, "--json", "profile", "picture-info", "--jid", avatar.jid.slice() };
+    const args = [_][]const u8{ a.wacli_path, "--json", "profile", "picture-info", "--jid", entry.jid.slice() };
     var parsed = runWacli(a, &args) catch {
-        avatar.state = .failed;
+        entry.state = .failed;
         return;
     };
     defer parsed.deinit();
     const root = switch (parsed.value) {
         .object => |object| object,
         else => {
-            avatar.state = .failed;
+            entry.state = .failed;
             return;
         },
     };
@@ -690,34 +690,34 @@ fn fetchAvatar(a: *App, avatar: *Avatar) void {
     const url = getString(object, "url");
     if (url.len == 0) {
         // WhatsApp reports no picture for this chat; keep the initials circle.
-        avatar.state = .failed;
+        entry.state = .failed;
         return;
     }
-    const path = avatarCachePath(a, avatar.jid.slice()) orelse {
-        avatar.state = .failed;
+    const path = avatarCachePath(a, entry.jid.slice()) orelse {
+        entry.state = .failed;
         return;
     };
     defer a.allocator.free(path);
     const wide_url = std.unicode.utf8ToUtf16LeAllocZ(a.allocator, url) catch {
-        avatar.state = .failed;
+        entry.state = .failed;
         return;
     };
     defer a.allocator.free(wide_url);
     const wide_path = std.unicode.utf8ToUtf16LeAllocZ(a.allocator, path) catch {
-        avatar.state = .failed;
+        entry.state = .failed;
         return;
     };
     defer a.allocator.free(wide_path);
     // ponytail: URLDownloadToFileW blocks the UI thread for the length of one
     // small picture download; move to an async WinHTTP worker if that ever hurts.
     if (win.URLDownloadToFileW(null, wide_url.ptr, wide_path.ptr, 0, null) < 0) {
-        avatar.state = .failed;
+        entry.state = .failed;
         return;
     }
-    if (loadAvatarFromDisk(a, avatar)) {
+    if (loadAvatarFromDisk(a, entry)) {
         invalidateChatList(a);
     } else {
-        avatar.state = .failed;
+        entry.state = .failed;
     }
 }
 
@@ -728,19 +728,19 @@ fn refreshAvatars(a: *App) void {
     if (a.avatar_dir.len == 0) return;
     var fetch_target: ?*Avatar = null;
     for (a.chats[0..a.chat_count]) |*chat| {
-        const avatar = avatarFor(a, chat.jid.slice()) orelse continue;
-        switch (avatar.state) {
+        const entry = avatarFor(a, chat.jid.slice()) orelse continue;
+        switch (entry.state) {
             .ready, .failed => continue,
             .none => {
-                if (loadAvatarFromDisk(a, avatar)) {
+                if (loadAvatarFromDisk(a, entry)) {
                     invalidateChatList(a);
                 } else if (fetch_target == null) {
-                    fetch_target = avatar;
+                    fetch_target = entry;
                 }
             },
         }
     }
-    if (fetch_target) |avatar| fetchAvatar(a, avatar);
+    if (fetch_target) |entry| fetchAvatar(a, entry);
 }
 
 fn clearMessages(a: *App) void {
