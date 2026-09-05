@@ -1,5 +1,45 @@
 const std = @import("std");
 
+// Files of the vendored libwebp 1.4.0 subset that decodes WebP (see vendor/libwebp).
+const libwebp_sources = [_][]const u8{
+    "src/dec/alpha_dec.c",
+    "src/dec/buffer_dec.c",
+    "src/dec/frame_dec.c",
+    "src/dec/idec_dec.c",
+    "src/dec/io_dec.c",
+    "src/dec/quant_dec.c",
+    "src/dec/tree_dec.c",
+    "src/dec/vp8_dec.c",
+    "src/dec/vp8l_dec.c",
+    "src/dec/webp_dec.c",
+    "src/dsp/alpha_processing.c",
+    "src/dsp/alpha_processing_sse2.c",
+    "src/dsp/cpu.c",
+    "src/dsp/dec.c",
+    "src/dsp/dec_clip_tables.c",
+    "src/dsp/dec_sse2.c",
+    "src/dsp/filters.c",
+    "src/dsp/filters_sse2.c",
+    "src/dsp/lossless.c",
+    "src/dsp/lossless_sse2.c",
+    "src/dsp/rescaler.c",
+    "src/dsp/rescaler_sse2.c",
+    "src/dsp/upsampling.c",
+    "src/dsp/upsampling_sse2.c",
+    "src/dsp/yuv.c",
+    "src/dsp/yuv_sse2.c",
+    "src/utils/bit_reader_utils.c",
+    "src/utils/color_cache_utils.c",
+    "src/utils/filters_utils.c",
+    "src/utils/huffman_utils.c",
+    "src/utils/palette.c",
+    "src/utils/quant_levels_dec_utils.c",
+    "src/utils/random_utils.c",
+    "src/utils/rescaler_utils.c",
+    "src/utils/thread_utils.c",
+    "src/utils/utils.c",
+};
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{ .preferred_optimize_mode = .ReleaseSmall });
@@ -12,6 +52,11 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    // Vendored libwebp 1.4.0 (decode-only, no SIMD beyond SSE2): Windows WIC has
+    // no WebP codec, so stickers need this to render.
+    exe.root_module.addIncludePath(b.path("vendor/libwebp"));
+    exe.root_module.addCSourceFiles(.{ .root = b.path("vendor/libwebp"), .files = &libwebp_sources });
+
     exe.subsystem = .Windows;
     exe.root_module.link_libc = true;
     for ([_][]const u8{
@@ -32,7 +77,7 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(exe);
 
     const test_step = b.step("test", "Run unit tests");
-    for ([_][]const u8{ "src/emoji_picker.zig", "src/avatar.zig" }) |test_root| {
+    for ([_][]const u8{ "src/emoji_picker.zig", "src/avatar.zig", "src/webp.zig" }) |test_root| {
         const tests = b.addTest(.{
             .root_module = b.createModule(.{
                 .root_source_file = b.path(test_root),
