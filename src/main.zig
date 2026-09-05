@@ -288,6 +288,7 @@ const App = struct {
     audio_duration_ms: i64 = 0,
     media_child: ?std.process.Child = null,
     read_child: ?std.process.Child = null,
+    read_spawn_failures: u32 = 0,
     pending_reads: [max_pending_reads]Utf8Text(191) = [_]Utf8Text(191){.{}} ** max_pending_reads,
     pending_read_count: usize = 0,
     send_child: ?std.process.Child = null,
@@ -741,11 +742,20 @@ fn startNextMarkRead(a: *App) void {
         .stderr = .ignore,
         .create_no_window = true,
     }) catch {
-        // Keep the jid queued; the timer retries the spawn each tick and
-        // the status bar says why the badge may lag.
-        setStatus(a, "Could not start mark as read; retrying");
+        // Give up after repeated spawn failures: drop the queue, restore
+        // the real unread badges via refreshChats, and let live sync run so
+        // a broken wacli cannot keep the app's sync permanently stopped.
+        a.read_spawn_failures += 1;
+        if (a.read_spawn_failures >= 3) {
+            a.pending_read_count = 0;
+            a.read_spawn_failures = 0;
+            startSync(a);
+            refreshChats(a);
+            setStatus(a, "Could not mark chats as read; unread badges restored");
+        } else setStatus(a, "Could not start mark as read; retrying");
         return;
     };
+    a.read_spawn_failures = 0;
     a.read_child = child;
 }
 
