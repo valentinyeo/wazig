@@ -1,0 +1,36 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    name: ci
+    runs-on: [self-hosted, wazig]
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Add Zig to PATH
+        run: echo "$HOME/.local/zig-0.16" >> "$GITHUB_PATH"
+
+      - name: Zig version
+        run: zig version
+
+      - name: Check formatting
+        run: zig fmt --check src build.zig
+
+      - name: Build
+        run: zig build -Dtarget=x86_64-windows-gnu --release=small
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Messages-windows-x86_64
+          path: zig-out/bin/
