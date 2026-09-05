@@ -23,6 +23,11 @@ pub fn build(b: *std.Build) void {
         "windowscodecs",
         "shell32",
         "dwmapi",
+        "mfplat",
+        "mfreadwrite",
+        "mfuuid",
+        "winhttp",
+        "urlmon",
     }) |library| {
         exe.root_module.linkSystemLibrary(library, .{});
     }
