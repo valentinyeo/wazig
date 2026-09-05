@@ -3,6 +3,11 @@ const audio = @import("audio.zig");
 const avatar = @import("avatar.zig");
 const dictation = @import("dictation.zig");
 const played = @import("played.zig");
+const webp_detect = @import("webp.zig");
+
+const webp = @cImport({
+    @cInclude("src/webp/decode.h");
+});
 
 const win = @cImport({
     @cDefine("WIN32_LEAN_AND_MEAN", "1");
@@ -1223,7 +1228,10 @@ fn ensureBitmap(a: *App, message: *Message) void {
         win.WICDecodeMetadataCacheOnLoad,
         &decoder,
     );
-    if (decoder_hr < 0 or decoder == null) return;
+    if (decoder_hr < 0 or decoder == null) {
+        ensureWebPBitmap(a, message);
+        return;
+    }
     defer _ = decoder.*.lpVtbl.*.Release.?(decoder);
 
     var frame_count: win.UINT = 0;
@@ -1237,6 +1245,44 @@ fn ensureBitmap(a: *App, message: *Message) void {
     var source_height: win.UINT = 0;
     if (frame.*.lpVtbl.*.GetSize.?(@ptrCast(frame), &source_width, &source_height) < 0 or source_width == 0 or source_height == 0) return;
 
+    fillBitmapFromSource(a, message, @ptrCast(frame), source_width, source_height);
+}
+
+// Windows WIC has no WebP codec, so stickers (WebP files) would never render.
+// Decode them with the vendored libwebp; for animated stickers this returns the
+// first frame. ponytail: frames are not animated on screen; use WebPAnimDecoder
+// (vendor src/demux) if stickers should move later.
+fn ensureWebPBitmap(a: *App, message: *Message) void {
+    const path_utf8 = std.unicode.utf16LeToUtf8Alloc(a.allocator, message.local_path.slice()) catch return;
+    defer a.allocator.free(path_utf8);
+    const data = readFileWin(a.allocator, path_utf8, 32 * 1024 * 1024) orelse return;
+    defer a.allocator.free(data);
+    if (!webp_detect.isWebPBytes(data)) return;
+    var width: c_int = 0;
+    var height: c_int = 0;
+    const pixels = webp.WebPDecodeRGBA(data.ptr, data.len, &width, &height) orelse return;
+    defer webp.WebPFree(pixels);
+    if (width <= 0 or height <= 0) return;
+
+    // Wrap the decoded pixels as a WIC bitmap so the shared convert/scale/DIB
+    // path can be reused.
+    var wic_bitmap: [*c]win.IWICBitmap = null;
+    const create_hr = a.wic_factory.*.lpVtbl.*.CreateBitmapFromMemory.?(
+        a.wic_factory,
+        @intCast(width),
+        @intCast(height),
+        &win.GUID_WICPixelFormat32bppRGBA,
+        @intCast(@as(u32, @intCast(width)) * 4),
+        @intCast(@as(u32, @intCast(width)) * @as(u32, @intCast(height)) * 4),
+        pixels,
+        &wic_bitmap,
+    );
+    if (create_hr < 0 or wic_bitmap == null) return;
+    defer _ = wic_bitmap.*.lpVtbl.*.Release.?(wic_bitmap);
+    fillBitmapFromSource(a, message, @ptrCast(wic_bitmap), @intCast(width), @intCast(height));
+}
+
+fn fillBitmapFromSource(a: *App, message: *Message, source: *win.IWICBitmapSource, source_width: win.UINT, source_height: win.UINT) void {
     var target_width: win.UINT = @min(source_width, 420);
     var target_height: win.UINT = @intCast(@max(1, @divTrunc(@as(u64, source_height) * target_width, source_width)));
     if (target_height > 250) {
@@ -1249,7 +1295,7 @@ fn ensureBitmap(a: *App, message: *Message) void {
     defer _ = converter.*.lpVtbl.*.Release.?(converter);
     if (converter.*.lpVtbl.*.Initialize.?(
         converter,
-        @ptrCast(frame),
+        source,
         &win.GUID_WICPixelFormat32bppPBGRA,
         win.WICBitmapDitherTypeNone,
         null,
