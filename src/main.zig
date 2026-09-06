@@ -6054,7 +6054,18 @@ fn drawCanvas(hwnd: win.HWND, a: *App) void {
         var text_top = y + 6;
         if (show_sender) {
             _ = win.SelectObject(hdc, @ptrCast(a.font_bold.?));
-            _ = win.SetTextColor(hdc, if (message.from_me) color_text else rgb(83, 189, 235));
+            // In group chats the name uses the same stable per-person tint as
+            // the avatar; direct chats and own messages keep their plain colors.
+            const name_tint = if (!message.from_me and in_group and message.sender_jid.len > 0)
+                senderColorFor(message.sender_jid.slice())
+            else
+                null;
+            _ = win.SetTextColor(hdc, if (message.from_me)
+                color_text
+            else if (name_tint) |tint|
+                rgb(tint.r, tint.g, tint.b)
+            else
+                rgb(83, 189, 235));
             var sender_rect = win.RECT{ .left = left + 12, .top = y + 6, .right = right - 52, .bottom = y + 26 };
             const sender_text = message.sender.slice();
             if (containsEmoji(sender_text)) {
