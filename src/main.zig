@@ -71,6 +71,7 @@ const command_copy_text = 2019;
 const command_copy_link = 2020;
 const command_copy_selection = 2021;
 const command_copy_transcript = 2022;
+const command_reply = 2023;
 const reaction_like = 3001;
 const reaction_love = 3002;
 const reaction_laugh = 3003;
@@ -159,6 +160,8 @@ const Group = struct {
 const PendingSend = struct {
     jid: Utf8Text(191) = .{},
     text: Utf8Text(4095) = .{},
+    reply_to: Utf8Text(191) = .{},
+    reply_sender: Utf8Text(191) = .{},
 };
 
 const LinkSpan = struct {
@@ -331,6 +334,8 @@ const App = struct {
     avatar_count: usize = 0,
     avatar_active_index: ?usize = null,
     wic_factory: [*c]win.IWICImagingFactory = null,
+    reply_to: Utf8Text(191) = .{},
+    reply_sender: Utf8Text(191) = .{},
     displayed_jid: Utf8Text(191) = .{},
     displayed_timestamp: Utf8Text(47) = .{},
     store_watch_path: WideText(519) = .{},
@@ -364,6 +369,44 @@ fn setFont(hwnd: ?win.HWND, font: ?win.HFONT) void {
     if (hwnd) |window| {
         _ = win.SendMessageW(window, win.WM_SETFONT, if (font) |value| @intFromPtr(value) else 0, 1);
     }
+}
+
+fn addTooltip(tt: win.HWND, tool: ?win.HWND, text: [*:0]const u16) void {
+    const target = tool orelse return;
+    var info = win.TOOLINFOW{
+        .cbSize = @sizeOf(win.TOOLINFOW),
+        .uFlags = win.TTF_IDISHWND | win.TTF_SUBCLASS,
+        .hwnd = win.GetParent(target),
+        .uId = @intFromPtr(target),
+        .lpszText = @constCast(text),
+    };
+    _ = win.SendMessageW(tt, win.TTM_ADDTOOLW, 0, @as(win.LPARAM, @bitCast(@intFromPtr(&info))));
+}
+
+fn createTooltips(a: *App, hwnd: win.HWND) void {
+    const tt = win.CreateWindowExW(
+        win.WS_EX_TOPMOST,
+        lit("tooltips_class32"),
+        null,
+        win.WS_POPUP | win.TTS_NOPREFIX,
+        0,
+        0,
+        0,
+        0,
+        hwnd,
+        null,
+        a.instance,
+        null,
+    ) orelse return;
+    a.tooltips = tt;
+    // TTM_SETMAXWIDTH (WM_USER + 24); not exposed by the commctrl.h import
+    _ = win.SendMessageW(tt, 0x400 + 24, 0, 260);
+    addTooltip(tt, a.search, lit("Search chats  Ctrl+F or /"));
+    addTooltip(tt, a.chats_hwnd, lit("Chats  ↑/↓ move · Ctrl+Tab next chat"));
+    addTooltip(tt, a.canvas, lit("Messages  Alt+J/K select · Ctrl+P play voice · Ctrl+T transcript · Ctrl+R react"));
+    addTooltip(tt, a.compose, lit("Message box  Enter sends · Shift+Enter new line"));
+    addTooltip(tt, a.dictate, lit("Dictate  Ctrl+D"));
+    addTooltip(tt, a.send, lit("Send message  Enter"));
 }
 
 fn loadRegistryString(allocator: std.mem.Allocator, name: [*:0]const u16) ?[]const u8 {
@@ -1853,8 +1896,24 @@ fn startNextSend(a: *App) void {
     if (a.send_child != null or a.read_child != null or a.pending_send_count == 0) return;
     stopSync(a);
     const pending = &a.pending_sends[0];
+    var args: [14][]const u8 = undefined;
+    var count: usize = 0;
+    for ([_][]const u8{ a.wacli_path, "--json", "--lock-wait", "10s", "send", "text", "--to", pending.jid.slice(), "--message", pending.text.slice() }) |argument| {
+        args[count] = argument;
+        count += 1;
+    }
+    if (pending.reply_to.len > 0) {
+        args[count] = "--reply-to";
+        args[count + 1] = pending.reply_to.slice();
+        count += 2;
+        if (pending.reply_sender.len > 0) {
+            args[count] = "--reply-to-sender";
+            args[count + 1] = pending.reply_sender.slice();
+            count += 2;
+        }
+    }
     const child = std.process.spawn(a.io, .{
-        .argv = &.{ a.wacli_path, "--json", "--lock-wait", "10s", "send", "text", "--to", pending.jid.slice(), "--message", pending.text.slice() },
+        .argv = args[0..count],
         .stdin = .ignore,
         .stdout = .ignore,
         .stderr = .ignore,
@@ -1905,11 +1964,40 @@ fn sendMessage(a: *App) void {
     const pending = &a.pending_sends[a.pending_send_count];
     pending.jid.set(a.chats[a.selected_chat].jid.slice());
     pending.text.set(text);
+    pending.reply_to.set(a.reply_to.slice());
+    pending.reply_sender.set(a.reply_sender.slice());
+    clearReply(a);
     a.pending_send_count += 1;
     a.user_viewed = true;
     _ = win.SetWindowTextW(a.compose.?, lit(""));
     focusCompose(a);
     startNextSend(a);
+}
+
+fn clearReply(a: *App) void {
+    a.reply_to.set("");
+    a.reply_sender.set("");
+}
+
+fn startReply(a: *App) void {
+    const selected = a.selected_message orelse {
+        setStatus(a, "Select a message with right-click or Ctrl+Tab");
+        return;
+    };
+    if (selected >= a.message_count or a.selected_chat >= a.chat_count) return;
+    const message = &a.messages[selected];
+    a.reply_to.set(message.id.slice());
+    a.reply_sender.set(message.sender_jid.slice());
+    const sender_bytes = std.unicode.utf16LeToUtf8Alloc(a.allocator, message.sender.slice()) catch {
+        setStatus(a, "Reply ready... Esc in the composer cancels");
+        return;
+    };
+    defer a.allocator.free(sender_bytes);
+    const shown = if (sender_bytes.len == 0) "message" else sender_bytes[0..@min(sender_bytes.len, 64)];
+    var status_buffer: [160]u8 = undefined;
+    const status = std.fmt.bufPrint(&status_buffer, "Replying to {s}... Esc in the composer cancels", .{shown}) catch return;
+    setStatus(a, status);
+    focusCompose(a);
 }
 
 fn focusCompose(a: *App) void {
@@ -1997,6 +2085,7 @@ fn updateDictation(a: *App) void {
 
 fn selectChat(a: *App, delta: i32, wrap: bool) void {
     if (a.chat_count == 0) return;
+    clearReply(a);
     var next: i32 = @intCast(a.selected_chat);
     next += delta;
     const count: i32 = @intCast(a.chat_count);
@@ -2308,9 +2397,11 @@ fn openUrlWide(a: *App, url: [*:0]const u16) void {
 fn openReactionMenu(a: *App, x: i32, y: i32) void {
     const menu = win.CreatePopupMenu() orelse return;
     defer _ = win.DestroyMenu(menu);
+    _ = win.AppendMenuW(menu, win.MF_STRING, command_reply, lit("Reply                Ctrl+Shift+R"));
+    _ = win.AppendMenuW(menu, win.MF_SEPARATOR, 0, null);
     addReactionItems(menu);
     const choice = win.TrackPopupMenu(menu, win.TPM_RETURNCMD | win.TPM_NONOTIFY, x, y, 0, a.hwnd.?, null);
-    reactToSelected(a, @intCast(choice));
+    if (choice == command_reply) startReply(a) else reactToSelected(a, @intCast(choice));
 }
 
 fn openReactionMenuForSelected(a: *App) void {
@@ -2429,6 +2520,7 @@ fn buildPaletteItems(a: *App) void {
     appendPalette(a, "Toggle unread chats", "U", command_unread);
     appendPalette(a, if (a.show_archived) "Show inbox chats" else "Show archived chats", "", command_archived);
     appendPalette(a, if (a.show_archived) "Unarchive selected chat" else "Archive selected chat", "Ctrl+E", command_archive);
+    appendPalette(a, "Reply to selected message", "Ctrl+Shift+R", command_reply);
     appendPalette(a, "React to message: 👍 Like", "", reaction_like);
     appendPalette(a, "React to message: ❤️ Love", "", reaction_love);
     appendPalette(a, "React to message: 😂 Laugh", "", reaction_laugh);
@@ -2747,6 +2839,7 @@ fn runCommand(a: *App, command: u16) void {
             refreshMessages(a);
         },
         command_archive => archiveSelectedChat(a),
+        command_reply => startReply(a),
         command_archived => {
             a.show_archived = !a.show_archived;
             refreshChats(a);
@@ -3616,12 +3709,14 @@ fn canvasProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win
                         _ = win.ClientToScreen(hwnd, &point);
                         const menu = win.CreatePopupMenu() orelse return 0;
                         defer _ = win.DestroyMenu(menu);
+                        _ = win.AppendMenuW(menu, win.MF_STRING, command_reply, lit("Reply"));
+                        _ = win.AppendMenuW(menu, win.MF_SEPARATOR, 0, null);
                         _ = win.AppendMenuW(menu, win.MF_STRING, command_copy_selection, lit("Copy selection"));
                         _ = win.AppendMenuW(menu, win.MF_STRING, command_copy_text, lit("Copy message text"));
                         if (item.transcript.len > 0) _ = win.AppendMenuW(menu, win.MF_STRING, command_copy_transcript, lit("Copy transcript"));
                         if (item.link_count > 0) _ = win.AppendMenuW(menu, win.MF_STRING, command_copy_link, lit("Copy link address"));
                         const choice = win.TrackPopupMenu(menu, win.TPM_RETURNCMD | win.TPM_NONOTIFY, point.x, point.y, 0, a.hwnd.?, null);
-                        reactToSelected(a, @intCast(choice));
+                        if (choice == command_reply) startReply(a) else reactToSelected(a, @intCast(choice));
                         return 0;
                     }
                 }
@@ -3642,46 +3737,6 @@ fn canvasProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win
         else => return win.DefWindowProcW(hwnd, message, wparam, lparam),
     }
 }
-
-fn addTooltip(tt: win.HWND, tool: ?win.HWND, text: [*:0]const u16) void {
-    const target = tool orelse return;
-    var info = win.TOOLINFOW{
-        .cbSize = @sizeOf(win.TOOLINFOW),
-        .uFlags = win.TTF_IDISHWND | win.TTF_SUBCLASS,
-        .hwnd = win.GetParent(target),
-        .uId = @intFromPtr(target),
-        .lpszText = @constCast(text),
-    };
-    _ = win.SendMessageW(tt, win.TTM_ADDTOOLW, 0, @as(win.LPARAM, @bitCast(@intFromPtr(&info))));
-}
-
-fn createTooltips(a: *App, hwnd: win.HWND) void {
-    const tt = win.CreateWindowExW(
-        win.WS_EX_TOPMOST,
-        lit("tooltips_class32"),
-        null,
-        win.WS_POPUP | win.TTS_NOPREFIX,
-        0,
-        0,
-        0,
-        0,
-        hwnd,
-        null,
-        a.instance,
-        null,
-    ) orelse return;
-    a.tooltips = tt;
-    // TTM_SETMAXWIDTH (WM_USER + 24); not exposed by the commctrl.h import
-    _ = win.SendMessageW(tt, 0x400 + 24, 0, 260);
-    addTooltip(tt, a.search, lit("Search chats  Ctrl+F or /"));
-    addTooltip(tt, a.chats_hwnd, lit("Chats  ↑/↓ move · Ctrl+Tab next chat"));
-    addTooltip(tt, a.canvas, lit("Messages  Alt+J/K select · Ctrl+P play voice · Ctrl+T transcript · Ctrl+R react"));
-    addTooltip(tt, a.compose, lit("Message box  Enter sends · Shift+Enter new line"));
-    addTooltip(tt, a.dictate, lit("Dictate  Ctrl+D"));
-    addTooltip(tt, a.send, lit("Send message  Enter"));
-    addTooltip(tt, a.emoji_btn, lit("Emoji menu"));
-}
-
 fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.LPARAM) callconv(.winapi) win.LRESULT {
     const a = app_ptr orelse return win.DefWindowProcW(hwnd, message, wparam, lparam);
     switch (message) {
@@ -3705,6 +3760,7 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
             a.send = win.CreateWindowExW(0, lit("BUTTON"), lit("Send"), win.WS_CHILD | win.WS_VISIBLE | win.WS_TABSTOP | win.BS_PUSHBUTTON, 0, 0, 0, 0, hwnd, controlId(id_send), a.instance, null);
             a.emoji_btn = win.CreateWindowExW(0, lit("BUTTON"), lit("😊"), win.WS_CHILD | win.WS_VISIBLE | win.WS_TABSTOP | win.BS_PUSHBUTTON, 0, 0, 0, 0, hwnd, controlId(id_emoji), a.instance, null);
             a.status = win.CreateWindowExW(0, lit("STATIC"), lit("Loading..."), win.WS_CHILD | win.WS_VISIBLE | win.SS_LEFT, 0, 0, 0, 0, hwnd, controlId(id_status), a.instance, null);
+            createTooltips(a, hwnd);
             recreateFonts(a);
             createTooltips(a, hwnd);
             if (a.search) |search| _ = win.SendMessageW(search, win.EM_SETCUEBANNER, 1, @bitCast(@intFromPtr(lit("Search chats  Ctrl+F"))));
@@ -4045,6 +4101,10 @@ fn handleKeyboard(a: *App, message: *const win.MSG) bool {
         focusCompose(a);
         return true;
     }
+    if (control and shift and key == 'R') {
+        startReply(a);
+        return true;
+    }
     if (a.compose) |compose| {
         if (focus == compose) {
             if (key == win.VK_RETURN and !shift) {
@@ -4052,6 +4112,11 @@ fn handleKeyboard(a: *App, message: *const win.MSG) bool {
                 return true;
             }
             if (key == win.VK_ESCAPE) {
+                if (a.reply_to.len > 0) {
+                    clearReply(a);
+                    setStatus(a, "Reply cancelled");
+                    return true;
+                }
                 if (a.chats_hwnd) |list| _ = win.SetFocus(list);
                 return true;
             }
