@@ -2411,6 +2411,8 @@ fn updateDictation(a: *App) void {
 
 fn openChatAtIndex(a: *App, index: usize) void {
     if (index >= a.chat_count) return;
+    // A pending reply quotes a message in the old chat; drop it on switch.
+    clearReply(a);
     a.selected_chat = index;
     a.user_viewed = true;
     if (a.chats_hwnd) |list| _ = win.SendMessageW(list, win.LB_SETCURSEL, @intCast(index), 0);
