@@ -292,6 +292,8 @@ const App = struct {
     read_started_ms: u64 = 0,
     pending_reads: [max_pending_reads]Utf8Text(191) = [_]Utf8Text(191){.{}} ** max_pending_reads,
     pending_read_count: usize = 0,
+    pending_download_jid: Utf8Text(191) = .{},
+    pending_download_id: Utf8Text(191) = .{},
     send_child: ?std.process.Child = null,
     pending_sends: [max_pending_sends]PendingSend = [_]PendingSend{.{}} ** max_pending_sends,
     pending_send_count: usize = 0,
@@ -777,6 +779,7 @@ fn checkMarkRead(a: *App) void {
         _ = child.wait(a.io) catch {};
         a.read_child = null;
         removeFirstPendingRead(a);
+        retryPendingDownload(a);
         // Release any sends or archives that queued up while the store was
         // held, then bring live sync back. startSync skips itself while a
         // write job is running.
@@ -786,6 +789,29 @@ fn checkMarkRead(a: *App) void {
         refreshChats(a);
         setStatus(a, if (code == 0) "Chat marked as read" else "Mark as read failed");
     } else startNextMarkRead(a);
+}
+
+// A manual download clicked while a mark-read job held the store waits here;
+// start it once no read job or download is running and its message is on
+// screen (the request is dropped if the user switched chats meanwhile).
+fn retryPendingDownload(a: *App) void {
+    if (a.pending_download_id.len == 0 or a.read_child != null or a.pending_read_count > 0 or
+        a.media_child != null) return;
+    if (a.selected_chat >= a.chat_count) return;
+    if (!std.mem.eql(u8, a.pending_download_jid.slice(), a.chats[a.selected_chat].jid.slice())) {
+        a.pending_download_jid.set("");
+        a.pending_download_id.set("");
+        return;
+    }
+    const id = a.pending_download_id.slice();
+    a.pending_download_jid.set("");
+    a.pending_download_id.set("");
+    for (a.messages[0..a.message_count], 0..) |*message, index| {
+        if (std.mem.eql(u8, message.id.slice(), id)) {
+            downloadMedia(a, index, false);
+            return;
+        }
+    }
 }
 
 fn clearMessages(a: *App) void {
@@ -1202,11 +1228,19 @@ fn ensureBitmap(a: *App, message: *Message) void {
 
 fn downloadMedia(a: *App, message_index: usize, automatic: bool) void {
     if (message_index >= a.message_count or a.selected_chat >= a.chat_count) return;
-    if (a.media_child != null or a.read_child != null) {
+    const message = &a.messages[message_index];
+    if (a.media_child != null or a.read_child != null or a.pending_read_count > 0) {
+        if (!automatic and message.id.len > 0) {
+            // Reads have no queue a click can join, so remember the request
+            // and start it once the mark-read job finishes.
+            a.pending_download_jid.set(a.chats[a.selected_chat].jid.slice());
+            a.pending_download_id.set(message.id.slice());
+            setStatus(a, "Attachment download queued");
+            return;
+        }
         if (!automatic) setStatus(a, "Waiting for the current download to finish");
         return;
     }
-    const message = &a.messages[message_index];
     if (message.media_type.len == 0 or message.id.len == 0) return;
     setStatus(a, if (automatic) "Downloading media..." else "Downloading attachment...");
     if (a.hwnd) |hwnd| _ = win.UpdateWindow(hwnd);
@@ -3626,6 +3660,7 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
                         refreshChats(a);
                         if (!messagesAreCurrent(a)) refreshMessages(a);
                     }
+                    retryPendingDownload(a);
                     autoDownloadNextMedia(a);
                     requestSelectedAvatar(a);
                 }
