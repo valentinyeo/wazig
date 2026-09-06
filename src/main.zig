@@ -17,6 +17,7 @@ const win = @cImport({
     @cInclude("mfapi.h");
     @cInclude("mfidl.h");
     @cInclude("mfreadwrite.h");
+    @cInclude("mfplay.h");
 });
 
 const app_version = "0.9.7";
@@ -62,6 +63,7 @@ const command_copy_text = 2019;
 const command_copy_link = 2020;
 const command_copy_selection = 2021;
 const command_copy_transcript = 2022;
+const command_open_video_external = 2023;
 const reaction_like = 3001;
 const reaction_love = 3002;
 const reaction_laugh = 3003;
@@ -182,7 +184,9 @@ const PaletteItem = struct {
     url: WideText(519) = .{},
 };
 
-const max_palette_items = 16;
+// buildPaletteItems registers more items than the original cap allowed, so
+// entries near the end were silently dropped.
+const max_palette_items = 32;
 const palette_width: i32 = 540;
 const palette_row_height: i32 = 40;
 const palette_edit_zone: i32 = 64;
@@ -314,6 +318,8 @@ const App = struct {
     avatar_count: usize = 0,
     avatar_active_index: ?usize = null,
     wic_factory: [*c]win.IWICImagingFactory = null,
+    player_window: ?win.HWND = null,
+    mf_player: ?*win.IMFPMediaPlayer = null,
     displayed_jid: Utf8Text(191) = .{},
     displayed_timestamp: Utf8Text(47) = .{},
     store_watch_path: WideText(519) = .{},
@@ -1506,6 +1512,167 @@ fn openMedia(a: *App, message: *const Message) void {
     if (@intFromPtr(result) <= 32) setStatus(a, "Windows could not open the attachment");
 }
 
+fn clampPlayerSize(width: u32, height: u32) [2]u32 {
+    const max_width: u32 = 800;
+    const max_height: u32 = 450;
+    if (width == 0 or height == 0) return .{ 640, 360 };
+    var w: u64 = width;
+    var h: u64 = height;
+    if (w > max_width) {
+        h = @max(1, h * max_width / w);
+        w = max_width;
+    }
+    if (h > max_height) {
+        w = @max(1, w * max_height / h);
+        h = max_height;
+    }
+    return .{ @intCast(w), @intCast(h) };
+}
+
+fn playerCallbackQueryInterface(_: [*c]win.IMFPMediaPlayerCallback, riid: [*c]const win.GUID, ppv_object: [*c]?*anyopaque) callconv(.c) win.HRESULT {
+    if (ppv_object != null and riid != null) {
+        const iid_callback = win.GUID{ .Data1 = 0x766c8ffb, .Data2 = 0x5fdb, .Data3 = 0x4fea, .Data4 = .{ 0xa2, 0x8d, 0xb9, 0x12, 0x99, 0x6f, 0x51, 0xbd } };
+        const g = riid.*;
+        const is_unknown = g.Data1 == 0 and g.Data2 == 0 and g.Data3 == 0 and g.Data4[0] == 0 and g.Data4[1] == 0 and g.Data4[2] == 0 and g.Data4[3] == 0xc0 and g.Data4[4] == 0 and g.Data4[5] == 0 and g.Data4[6] == 0 and g.Data4[7] == 0x46;
+        const is_callback = g.Data1 == iid_callback.Data1 and g.Data2 == iid_callback.Data2 and g.Data3 == iid_callback.Data3 and std.mem.eql(u8, &g.Data4, &iid_callback.Data4);
+        if (is_unknown or is_callback) {
+            ppv_object.* = @ptrCast(&player_callback);
+            _ = playerCallbackAddRef(&player_callback);
+            return 0;
+        }
+        ppv_object.* = null;
+    }
+    return win.E_NOINTERFACE;
+}
+
+fn playerCallbackAddRef(_: [*c]win.IMFPMediaPlayerCallback) callconv(.c) win.ULONG {
+    player_callback_refs += 1;
+    return player_callback_refs;
+}
+
+fn playerCallbackRelease(_: [*c]win.IMFPMediaPlayerCallback) callconv(.c) win.ULONG {
+    if (player_callback_refs > 0) player_callback_refs -= 1;
+    return player_callback_refs;
+}
+
+fn playerCallbackEvent(_: [*c]win.IMFPMediaPlayerCallback, event: [*c]win.MFP_EVENT_HEADER) callconv(.c) void {
+    if (event == null) return;
+    if (event.*.eEventType == win.MFP_EVENT_TYPE_ERROR) {
+        if (app_ptr) |a| {
+            if (a.player_window) |hwnd| _ = win.SetWindowTextW(hwnd, lit("Messages · Video (playback failed)"));
+        }
+    }
+}
+
+var player_callback = win.IMFPMediaPlayerCallback{ .lpVtbl = &player_callback_vtable };
+var player_callback_vtable = win.IMFPMediaPlayerCallbackVtbl{
+    .QueryInterface = playerCallbackQueryInterface,
+    .AddRef = playerCallbackAddRef,
+    .Release = playerCallbackRelease,
+    .OnMediaPlayerEvent = playerCallbackEvent,
+};
+var player_callback_refs: u32 = 1;
+
+var player_class_registered: bool = false;
+
+fn closePlayer(a: *App) void {
+    if (a.mf_player) |player| {
+        _ = player.lpVtbl.*.Shutdown.?(player);
+        _ = player.lpVtbl.*.Release.?(player);
+        a.mf_player = null;
+    }
+    if (a.player_window) |hwnd| {
+        a.player_window = null;
+        _ = win.DestroyWindow(hwnd);
+    }
+}
+
+fn playerProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.LPARAM) callconv(.winapi) win.LRESULT {
+    const a = app_ptr orelse return win.DefWindowProcW(hwnd, message, wparam, lparam);
+    switch (message) {
+        win.WM_KEYDOWN => {
+            if (wparam == 27) { // escape
+                closePlayer(a);
+                return 0;
+            }
+        },
+        win.WM_CLOSE => {
+            closePlayer(a);
+            return 0;
+        },
+        win.WM_DESTROY => {
+            if (a.player_window != null and a.player_window.? == hwnd) a.player_window = null;
+            if (a.mf_player) |player| {
+                _ = player.lpVtbl.*.Shutdown.?(player);
+                _ = player.lpVtbl.*.Release.?(player);
+                a.mf_player = null;
+            }
+            return 0;
+        },
+        else => {},
+    }
+    return win.DefWindowProcW(hwnd, message, wparam, lparam);
+}
+
+fn playVideoInline(a: *App, message: *const Message) void {
+    if (message.local_path.len == 0) return;
+    if (a.player_window) |hwnd| {
+        _ = win.SetForegroundWindow(hwnd);
+        return;
+    }
+    const size = clampPlayerSize(@intCast(@max(message.bitmap_width, 0)), @intCast(@max(message.bitmap_height, 0)));
+    var rect = win.RECT{ .left = 0, .top = 0, .right = @intCast(size[0]), .bottom = @intCast(size[1]) };
+    _ = win.AdjustWindowRect(&rect, win.WS_OVERLAPPEDWINDOW, 0);
+    const width = rect.right - rect.left;
+    const height = rect.bottom - rect.top;
+
+    if (!player_class_registered) {
+        var class = win.WNDCLASSEXW{
+            .cbSize = @sizeOf(win.WNDCLASSEXW),
+            .style = win.CS_HREDRAW | win.CS_VREDRAW,
+            .lpfnWndProc = playerProc,
+            .hInstance = a.instance,
+            .hCursor = win.LoadCursorW(null, @ptrFromInt(32512)),
+            .hbrBackground = win.CreateSolidBrush(color_bg),
+            .lpszClassName = lit("MessagesVideoPlayer"),
+            .hIconSm = null,
+        };
+        if (win.RegisterClassExW(&class) == 0) {
+            setStatus(a, "Could not open the video player");
+            return;
+        }
+        player_class_registered = true;
+    }
+    const hwnd = win.CreateWindowExW(
+        0,
+        lit("MessagesVideoPlayer"),
+        lit("Messages · Video"),
+        win.WS_OVERLAPPEDWINDOW,
+        win.CW_USEDEFAULT,
+        win.CW_USEDEFAULT,
+        width,
+        height,
+        a.hwnd orelse null,
+        null,
+        a.instance,
+        null,
+    ) orelse {
+        setStatus(a, "Could not open the video player");
+        return;
+    };
+    a.player_window = hwnd;
+    var player: ?*win.IMFPMediaPlayer = null;
+    const hr = win.MFPCreateMediaPlayer(message.local_path.ptr(), 1, win.MFP_OPTION_NONE, &player_callback, hwnd, &player);
+    if (hr < 0 or player == null) {
+        setStatus(a, "Video playback is not available for this file");
+        a.player_window = null;
+        _ = win.DestroyWindow(hwnd);
+        return;
+    }
+    a.mf_player = player;
+    _ = win.ShowWindow(hwnd, win.SW_SHOW);
+}
+
 fn advanceGifs(a: *App) void {
     var changed = false;
     var dirty = win.RECT{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
@@ -2019,6 +2186,8 @@ fn handleCanvasClick(a: *App, hwnd: win.HWND, x: i32, y: i32) void {
                 downloadMedia(a, index, false);
             } else if (isAudio(item)) {
                 handleAudioClick(a, item, x);
+            } else if (isVideo(item)) {
+                playVideoInline(a, item);
             } else if (!isGif(item)) {
                 // GIFs already animate in place; popping them out to
                 // an external player was unwanted.
@@ -2293,6 +2462,7 @@ fn buildPaletteItems(a: *App) void {
     appendPalette(a, "Remove reaction", "", reaction_remove);
     appendPalette(a, "Refresh", "R", command_refresh);
     appendPalette(a, "Restart live sync", "S", command_sync);
+    appendPalette(a, "Open video in external player", "", command_open_video_external);
     appendPalette(a, "Quit Messages", "Q", command_quit);
 }
 
@@ -2651,6 +2821,23 @@ fn runCommand(a: *App, command: u16) void {
         command_sync => {
             stopSync(a);
             startSync(a);
+        },
+        command_open_video_external => {
+            const selected = a.selected_message orelse {
+                setStatus(a, "Select a video first");
+                return;
+            };
+            if (selected >= a.message_count) return;
+            const message = &a.messages[selected];
+            if (!isVideo(message)) {
+                setStatus(a, "Select a video first");
+                return;
+            }
+            if (message.local_path.len == 0) {
+                setStatus(a, "The video is still downloading");
+                return;
+            }
+            openMedia(a, message);
         },
         command_quit => {
             if (a.hwnd) |hwnd| _ = win.PostMessageW(hwnd, win.WM_CLOSE, 0, 0);
@@ -3175,9 +3362,20 @@ fn drawCanvas(hwnd: win.HWND, a: *App) void {
             }
             message.media_hit = .{ .left = image_left, .top = image_top, .right = image_left + message.bitmap_width, .bottom = image_top + message.bitmap_height };
             if (std.ascii.eqlIgnoreCase(message.media_type.slice(), "video")) {
+                const center_x = image_left + @divTrunc(message.bitmap_width, 2);
+                const center_y = image_top + @divTrunc(message.bitmap_height, 2);
+                const button_brush = win.CreateSolidBrush(color_bg) orelse null;
+                const button_pen = win.CreatePen(win.PS_SOLID, 2, color_accent);
+                const old_pen2 = win.SelectObject(hdc, button_pen);
+                const old_brush2 = win.SelectObject(hdc, if (button_brush) |bb| @ptrCast(bb) else win.GetStockObject(win.BLACK_BRUSH));
+                _ = win.Ellipse(hdc, center_x - 26, center_y - 26, center_x + 26, center_y + 26);
+                _ = win.SelectObject(hdc, old_brush2);
+                _ = win.SelectObject(hdc, old_pen2);
+                if (button_pen) |pen| _ = win.DeleteObject(pen);
+                if (button_brush) |dead_brush| _ = win.DeleteObject(dead_brush);
                 _ = win.SelectObject(hdc, @ptrCast(a.font_bold.?));
                 _ = win.SetTextColor(hdc, color_text);
-                var play_rect = message.media_hit;
+                var play_rect = win.RECT{ .left = center_x - 26, .top = center_y - 26, .right = center_x + 26, .bottom = center_y + 26 };
                 _ = win.DrawTextW(hdc, lit("▶"), -1, &play_rect, win.DT_CENTER | win.DT_SINGLELINE | win.DT_VCENTER);
             }
             text_top += message.bitmap_height + 8;
@@ -3566,6 +3764,7 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
             return 0;
         },
         win.WM_DESTROY => {
+            closePlayer(a);
             _ = win.KillTimer(hwnd, timer_refresh);
             _ = win.KillTimer(hwnd, timer_search);
             _ = win.KillTimer(hwnd, timer_animation);
