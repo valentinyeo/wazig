@@ -5,6 +5,7 @@
 // Microsoft Opus decoder MFT, and renders PCM through shared-mode WASAPI.
 // Only Windows system components are used.
 const std = @import("std");
+const sola = @import("stretch.zig");
 pub const win = @cImport({
     @cDefine("WIN32_LEAN_AND_MEAN", "1");
     @cInclude("objbase.h");
@@ -194,7 +195,15 @@ pub const Player = struct {
     ring_write: std.atomic.Value(u64) = .init(0),
     pre_skip: u32 = 0,
     duration_ms: std.atomic.Value(i64) = .init(0),
-    rendered_frames: std.atomic.Value(u64) = .init(0),
+    // Source-frame position of audio handed to WASAPI: rendered output
+    // converted to source time chunk-by-chunk at the speed in effect, plus
+    // the source-frame offset playback started (or seeked) at.
+    rendered_src: std.atomic.Value(u64) = .init(0),
+    seek_base: std.atomic.Value(u64) = .init(0),
+    // ponytail: rendered chunks are converted at the *current* speed, so for
+    // up to ~2 s after a speed change the progress bar can drift until the
+    // ring drains. Fixing exactly needs per-chunk speed metadata in the ring.
+    position_ms_value: std.atomic.Value(i64) = .init(0),
     state_value: std.atomic.Value(u8) = .init(@intFromEnum(State.idle)),
     start_failed: std.atomic.Value(bool) = .init(false),
     speed_value: std.atomic.Value(u32) = .init(100),
@@ -219,7 +228,12 @@ pub const Player = struct {
     }
 
     pub fn positionMs(self: *Player) i64 {
-        return @intCast(self.rendered_frames.load(.acquire) * 1000 / output_rate);
+        return self.position_ms_value.load(.acquire);
+    }
+
+    fn storePositionMs(self: *Player) void {
+        const source_frames = self.seek_base.load(.acquire) + self.rendered_src.load(.acquire);
+        self.position_ms_value.store(@intCast(source_frames * 1000 / output_rate), .release);
     }
 
     pub fn play(self: *Player, ogg_path: []const u8) void {
@@ -284,7 +298,9 @@ pub const Player = struct {
             self.thread = null;
         }
         self.state_value.store(@intFromEnum(State.idle), .release);
-        self.rendered_frames.store(0, .release);
+        self.rendered_src.store(0, .release);
+        self.seek_base.store(0, .release);
+        self.position_ms_value.store(0, .release);
         self.duration_ms.store(0, .release);
     }
 };
@@ -312,7 +328,9 @@ fn workerRun(self: *Player, path: []const u8) !void {
 
     const duration: i64 = @intCast(opus.duration_samples * 1000 / output_rate);
     self.duration_ms.store(duration, .release);
-    self.rendered_frames.store(0, .release);
+    self.rendered_src.store(0, .release);
+    self.seek_base.store(0, .release);
+    self.position_ms_value.store(0, .release);
 
     var decoder = try openDecoder();
     defer decoder.destroy();
@@ -327,7 +345,14 @@ fn workerRun(self: *Player, path: []const u8) !void {
 
     var audio = try WasapiOutput.open(48000);
     defer audio.close();
-    var current_speed: u32 = 100;
+
+    // Decoded PCM accumulates here; the stretch stage consumes it from the
+    // front (acc_base is the absolute source frame of acc[0]).
+    var acc: std.ArrayList(f32) = .empty;
+    defer acc.deinit(self.allocator);
+    var acc_base: u64 = 0;
+    var stretch: sola.Stretch = .{ .channels = output_channels, .percent = 100 };
+    var out_block: [sola.window_frames * output_channels]f32 = undefined;
 
     var next_packet: usize = 0;
     var pending_skip: u64 = opus.pre_skip;
@@ -347,7 +372,12 @@ fn workerRun(self: *Player, path: []const u8) !void {
                 decoder.flush() catch {};
                 self.ring_read.store(0, .release);
                 self.ring_write.store(0, .release);
-                self.rendered_frames.store(target_frames, .release);
+                self.seek_base.store(target_frames, .release);
+                self.rendered_src.store(0, .release);
+                self.position_ms_value.store(@intCast(target_frames * 1000 / output_rate), .release);
+                acc.clearRetainingCapacity();
+                acc_base = target_frames;
+                stretch.reset(target_frames);
                 pending_skip = 0;
                 decode_samples = 0;
                 packets_done = false;
@@ -355,25 +385,87 @@ fn workerRun(self: *Player, path: []const u8) !void {
             }
         }
 
+        stretch.percent = self.speed();
+        const ring_cap: u64 = @intCast(ring_frames);
+
         if (!packets_done) {
-            while (ringAvailableFrames(self) < ring_frames / 2 and next_packet < opus.packets.len) {
-                const wrote = try decodePacketToRing(self, decoder, opus, next_packet, ring, &pending_skip, &decode_samples);
+            while (@as(u64, @intCast(acc.items.len / output_channels)) < 4 * output_rate and next_packet < opus.packets.len) {
+                const wrote = try decodePacketToAcc(self, decoder, opus, next_packet, &acc, &pending_skip, &decode_samples);
                 next_packet += 1;
                 if (!wrote) break;
             }
             if (next_packet >= opus.packets.len) packets_done = true;
         }
 
-        const ended = packets_done and ringAvailableFrames(self) == 0;
-        try audio.renderFrame(self, !isPaused(self));
-        const wanted_speed = self.speed();
-        if (wanted_speed != current_speed) {
-            // Reinitializing WASAPI at 48 kHz x speed makes the shared-mode
-            // mixer drain the source faster while timestamps stay in source
-            // time, giving playback-rate control without resampling here.
-            audio.reopen(48000 * wanted_speed / 100) catch {};
-            current_speed = wanted_speed;
+        // Drop already-consumed frames from the front. Batched to a second
+        // while stretching; fully before the 1x copy path so it never
+        // replays consumed frames after a speed change.
+        const pos = stretch.sourceFramesConsumed();
+        // pos can overshoot the accumulator at high speeds (the hop skips
+        // ahead); never trim more than is actually buffered.
+        const stale = @min(pos - acc_base, @as(u64, @intCast(acc.items.len / output_channels)));
+        if (stretch.percent == 100 or stale >= output_rate) {
+            const n = stale * output_channels;
+            std.mem.copyForwards(f32, acc.items[0 .. acc.items.len - n], acc.items[n..]);
+            acc.shrinkRetainingCapacity(acc.items.len - n);
+            acc_base += stale;
         }
+
+        if (stretch.percent == 100) {
+            // Normal speed: copy decoded frames through untouched. The
+            // stretch tail is dropped so returning to a higher speed does
+            // not crossfade against audio from before the 1x segment.
+            stretch.has_tail = false;
+            while (acc.items.len >= sola.window_frames * output_channels and
+                ringAvailableFrames(self) + sola.window_frames <= ring_cap)
+            {
+                ringWriteFrames(self, acc.items[0 .. sola.window_frames * output_channels]);
+                const n = sola.window_frames * output_channels;
+                std.mem.copyForwards(f32, acc.items[0 .. acc.items.len - n], acc.items[n..]);
+                acc.shrinkRetainingCapacity(acc.items.len - n);
+                acc_base += sola.window_frames;
+                stretch.pos_scaled += @as(u64, sola.window_frames) * 100;
+            }
+        } else while (stretch.canEmit(acc_base, @intCast(acc.items.len / output_channels)) and
+            ringAvailableFrames(self) + sola.window_frames <= ring_cap)
+        {
+            stretch.emitWindow(acc.items, acc_base, @intCast(acc.items.len / output_channels), &out_block);
+            ringWriteFrames(self, &out_block);
+        }
+
+        // End of file: flush what a window could not consume, crossfaded
+        // from the stretch tail so the last seam stays click-free. Gate and
+        // flush on the unconsumed part only.
+        const stale_now = @min(stretch.sourceFramesConsumed() - acc_base, @as(u64, @intCast(acc.items.len / output_channels)));
+        const unconsumed = acc.items.len / output_channels - stale_now;
+        if (packets_done and unconsumed < sola.lookahead_frames) {
+            const remaining = acc.items.len - @as(usize, @intCast(stale_now * output_channels));
+            if (remaining == 0) {
+                // Everything consumed (pos may overshoot at high speeds).
+                acc.clearRetainingCapacity();
+            } else if (ringAvailableFrames(self) + remaining / output_channels <= ring_cap) {
+                const pcm = acc.items[@intCast(stale_now * output_channels)..];
+                var tail_i: usize = 0;
+                if (stretch.has_tail) {
+                    const inv: f32 = 1.0 / @as(f32, sola.overlap_frames);
+                    const fade = @min(remaining / output_channels, sola.overlap_frames);
+                    while (tail_i < fade) : (tail_i += 1) {
+                        const t: f32 = @as(f32, @floatFromInt(tail_i)) * inv;
+                        for (0..output_channels) |c| {
+                            pcm[tail_i * output_channels + c] =
+                                stretch.tail[tail_i * output_channels + c] * (1 - t) + pcm[tail_i * output_channels + c] * t;
+                        }
+                    }
+                }
+                ringWriteFrames(self, pcm);
+                stretch.pos_scaled = (acc_base + stale_now + remaining / output_channels) * 100;
+                acc_base += stale_now + remaining / output_channels;
+                acc.clearRetainingCapacity();
+            }
+        }
+
+        const ended = packets_done and acc.items.len == 0 and ringAvailableFrames(self) == 0;
+        try audio.renderFrame(self, !isPaused(self));
         if (ended and !drained) {
             audio.drain();
             drained = true;
@@ -383,6 +475,23 @@ fn workerRun(self: *Player, path: []const u8) !void {
     }
     audio.stopOutput();
     self.ring_read.store(self.ring_write.load(.acquire), .release);
+}
+
+// Copies whole frames into the playback ring. The caller must have checked
+// that the ring has room.
+fn ringWriteFrames(self: *Player, src: []const f32) void {
+    const ch: usize = self.ring_channels;
+    const cap: u64 = @intCast(self.ring.len / ch);
+    var off: usize = 0;
+    while (off * ch < src.len) {
+        const write = self.ring_write.load(.acquire);
+        const contiguous = @min(cap - (write % cap), cap - (write - self.ring_read.load(.acquire)));
+        const chunk = @min(@as(u64, src.len / ch - off), contiguous);
+        const slot = (write % cap) * ch;
+        @memcpy(self.ring[@intCast(slot)..][0..@intCast(chunk * ch)], src[off * ch ..][0..@intCast(chunk * ch)]);
+        self.ring_write.store(write + chunk, .release);
+        off += @intCast(chunk);
+    }
 }
 
 fn isPaused(self: *Player) bool {
@@ -395,9 +504,9 @@ fn ringAvailableFrames(self: *Player) u64 {
     return self.ring_write.load(.acquire) - self.ring_read.load(.acquire);
 }
 
-// Decodes one packet into the ring. Returns false while the decoder needs
-// more input before producing output.
-fn decodePacketToRing(self: *Player, decoder: *Decoder, opus: ParsedOgg, packet_index: usize, ring: []f32, pending_skip: *u64, decode_samples: *u64) !bool {
+// Decodes one packet into the PCM accumulator. Returns false while the
+// decoder needs more input before producing output.
+fn decodePacketToAcc(self: *Player, decoder: *Decoder, opus: ParsedOgg, packet_index: usize, acc: *std.ArrayList(f32), pending_skip: *u64, decode_samples: *u64) !bool {
     const packet = opus.packets[packet_index];
     const packet_data = self.file_data[packet.offset .. packet.offset + packet.len];
     const packet_samples: u64 = opusPacketSamples(packet_data);
@@ -409,7 +518,6 @@ fn decodePacketToRing(self: *Player, decoder: *Decoder, opus: ParsedOgg, packet_
     var produced_any = false;
     try decoder.sendInput(input_sample);
 
-    const ring_capacity_frames: u64 = @intCast(ring.len / output_channels);
     while (true) {
         const output = decoder.pullOutput() catch |err| switch (err) {
             error.NeedMoreInput => return produced_any,
@@ -431,21 +539,7 @@ fn decodePacketToRing(self: *Player, decoder: *Decoder, opus: ParsedOgg, packet_
             pending_skip.* -= drop;
         }
 
-        var frame: u64 = 0;
-        while (frame < frames) {
-            const write = self.ring_write.load(.acquire);
-            const in_ring = write - self.ring_read.load(.acquire);
-            if (in_ring >= ring_capacity_frames) break;
-            const slot = (write % ring_capacity_frames) * output_channels;
-            const chunk = @min(@min(frames - frame, ring_capacity_frames - (write % ring_capacity_frames)), ring_capacity_frames - in_ring);
-            const src = frame * output_channels;
-            var k: usize = 0;
-            while (k < chunk * output_channels) : (k += 1) {
-                ring[slot + k] = pcm[src + k];
-            }
-            self.ring_write.store(write + chunk, .release);
-            frame += chunk;
-        }
+        try acc.appendSlice(self.allocator, pcm);
     }
 }
 
@@ -700,11 +794,6 @@ const WasapiOutput = struct {
         };
     }
 
-    fn reopen(self: *WasapiOutput, rate: u32) !void {
-        self.close();
-        self.* = try WasapiOutput.open(rate);
-    }
-
     fn renderFrame(self: *WasapiOutput, player: *Player, playing: bool) !void {
         var padding: win.UINT32 = 0;
         if (self.client.*.lpVtbl.*.GetCurrentPadding.?(self.client, &padding) < 0) return;
@@ -734,7 +823,11 @@ const WasapiOutput = struct {
         @memset(samples[written..total], 0);
         _ = self.render.*.lpVtbl.*.ReleaseBuffer.?(self.render, frames_free, 0);
         if (playing and written > 0) {
-            _ = player.rendered_frames.fetchAdd(written / channels, .release);
+            // Convert this chunk to source time at the speed in effect now,
+            // so later speed changes do not rescale earlier audio.
+            const src_frames = written / channels * player.speed() / 100;
+            _ = player.rendered_src.fetchAdd(src_frames, .release);
+            player.storePositionMs();
         }
     }
 
