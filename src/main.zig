@@ -1547,13 +1547,11 @@ fn playerCallbackQueryInterface(_: [*c]win.IMFPMediaPlayerCallback, riid: [*c]co
 }
 
 fn playerCallbackAddRef(_: [*c]win.IMFPMediaPlayerCallback) callconv(.c) win.ULONG {
-    player_callback_refs += 1;
-    return player_callback_refs;
+    return @atomicRmw(u32, &player_callback_refs, .Add, 1, .monotonic) + 1;
 }
 
 fn playerCallbackRelease(_: [*c]win.IMFPMediaPlayerCallback) callconv(.c) win.ULONG {
-    if (player_callback_refs > 0) player_callback_refs -= 1;
-    return player_callback_refs;
+    return @atomicRmw(u32, &player_callback_refs, .Sub, 1, .monotonic);
 }
 
 fn playerCallbackEvent(_: [*c]win.IMFPMediaPlayerCallback, event: [*c]win.MFP_EVENT_HEADER) callconv(.c) void {
@@ -1595,9 +1593,18 @@ fn playerProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win
                 return 0;
             }
         },
-        win.WM_SIZE, win.WM_PAINT => {
-            // MFPlay does not move or redraw its video surface on its own.
+        win.WM_SIZE => {
+            // MFPlay does not move its video surface on its own.
             if (a.mf_player) |player| _ = player.lpVtbl.*.UpdateVideo.?(player);
+        },
+        win.WM_PAINT => {
+            // Paint ordering per the MFPlay docs: erase, present, validate.
+            var ps = win.PAINTSTRUCT{};
+            const hdc = win.BeginPaint(hwnd, &ps);
+            if (a.mf_player) |player| _ = player.lpVtbl.*.UpdateVideo.?(player);
+            _ = win.EndPaint(hwnd, &ps);
+            _ = hdc;
+            return 0;
         },
         win.WM_CLOSE => {
             closePlayer(a);
