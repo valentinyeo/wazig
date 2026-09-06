@@ -1529,7 +1529,7 @@ fn clampPlayerSize(width: u32, height: u32) [2]u32 {
     return .{ @intCast(w), @intCast(h) };
 }
 
-fn playerCallbackQueryInterface(_: [*c]win.IMFPMediaPlayerCallback, riid: [*c]const win.GUID, ppv_object: [*c]?*anyopaque) callconv(.c) win.HRESULT {
+fn playerCallbackQueryInterface(_: [*c]win.IMFPMediaPlayerCallback, riid: [*c]const win.GUID, ppv_object: [*c]?*anyopaque) callconv(.winapi) win.HRESULT {
     if (ppv_object != null and riid != null) {
         const iid_callback = win.GUID{ .Data1 = 0x766c8ffb, .Data2 = 0x5fdb, .Data3 = 0x4fea, .Data4 = .{ 0xa2, 0x8d, 0xb9, 0x12, 0x99, 0x6f, 0x51, 0xbd } };
         const iid_unknown = win.GUID{ .Data1 = 0, .Data2 = 0, .Data3 = 0, .Data4 = .{ 0xc0, 0, 0, 0, 0, 0, 0, 0x46 } };
@@ -1546,15 +1546,15 @@ fn playerCallbackQueryInterface(_: [*c]win.IMFPMediaPlayerCallback, riid: [*c]co
     return win.E_NOINTERFACE;
 }
 
-fn playerCallbackAddRef(_: [*c]win.IMFPMediaPlayerCallback) callconv(.c) win.ULONG {
+fn playerCallbackAddRef(_: [*c]win.IMFPMediaPlayerCallback) callconv(.winapi) win.ULONG {
     return @atomicRmw(u32, &player_callback_refs, .Add, 1, .monotonic) + 1;
 }
 
-fn playerCallbackRelease(_: [*c]win.IMFPMediaPlayerCallback) callconv(.c) win.ULONG {
+fn playerCallbackRelease(_: [*c]win.IMFPMediaPlayerCallback) callconv(.winapi) win.ULONG {
     return @atomicRmw(u32, &player_callback_refs, .Sub, 1, .monotonic) - 1;
 }
 
-fn playerCallbackEvent(_: [*c]win.IMFPMediaPlayerCallback, event: [*c]win.MFP_EVENT_HEADER) callconv(.c) void {
+fn playerCallbackEvent(_: [*c]win.IMFPMediaPlayerCallback, event: [*c]win.MFP_EVENT_HEADER) callconv(.winapi) void {
     // Runs on an MFPlay worker thread; deliberately touches no window state
     // to avoid cross-thread races. On playback failure the window simply
     // stops and the user closes it with Esc or the close button.
