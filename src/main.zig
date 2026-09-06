@@ -202,11 +202,11 @@ const PaletteItem = struct {
     shortcut: WideText(15) = .{},
     command: u16 = 0,
     url: WideText(519) = .{},
+    chat_jid: Utf8Text(191) = .{},
 };
 
-// buildPaletteItems registers more items than the original cap allowed, so
-// entries near the end were silently dropped.
-const max_palette_items = 32;
+// 27 commands plus one entry per chat in the sidebar list (max_chats 256).
+const max_palette_items = 288;
 const palette_width: i32 = 540;
 const palette_row_height: i32 = 40;
 const palette_edit_zone: i32 = 64;
@@ -2409,6 +2409,23 @@ fn updateDictation(a: *App) void {
     }
 }
 
+fn openChatAtIndex(a: *App, index: usize) void {
+    if (index >= a.chat_count) return;
+    a.selected_chat = index;
+    a.user_viewed = true;
+    if (a.chats_hwnd) |list| _ = win.SendMessageW(list, win.LB_SETCURSEL, @intCast(index), 0);
+    refreshMessages(a);
+    focusCompose(a);
+    if (a.hwnd) |hwnd| _ = win.InvalidateRect(hwnd, null, win.TRUE);
+}
+
+fn findChatByJid(a: *App, jid: []const u8) ?usize {
+    for (a.chats[0..a.chat_count], 0..) |*chat, index| {
+        if (std.mem.eql(u8, chat.jid.slice(), jid)) return index;
+    }
+    return null;
+}
+
 fn selectChat(a: *App, delta: i32, wrap: bool) void {
     if (a.chat_count == 0) return;
     clearReply(a);
@@ -2829,6 +2846,23 @@ fn appendPalette(a: *App, label: []const u8, shortcut: []const u8, command: u16)
     item.label.set(a.allocator, label);
     item.shortcut.set(a.allocator, shortcut);
     item.command = command;
+    // The item array is reused across link mode, so stale targets from the
+    // previous build must not survive into a command item.
+    item.url = .{};
+    item.chat_jid = .{};
+}
+
+fn appendPaletteChat(a: *App, chat: *const Chat) void {
+    if (a.palette_item_count >= max_palette_items) return;
+    const name_utf8 = std.unicode.utf16LeToUtf8Alloc(a.allocator, chat.name.slice()) catch return;
+    defer a.allocator.free(name_utf8);
+    const item = &a.palette_items[a.palette_item_count];
+    a.palette_item_count += 1;
+    item.label.set(a.allocator, name_utf8);
+    item.shortcut.set(a.allocator, if (std.mem.endsWith(u8, chat.jid.slice(), "@g.us")) "Group" else "Chat");
+    item.command = 0;
+    item.url = .{};
+    item.chat_jid.set(chat.jid.slice());
 }
 
 fn buildPaletteItems(a: *App) void {
@@ -2860,6 +2894,7 @@ fn buildPaletteItems(a: *App) void {
     appendPalette(a, "Restart live sync", "S", command_sync);
     appendPalette(a, "Open video in external player", "", command_open_video_external);
     appendPalette(a, "Quit Messages", "Q", command_quit);
+    for (a.chats[0..a.chat_count]) |*chat| appendPaletteChat(a, chat);
 }
 
 fn lowerUnit(unit: u16) u16 {
@@ -2962,6 +2997,27 @@ fn closePalette(a: *App) void {
 fn paletteActivate(a: *App) void {
     if (a.palette_selected >= a.palette_match_count) return;
     const item = &a.palette_items[a.palette_matches[a.palette_selected]];
+    if (item.chat_jid.len > 0) {
+        const jid_bytes = item.chat_jid.slice();
+        closePalette(a);
+        var index = findChatByJid(a, jid_bytes);
+        if (index == null) {
+            // The chat may be hidden by the sidebar search filter; clear the
+            // filter and retry once against the refreshed list. Archived and
+            // unread-filtered chats still fall through to the status message
+            // below (ponytail: palette only indexes the current sidebar list;
+            // upgrade path: query wacli for an unfiltered chat list here).
+            if (a.search) |search| _ = win.SetWindowTextW(search, lit(""));
+            refreshChats(a);
+            index = findChatByJid(a, jid_bytes);
+        }
+        if (index) |found| {
+            openChatAtIndex(a, found);
+        } else {
+            setStatus(a, "Chat is outside the current list filters");
+        }
+        return;
+    }
     if (item.url.len > 0) {
         const url_ptr = item.url.ptr();
         closePalette(a);
@@ -3017,6 +3073,7 @@ fn buildLinkPaletteItems(a: *App) void {
             item.url.set(a.allocator, url_utf8);
             item.shortcut.set(a.allocator, "");
             item.command = 0;
+            item.chat_jid = .{};
             a.palette_item_count += 1;
         }
     }
@@ -4217,13 +4274,7 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
             const notification = hiword(wparam);
             if (id == id_chats and notification == win.LBN_SELCHANGE) {
                 const selected = win.SendMessageW(a.chats_hwnd.?, win.LB_GETCURSEL, 0, 0);
-                if (selected >= 0) {
-                    a.selected_chat = @intCast(selected);
-                    a.user_viewed = true;
-                    refreshMessages(a);
-                    focusCompose(a);
-                    _ = win.InvalidateRect(hwnd, null, win.TRUE);
-                }
+                if (selected >= 0) openChatAtIndex(a, @intCast(selected));
             } else if (id == id_send and notification == win.BN_CLICKED) {
                 sendMessage(a);
             } else if (id == id_dictate and notification == win.BN_CLICKED) {
