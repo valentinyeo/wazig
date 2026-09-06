@@ -13,23 +13,7 @@ const webp = @cImport({
     @cInclude("src/webp/decode.h");
 });
 
-const win = @cImport({
-    @cDefine("WIN32_LEAN_AND_MEAN", "1");
-    @cDefine("NOMINMAX", "1");
-    @cDefine("COBJMACROS", "1");
-    @cInclude("windows.h");
-    @cInclude("windowsx.h");
-    @cInclude("commctrl.h");
-    @cInclude("dwmapi.h");
-    @cInclude("shellapi.h");
-    @cInclude("shobjidl.h");
-    @cInclude("wincodec.h");
-    @cInclude("mfapi.h");
-    @cInclude("mfidl.h");
-    @cInclude("mfreadwrite.h");
-    @cInclude("mfplay.h");
-    @cInclude("winhttp.h");
-});
+const win = @import("win32.zig").c;
 
 const build_info = @import("build_info");
 const app_version = build_info.version;
@@ -65,7 +49,7 @@ const update_check_interval_ms: u32 = 4 * 60 * 60 * 1000;
 const update_restart_delay_ms: u32 = 10 * 1000;
 const scrollbar_width: i32 = 8; // 6px thumb + 1px inset on each side
 const scrollbar_min_thumb: i32 = 24;
-const SbDrag = enum { none, chats, compose, palette, canvas };
+const SbDrag = enum { none, chats, compose, palette, canvas, emoji };
 const update_max_asset_bytes: usize = 256 * 1024 * 1024;
 const id_search = 1008;
 const id_chats = 1016;
@@ -77,6 +61,8 @@ const id_dictate = 1056;
 const id_palette_edit = 1064;
 const id_palette_list = 1072;
 const id_emoji = 1080;
+const id_emoji_edit = 1088;
+const id_emoji_list = 1096;
 const command_search = 2001;
 const command_compose = 2002;
 const command_unread = 2003;
@@ -101,6 +87,7 @@ const command_copy_selection = 2021;
 const command_copy_transcript = 2022;
 const command_reply = 2023;
 const command_open_video_external = 2024;
+const command_emoji = 2027;
 const reaction_like = 3001;
 const reaction_love = 3002;
 const reaction_laugh = 3003;
@@ -109,9 +96,7 @@ const reaction_sad = 3005;
 const reaction_thanks = 3006;
 const reaction_remove = 3007;
 const emoji_picker = @import("emoji_picker.zig");
-const picker_emojis = emoji_picker.picker_emojis;
-const picker_base = emoji_picker.picker_base;
-const pickerEmojiForCommand = emoji_picker.pickerEmojiForCommand;
+const emoji_draw = @import("emoji_draw.zig");
 
 const color_bg = rgb(11, 20, 26);
 const color_panel = rgb(17, 27, 33);
@@ -246,6 +231,10 @@ const palette_width: i32 = 540;
 const palette_row_height: i32 = 40;
 const palette_edit_zone: i32 = 64;
 const palette_max_rows = 10;
+const emoji_picker_width: i32 = emoji_picker.cell_size * @as(i32, @intCast(emoji_picker.grid_columns)) + 12 + scrollbar_width;
+const emoji_edit_zone: i32 = 64;
+const emoji_max_rows: i32 = @intCast(emoji_picker.grid_rows);
+const max_emoji_matches = emoji_picker.catalog.len;
 
 const Message = struct {
     id: Utf8Text(191) = .{},
@@ -384,6 +373,17 @@ const App = struct {
     palette_match_count: usize = 0,
     palette_selected: usize = 0,
     palette_ever_active: bool = false,
+    emoji_wnd: ?win.HWND = null,
+    emoji_edit: ?win.HWND = null,
+    emoji_list: ?win.HWND = null,
+    emoji_matches: [max_emoji_matches]u16 = [_]u16{0} ** max_emoji_matches,
+    emoji_match_count: usize = 0,
+    emoji_selected: usize = 0,
+    emoji_ever_active: bool = false,
+    emoji_recents: [emoji_picker.max_recents]u16 = [_]u16{0} ** emoji_picker.max_recents,
+    emoji_recents_count: usize = 0,
+    sb_emoji_top: i32 = -1,
+    sb_emoji_total: i32 = -1,
     user_viewed: bool = false,
     chat_selection_pending: bool = false,
     last_chat_count: usize = std.math.maxInt(usize),
@@ -640,6 +640,25 @@ fn saveComposeDragged(hwnd: win.HWND, dragged: i32) void {
     _ = win.RegSetValueExW(key, lit("ComposeMinHeight"), 0, win.REG_DWORD, @ptrCast(&stored), @sizeOf(win.DWORD));
     var saved_dpi: win.DWORD = 96;
     _ = win.RegSetValueExW(key, lit("ComposeDpi"), 0, win.REG_DWORD, @ptrCast(&saved_dpi), @sizeOf(win.DWORD));
+}
+
+fn loadEmojiRecents(a: *App) void {
+    const saved = loadRegistryString(a.allocator, lit("EmojiRecents")) orelse return;
+    defer a.allocator.free(saved);
+    a.emoji_recents_count = emoji_picker.parseRecents(saved, &a.emoji_recents);
+}
+
+fn saveEmojiRecents(a: *App) void {
+    var buffer: [64]u8 = undefined;
+    const text = emoji_picker.formatRecents(&buffer, a.emoji_recents[0..a.emoji_recents_count]);
+    var wide = WideText(31){};
+    wide.set(a.allocator, text);
+    if (wide.len == 0) return;
+    var key: win.HKEY = null;
+    var disposition: win.DWORD = 0;
+    if (win.RegCreateKeyExW(winHandle(win.HKEY, 0x80000001), lit("Software\\Messages"), 0, null, 0, win.KEY_SET_VALUE, null, &key, &disposition) != win.ERROR_SUCCESS) return;
+    defer _ = win.RegCloseKey(key);
+    _ = win.RegSetValueExW(key, lit("EmojiRecents"), 0, win.REG_SZ, @ptrCast(wide.ptr()), @intCast((wide.len + 1) * 2));
 }
 
 fn saveFontScale(scale: i32) void {
@@ -3673,21 +3692,309 @@ fn insertEmoji(a: *App, emoji: []const u8) void {
     _ = win.SetFocus(compose);
 }
 
-fn openEmojiMenu(a: *App) void {
-    const hwnd = a.hwnd orelse return;
-    const menu = win.CreatePopupMenu() orelse return;
-    defer _ = win.DestroyMenu(menu);
-    for (picker_emojis, 0..) |emoji, index| {
-        var wide = WideText(31){};
-        wide.set(a.allocator, emoji);
-        if (wide.len == 0) continue;
-        _ = win.AppendMenuW(menu, win.MF_STRING, picker_base + @as(u32, @intCast(index)), wide.ptr());
+fn closeEmojiPicker(a: *App) void {
+    if (a.emoji_wnd) |picker| _ = win.DestroyWindow(picker);
+    if (a.chats_hwnd) |list| _ = win.SetFocus(list);
+}
+
+fn openEmojiPicker(a: *App) void {
+    if (a.emoji_wnd != null) {
+        closeEmojiPicker(a);
+        return;
     }
-    var rect: win.RECT = undefined;
-    _ = win.GetWindowRect(hwnd, &rect);
-    const choice = win.TrackPopupMenu(menu, win.TPM_RETURNCMD | win.TPM_NONOTIFY, rect.right - 232, rect.bottom - 110, 0, hwnd, null);
-    if (choice == 0) return;
-    if (pickerEmojiForCommand(@intCast(choice))) |emoji| insertEmoji(a, emoji);
+    showEmojiPickerWindow(a);
+}
+
+/// Fills the match list: recent emojis first when the query is empty, else
+/// every catalog entry whose name contains the query.
+fn buildEmojiMatches(a: *App) void {
+    a.emoji_match_count = 0;
+    var query_buf: [64]u16 = [_]u16{0} ** 64;
+    const query_len: usize = if (a.emoji_edit) |edit| @intCast(win.GetWindowTextW(edit, &query_buf, query_buf.len)) else 0;
+    if (query_len == 0) {
+        for (a.emoji_recents[0..a.emoji_recents_count]) |recent| {
+            a.emoji_matches[a.emoji_match_count] = recent;
+            a.emoji_match_count += 1;
+        }
+        for (0..emoji_picker.catalog.len) |index| {
+            var recent = false;
+            for (a.emoji_matches[0..a.emoji_match_count]) |match| {
+                if (match == index) recent = true;
+            }
+            if (recent) continue;
+            a.emoji_matches[a.emoji_match_count] = @intCast(index);
+            a.emoji_match_count += 1;
+        }
+        return;
+    }
+    const utf8_query = std.unicode.utf16LeToUtf8Alloc(a.allocator, query_buf[0..query_len]) catch {
+        // On conversion failure show the unfiltered catalog rather than none.
+        buildEmojiMatchesEmptyQuery(a);
+        return;
+    };
+    defer a.allocator.free(utf8_query);
+    for (utf8_query) |*character| character.* = std.ascii.toLower(character.*);
+    for (emoji_picker.catalog, 0..) |entry, index| {
+        if (!emoji_picker.nameMatches(entry.name, utf8_query)) continue;
+        a.emoji_matches[a.emoji_match_count] = @intCast(index);
+        a.emoji_match_count += 1;
+    }
+}
+
+fn buildEmojiMatchesEmptyQuery(a: *App) void {
+    a.emoji_match_count = 0;
+    for (0..emoji_picker.catalog.len) |index| {
+        a.emoji_matches[a.emoji_match_count] = @intCast(index);
+        a.emoji_match_count += 1;
+    }
+}
+
+fn emojiLayout(a: *App) void {
+    const picker = a.emoji_wnd orelse return;
+    const match_rows: i32 = @intCast(@divTrunc(a.emoji_match_count + emoji_picker.grid_columns - 1, emoji_picker.grid_columns));
+    const rows = @max(1, @min(match_rows, emoji_max_rows));
+    const height = emoji_edit_zone + rows * emoji_picker.grid_row_height + 12;
+    _ = win.SetWindowPos(picker, null, 0, 0, emoji_picker_width, height, win.SWP_NOMOVE | win.SWP_NOZORDER | win.SWP_NOACTIVATE);
+    if (a.emoji_list) |list| {
+        _ = win.MoveWindow(list, 1, emoji_edit_zone, emoji_picker_width - 2 - scrollbar_width, height - emoji_edit_zone - 1, win.TRUE);
+    }
+}
+
+fn emojiFilter(a: *App) void {
+    buildEmojiMatches(a);
+    a.emoji_selected = 0;
+    if (a.emoji_list) |list| {
+        _ = win.SendMessageW(list, win.WM_SETREDRAW, 0, 0);
+        _ = win.SendMessageW(list, win.LB_RESETCONTENT, 0, 0);
+        const rows: i32 = @divTrunc(@as(i32, @intCast(a.emoji_match_count)) + @as(i32, @intCast(emoji_picker.grid_columns)) - 1, @as(i32, @intCast(emoji_picker.grid_columns)));
+        for (0..@intCast(@max(0, rows))) |_| {
+            _ = win.SendMessageW(list, win.LB_ADDSTRING, 0, 1);
+        }
+        _ = win.SendMessageW(list, win.WM_SETREDRAW, 1, 0);
+        _ = win.InvalidateRect(list, null, win.TRUE);
+    }
+    emojiLayout(a);
+    if (a.emoji_wnd) |picker| _ = win.InvalidateRect(picker, null, win.TRUE);
+}
+
+/// Moves the grid selection in cells; deltas are in grid coordinates.
+fn emojiMove(a: *App, delta_columns: i32, delta_rows: i32) void {
+    if (a.emoji_match_count == 0) return;
+    const columns: i32 = @intCast(emoji_picker.grid_columns);
+    var next: i32 = @as(i32, @intCast(a.emoji_selected)) + delta_rows * columns + delta_columns;
+    next = std.math.clamp(next, 0, @as(i32, @intCast(a.emoji_match_count - 1)));
+    a.emoji_selected = @intCast(next);
+    if (a.emoji_list) |list| {
+        _ = win.SendMessageW(list, win.LB_SETCURSEL, @intCast(@divTrunc(next, columns)), 0);
+        _ = win.InvalidateRect(list, null, win.FALSE);
+    }
+}
+
+fn emojiActivate(a: *App) void {
+    if (a.emoji_selected >= a.emoji_match_count) return;
+    const catalog_index = a.emoji_matches[a.emoji_selected];
+    const emoji = emoji_picker.catalog[catalog_index].emoji;
+    emoji_picker.pushRecent(&a.emoji_recents, &a.emoji_recents_count, catalog_index);
+    saveEmojiRecents(a);
+    closeEmojiPicker(a);
+    insertEmoji(a, emoji);
+}
+
+fn emojiCellClicked(a: *App, x: i32, item_index: i32) void {
+    const column = emoji_picker.cellFromHit(x) orelse return;
+    const index = @as(i32, @intCast(item_index)) * @as(i32, @intCast(emoji_picker.grid_columns)) + @as(i32, @intCast(column));
+    if (index < 0 or index >= @as(i32, @intCast(a.emoji_match_count))) return;
+    a.emoji_selected = @intCast(index);
+    emojiActivate(a);
+}
+
+fn drawEmojiCell(a: *App, item: *win.DRAWITEMSTRUCT) void {
+    const background = win.CreateSolidBrush(color_panel) orelse return;
+    defer _ = win.DeleteObject(background);
+    _ = win.FillRect(item.hDC, &item.rcItem, background);
+    _ = win.SetBkMode(item.hDC, win.TRANSPARENT);
+    const row: i32 = @intCast(item.itemID);
+    const columns: i32 = @intCast(emoji_picker.grid_columns);
+    for (0..emoji_picker.grid_columns) |column| {
+        const index = row * columns + @as(i32, @intCast(column));
+        if (index < 0 or index >= @as(i32, @intCast(a.emoji_match_count))) break;
+        const catalog_index = a.emoji_matches[@intCast(index)];
+        var cell = win.RECT{
+            .left = item.rcItem.left + @as(i32, @intCast(column)) * emoji_picker.cell_size,
+            .top = item.rcItem.top,
+            .right = item.rcItem.left + @as(i32, @intCast(column)) * emoji_picker.cell_size + emoji_picker.cell_size,
+            .bottom = item.rcItem.bottom,
+        };
+        if (index == @as(i32, @intCast(a.emoji_selected))) {
+            const selected_brush = win.CreateSolidBrush(color_selected) orelse return;
+            defer _ = win.DeleteObject(selected_brush);
+            _ = win.FillRect(item.hDC, &cell, selected_brush);
+        }
+        var wide = WideText(31){};
+        wide.set(a.allocator, emoji_picker.catalog[catalog_index].emoji);
+        if (wide.len == 0) continue;
+        const em: i32 = 28;
+        const offset_x = cell.left + @divTrunc(emoji_picker.cell_size - em, 2);
+        const offset_y = cell.top + @divTrunc(emoji_picker.cell_size - em, 2);
+        if (!emoji_draw.draw(item.hDC, wide.slice(), offset_x, offset_y, em, em)) {
+            const fallback_font = (if (a.font_emoji != null) a.font_emoji else a.font) orelse return;
+            _ = win.SelectObject(item.hDC, @ptrCast(fallback_font));
+            _ = win.TextOutW(item.hDC, offset_x, offset_y, wide.ptr(), @intCast(wide.len));
+        }
+    }
+}
+
+fn showEmojiPickerWindow(a: *App) void {
+    const owner = a.hwnd orelse return;
+    var owner_rect: win.RECT = undefined;
+    _ = win.GetWindowRect(owner, &owner_rect);
+    const x = owner_rect.right - emoji_picker_width - 16;
+    const y = owner_rect.bottom - emoji_edit_zone - emoji_max_rows * emoji_picker.grid_row_height - 120;
+    const picker = win.CreateWindowExW(
+        win.WS_EX_TOOLWINDOW,
+        lit("MessagesEmojiPicker"),
+        null,
+        win.WS_POPUP,
+        @max(owner_rect.left + 8, x),
+        @max(owner_rect.top + 60, y),
+        emoji_picker_width,
+        emoji_edit_zone + emoji_max_rows * emoji_picker.grid_row_height + 12,
+        owner,
+        null,
+        a.instance,
+        null,
+    ) orelse return;
+    a.emoji_wnd = picker;
+    a.emoji_ever_active = false;
+    var corner: win.DWORD = 2; // DWMWCP_ROUND
+    _ = win.DwmSetWindowAttribute(picker, 33, &corner, @sizeOf(win.DWORD));
+    var margins = win.MARGINS{ .cxLeftWidth = 0, .cxRightWidth = 0, .cyTopHeight = 0, .cyBottomHeight = 1 };
+    _ = win.DwmExtendFrameIntoClientArea(picker, &margins);
+    a.emoji_edit = win.CreateWindowExW(0, lit("EDIT"), null, win.WS_CHILD | win.WS_VISIBLE | win.WS_TABSTOP | win.ES_AUTOHSCROLL, 16, 13, emoji_picker_width - 32, 36, picker, controlId(id_emoji_edit), a.instance, null);
+    a.emoji_list = win.CreateWindowExW(0, lit("LISTBOX"), null, win.WS_CHILD | win.WS_VISIBLE | win.LBS_NOTIFY | win.LBS_OWNERDRAWFIXED | win.LBS_NOINTEGRALHEIGHT, 1, emoji_edit_zone, emoji_picker_width - 2 - scrollbar_width, emoji_max_rows * emoji_picker.grid_row_height + 12, picker, controlId(id_emoji_list), a.instance, null);
+    setFont(a.emoji_edit, a.font);
+    setFont(a.emoji_list, a.font);
+    if (a.emoji_edit) |edit| {
+        _ = win.SendMessageW(edit, win.EM_SETCUEBANNER, 1, @bitCast(@intFromPtr(lit("Search emoji"))));
+    }
+    if (a.emoji_list) |list| _ = win.SendMessageW(list, win.LB_SETITEMHEIGHT, 0, emoji_picker.grid_row_height);
+    emojiFilter(a);
+    _ = win.ShowWindow(picker, win.SW_SHOW);
+    if (a.emoji_edit) |edit| _ = win.SetFocus(edit);
+}
+
+fn emojiProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.LPARAM) callconv(.winapi) win.LRESULT {
+    const a = app_ptr orelse return win.DefWindowProcW(hwnd, message, wparam, lparam);
+    switch (message) {
+        win.WM_COMMAND => {
+            const id = loword(wparam);
+            const notification = hiword(wparam);
+            if (id == id_emoji_edit and notification == win.EN_CHANGE) {
+                emojiFilter(a);
+            } else if (id == id_emoji_list and notification == win.LBN_SELCHANGE) {
+                const list = a.emoji_list orelse return 0;
+                const row = win.SendMessageW(list, win.LB_GETCURSEL, 0, 0);
+                if (row >= 0) emojiCellClicked(a, emojiCellX(a), @intCast(row));
+            }
+            return 0;
+        },
+        win.WM_DRAWITEM => {
+            const item: *win.DRAWITEMSTRUCT = winHandle(*win.DRAWITEMSTRUCT, @as(usize, @bitCast(lparam)));
+            if (item.CtlID == id_emoji_list) drawEmojiCell(a, item);
+            return 1;
+        },
+        win.WM_CTLCOLORSTATIC, win.WM_CTLCOLOREDIT, win.WM_CTLCOLORLISTBOX => {
+            const hdc: win.HDC = winHandle(win.HDC, wparam);
+            _ = win.SetTextColor(hdc, color_text);
+            _ = win.SetBkColor(hdc, color_panel);
+            if (a.brush_panel) |brush| return @bitCast(@intFromPtr(brush));
+            return @bitCast(@intFromPtr(win.GetStockObject(win.BLACK_BRUSH)));
+        },
+        win.WM_PAINT => {
+            var paint: win.PAINTSTRUCT = undefined;
+            const hdc = win.BeginPaint(hwnd, &paint);
+            defer _ = win.EndPaint(hwnd, &paint);
+            var client: win.RECT = undefined;
+            _ = win.GetClientRect(hwnd, &client);
+            _ = win.FillRect(hdc, &client, a.brush_panel.?);
+            var separator = win.RECT{ .left = 0, .top = emoji_edit_zone - 2, .right = client.right, .bottom = emoji_edit_zone - 1 };
+            _ = win.FillRect(hdc, &separator, a.brush_raised.?);
+            if (a.emoji_match_count == 0) {
+                _ = win.SetTextColor(hdc, color_muted);
+                _ = win.SelectObject(hdc, @ptrCast(a.font.?));
+                var empty_rect = win.RECT{ .left = 20, .top = emoji_edit_zone + 4, .right = client.right - 20, .bottom = emoji_edit_zone + 36 };
+                _ = win.DrawTextW(hdc, lit("No matching emoji"), -1, &empty_rect, win.DT_LEFT | win.DT_SINGLELINE | win.DT_VCENTER);
+            }
+            if (a.emoji_list) |list| drawScrollbar(hdc, stripRightOf(list, hwnd), listboxScrollInfo(list), a.brush_muted.?);
+            return 0;
+        },
+        win.WM_LBUTTONDOWN => {
+            const x: i32 = @as(i16, @bitCast(loword(@as(usize, @bitCast(lparam)))));
+            const y: i32 = @as(i16, @bitCast(hiword(@as(usize, @bitCast(lparam)))));
+            if (a.emoji_list) |list| {
+                const strip = stripRightOf(list, hwnd);
+                if (hitStrip(strip, x, y)) {
+                    const info = listboxScrollInfo(list);
+                    if (scrollbar.thumbGeom(trackOf(strip).top, trackOf(strip).h, info.total, info.page, info.top, scrollbar_min_thumb) != null)
+                        beginStripDrag(a, hwnd, strip, info, y, .emoji, setEmojiScroll);
+                    return 0;
+                }
+            }
+            return win.DefWindowProcW(hwnd, message, wparam, lparam);
+        },
+        win.WM_MOUSEMOVE => {
+            if (a.sb_drag == .emoji) {
+                const y: i32 = @as(i16, @bitCast(hiword(@as(usize, @bitCast(lparam)))));
+                if (a.emoji_list) |list| dragStrip(a, stripRightOf(list, hwnd), listboxScrollInfo(list), y, setEmojiScroll);
+                return 0;
+            }
+            return win.DefWindowProcW(hwnd, message, wparam, lparam);
+        },
+        win.WM_LBUTTONUP => {
+            if (a.sb_drag == .emoji) {
+                _ = win.ReleaseCapture();
+                a.sb_drag = .none;
+                return 0;
+            }
+            return win.DefWindowProcW(hwnd, message, wparam, lparam);
+        },
+        win.WM_CAPTURECHANGED => {
+            a.sb_drag = .none;
+            return 0;
+        },
+        win.WM_ACTIVATE => {
+            if (loword(wparam) == win.WA_INACTIVE) {
+                if (a.emoji_ever_active) _ = win.DestroyWindow(hwnd);
+            } else a.emoji_ever_active = true;
+            return 0;
+        },
+        win.WM_DESTROY => {
+            a.emoji_wnd = null;
+            a.emoji_edit = null;
+            a.emoji_list = null;
+            if (a.sb_drag == .emoji) a.sb_drag = .none;
+            return 0;
+        },
+        else => return win.DefWindowProcW(hwnd, message, wparam, lparam),
+    }
+}
+
+fn setEmojiScroll(a: *App, top: i32) void {
+    if (a.emoji_list) |list| setListboxTop(list, top);
+}
+
+/// Client x offset of a click inside the grid listbox, tracked between the
+/// LBN_SELCHANGE notification and the mouse position.
+fn emojiCellX(a: *App) i32 {
+    var point: win.POINT = undefined;
+    _ = win.GetCursorPos(&point);
+    const list = a.emoji_list orelse return 0;
+    _ = win.ScreenToClient(list, &point);
+    return point.x;
+}
+
+fn openEmojiMenu(a: *App) void {
+    openEmojiPicker(a);
 }
 
 fn addReactionItems(menu: win.HMENU) void {
@@ -3830,6 +4137,7 @@ fn buildPaletteItems(a: *App) void {
     a.palette_item_count = 0;
     appendPalette(a, "Search chats", "Ctrl+F", command_search);
     appendPalette(a, "Compose message", "C", command_compose);
+    appendPalette(a, "Insert emoji", "", command_emoji);
     appendPalette(a, "Dictate", "Ctrl+D", command_dictate);
     appendPalette(a, "Dictation language: Automatic", "", command_dictation_auto);
     appendPalette(a, "Dictation language: English", "", command_dictation_english);
@@ -4202,6 +4510,7 @@ fn runCommand(a: *App, command: u16) void {
             a.user_viewed = true;
             if (a.compose) |compose| _ = win.SetFocus(compose);
         },
+        command_emoji => openEmojiPicker(a),
         command_unread => {
             a.unread_only = !a.unread_only;
             refreshChats(a);
@@ -4494,18 +4803,46 @@ fn runWidth(hdc: win.HDC, text: []const u16) i32 {
     return size.cx;
 }
 
+/// Draws one emoji run with DirectWrite color glyphs when available, else the
+/// monochrome GDI font. Returns the run width in pixels; measuring and
+/// painting always use the same source so wrapping stays consistent.
+fn drawEmojiRun(hdc: win.HDC, emoji_font: win.HFONT, text_ascent: i32, line_height: i32, slice: []const u16, cursor: i32, y: i32, draw: bool) i32 {
+    const em = line_height;
+    if (emoji_draw.metrics(slice, em)) |run_metrics| {
+        if (!draw or emoji_draw.draw(hdc, slice, cursor, y, text_ascent, em)) return run_metrics.width;
+    }
+    _ = win.SelectObject(hdc, @ptrCast(emoji_font));
+    if (draw) _ = win.TextOutW(hdc, cursor, y, slice.ptr, @intCast(slice.len));
+    return runWidth(hdc, slice);
+}
+
 /// Draws one line mixing text and emoji runs. Returns the end x position.
 fn drawMixedLine(hdc: win.HDC, text_font: win.HFONT, emoji_font: win.HFONT, text: []const u16, x: i32, y: i32) i32 {
     var runs: [max_text_runs]TextRun = undefined;
     const count = splitRuns(text, &runs);
     var cursor = x;
+    _ = win.SelectObject(hdc, @ptrCast(text_font));
+    const line_height = textLineHeight(hdc, text_font);
+    const text_ascent = fontAscent(hdc, text_font);
     for (runs[0..count]) |run| {
-        _ = win.SelectObject(hdc, @ptrCast(if (run.emoji) emoji_font else text_font));
         const slice = text[run.start..][0..run.len];
-        _ = win.TextOutW(hdc, cursor, y, slice.ptr, @intCast(slice.len));
-        cursor += runWidth(hdc, slice);
+        if (run.emoji) {
+            cursor += drawEmojiRun(hdc, emoji_font, text_ascent, line_height, slice, cursor, y, true);
+        } else {
+            _ = win.SelectObject(hdc, @ptrCast(text_font));
+            _ = win.TextOutW(hdc, cursor, y, slice.ptr, @intCast(slice.len));
+            cursor += runWidth(hdc, slice);
+        }
     }
     return cursor;
+}
+
+fn fontAscent(hdc: win.HDC, font: win.HFONT) i32 {
+    var metrics: win.TEXTMETRICW = undefined;
+    const old = win.SelectObject(hdc, @ptrCast(font));
+    _ = win.GetTextMetricsW(hdc, &metrics);
+    _ = win.SelectObject(hdc, old);
+    return metrics.tmAscent;
 }
 
 fn textLineHeight(hdc: win.HDC, font: win.HFONT) i32 {
@@ -4557,6 +4894,7 @@ fn wrapMixedSink(hdc: win.HDC, a: *App, text_ptr: [*]const u16, len: c_int, max_
     const text_font = a.font orelse return 0;
     const emoji_font = a.font_emoji orelse text_font;
     const line_height = textLineHeight(hdc, text_font);
+    const text_ascent = fontAscent(hdc, text_font);
     var line_top = top;
     var cursor_x = left;
     var word_start: usize = 0;
@@ -4569,8 +4907,13 @@ fn wrapMixedSink(hdc: win.HDC, a: *App, text_ptr: [*]const u16, len: c_int, max_
             const word_run_count = splitRuns(word, &word_runs);
             var word_width: i32 = 0;
             for (word_runs[0..word_run_count]) |run| {
-                _ = win.SelectObject(hdc, @ptrCast(if (run.emoji) emoji_font else text_font));
-                word_width += runWidth(hdc, word[run.start..][0..run.len]);
+                const slice = word[run.start..][0..run.len];
+                if (run.emoji) {
+                    word_width += drawEmojiRun(hdc, emoji_font, text_ascent, line_height, slice, 0, 0, false);
+                } else {
+                    _ = win.SelectObject(hdc, @ptrCast(text_font));
+                    word_width += runWidth(hdc, slice);
+                }
             }
             const space_width = runWidth(hdc, &[_]u16{' '});
             if (cursor_x > left and cursor_x + word_width > left + max_width) {
@@ -4581,13 +4924,17 @@ fn wrapMixedSink(hdc: win.HDC, a: *App, text_ptr: [*]const u16, len: c_int, max_
                 const word_x_start = cursor_x;
                 const is_link = wordIsUrl(word);
                 for (word_runs[0..word_run_count]) |run| {
+                    const slice = word[run.start..][0..run.len];
+                    if (!is_link and run.emoji) {
+                        cursor_x += drawEmojiRun(hdc, emoji_font, text_ascent, line_height, slice, cursor_x, line_top, true);
+                        continue;
+                    }
                     if (is_link) {
                         _ = win.SelectObject(hdc, @ptrCast(a.font_underline orelse text_font));
                         _ = win.SetTextColor(hdc, color_accent);
                     } else {
-                        _ = win.SelectObject(hdc, @ptrCast(if (run.emoji) emoji_font else text_font));
+                        _ = win.SelectObject(hdc, @ptrCast(text_font));
                     }
-                    const slice = word[run.start..][0..run.len];
                     _ = win.TextOutW(hdc, cursor_x, line_top, slice.ptr, @intCast(slice.len));
                     cursor_x += runWidth(hdc, slice);
                 }
@@ -5831,13 +6178,42 @@ fn handleKeyboard(a: *App, message: *const win.MSG) bool {
         }
         return false;
     }
+    if (a.emoji_wnd != null) {
+        if (key == win.VK_DOWN) {
+            emojiMove(a, 0, 1);
+            return true;
+        }
+        if (key == win.VK_UP) {
+            emojiMove(a, 0, -1);
+            return true;
+        }
+        if (key == win.VK_LEFT) {
+            emojiMove(a, -1, 0);
+            return true;
+        }
+        if (key == win.VK_RIGHT) {
+            emojiMove(a, 1, 0);
+            return true;
+        }
+        if (key == win.VK_RETURN) {
+            emojiActivate(a);
+            return true;
+        }
+        if (key == win.VK_ESCAPE) {
+            closeEmojiPicker(a);
+            return true;
+        }
+        return false;
+    }
     if (key == win.VK_ESCAPE) {
         const focused = win.GetFocus();
         if (focused != null) {
             const root = win.GetAncestor(focused, win.GA_ROOT) orelse focused;
             var class_name: [32]u16 = [_]u16{0} ** 32;
             const class_len: usize = @intCast(win.GetClassNameW(root, &class_name, class_name.len));
-            if (std.mem.eql(u16, class_name[0..class_len], std.mem.span(lit("MessagesPalette")))) {
+            const is_palette = std.mem.eql(u16, class_name[0..class_len], std.mem.span(lit("MessagesPalette")));
+            const is_emoji_picker = std.mem.eql(u16, class_name[0..class_len], std.mem.span(lit("MessagesEmojiPicker")));
+            if (is_palette or is_emoji_picker) {
                 _ = win.DestroyWindow(root);
                 if (a.chats_hwnd) |list| _ = win.SetFocus(list);
                 return true;
@@ -6192,6 +6568,7 @@ pub fn main(init: std.process.Init) !void {
     }
     if (openrouter_model.len == 0) openrouter_model = "openai/gpt-5.6-luna";
     var app = App{ .allocator = init.gpa, .io = init.io, .instance = instance, .wacli_path = wacli_path, .avatar_dir = avatar_dir, .deepgram_configured = deepgram_key.len > 0, .deepgram_key = deepgram_key, .openrouter_key = openrouter_key, .openrouter_model = openrouter_model, .openrouter_configured = openrouter_key.len > 0, .dictation_language = loadDictationLanguage(), .font_scale = loadFontScale() };
+    loadEmojiRecents(&app);
     if (init.environ_map.get("LOCALAPPDATA")) |local| {
         if (std.fs.path.join(init.gpa, &.{ local, "Messages", "telegram" })) |telegram_dir| {
             if (tg.Client.create(init.gpa, init.io, build_info.telegram_api_id, build_info.telegram_api_hash, telegram_dir)) |client| {
@@ -6291,6 +6668,22 @@ pub fn main(init: std.process.Init) !void {
         .hIconSm = icon_small,
     };
     if (win.RegisterClassExW(&palette_class) == 0) return error.RegisterPaletteClassFailed;
+
+    var emoji_class = win.WNDCLASSEXW{
+        .cbSize = @sizeOf(win.WNDCLASSEXW),
+        .style = 0,
+        .lpfnWndProc = emojiProc,
+        .cbClsExtra = 0,
+        .cbWndExtra = 0,
+        .hInstance = instance,
+        .hIcon = icon_big,
+        .hCursor = cursor,
+        .hbrBackground = null,
+        .lpszMenuName = null,
+        .lpszClassName = lit("MessagesEmojiPicker"),
+        .hIconSm = icon_small,
+    };
+    if (win.RegisterClassExW(&emoji_class) == 0) return error.RegisterEmojiPickerClassFailed;
 
     const hwnd = win.CreateWindowExW(
         0,
