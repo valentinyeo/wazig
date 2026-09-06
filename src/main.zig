@@ -719,6 +719,23 @@ fn refreshChats(a: *App) void {
         @memcpy(selected_jid[0..selected_len], a.chats[a.selected_chat].jid.slice());
     }
 
+    // Remember the top visible row by jid so the rebuild below can anchor the
+    // list to the same chat instead of resetting the scroll and jumping.
+    var anchor_jid: [192]u8 = [_]u8{0} ** 192;
+    var anchor_len: usize = 0;
+    var top_index: i32 = -1;
+    if (a.chats_hwnd) |list| {
+        const current_top = win.SendMessageW(list, win.LB_GETTOPINDEX, 0, 0);
+        if (current_top >= 0 and @as(usize, @intCast(current_top)) < a.chat_count) {
+            const top_chat = &a.chats[@intCast(current_top)];
+            if (top_chat.jid.len <= anchor_jid.len) {
+                top_index = @intCast(current_top);
+                anchor_len = top_chat.jid.len;
+                @memcpy(anchor_jid[0..anchor_len], top_chat.jid.slice());
+            }
+        }
+    }
+
     var parsed = runWacli(a, args[0..count]) catch {
         setStatus(a, "Unable to read chats from wacli");
         return;
@@ -761,7 +778,13 @@ fn refreshChats(a: *App) void {
     var i: usize = 1;
     while (i < a.chat_count) : (i += 1) {
         var j = i;
-        while (j > 0 and std.mem.order(u8, a.chats[j - 1].timestamp.slice(), a.chats[j].timestamp.slice()) == .lt) : (j -= 1) {
+        while (j > 0) : (j -= 1) {
+            // Ties in the timestamp fall back to the jid so the order is fully
+            // deterministic no matter what order wacli returned this time.
+            const by_time = std.mem.order(u8, a.chats[j - 1].timestamp.slice(), a.chats[j].timestamp.slice());
+            const should_move = by_time == .lt or
+                (by_time == .eq and std.mem.order(u8, a.chats[j - 1].jid.slice(), a.chats[j].jid.slice()) == .gt);
+            if (!should_move) break;
             const temporary = a.chats[j - 1];
             a.chats[j - 1] = a.chats[j];
             a.chats[j] = temporary;
@@ -794,7 +817,22 @@ fn refreshChats(a: *App) void {
         for (a.chats[0..a.chat_count]) |*chat| {
             _ = win.SendMessageW(list, win.LB_ADDSTRING, 0, @bitCast(@intFromPtr(chat.name.ptr())));
         }
-        if (a.chat_count > 0) _ = win.SendMessageW(list, win.LB_SETCURSEL, a.selected_chat, 0);
+        if (a.chat_count > 0) {
+            var restore_top = top_index;
+            for (a.chats[0..a.chat_count], 0..) |*chat, index| {
+                if (anchor_len > 0 and std.mem.eql(u8, anchor_jid[0..anchor_len], chat.jid.slice())) {
+                    restore_top = @intCast(index);
+                    break;
+                }
+            }
+            if (restore_top >= 0) {
+                const clamped = @min(restore_top, @as(i32, @intCast(a.chat_count)) - 1);
+                // Selection first: LB_SETCURSEL scrolls to the selection, and
+                // the top-index restore below must have the final say.
+                _ = win.SendMessageW(list, win.LB_SETCURSEL, a.selected_chat, 0);
+                _ = win.SendMessageW(list, win.LB_SETTOPINDEX, @intCast(clamped), 0);
+            } else _ = win.SendMessageW(list, win.LB_SETCURSEL, a.selected_chat, 0);
+        }
         _ = win.SendMessageW(list, win.WM_SETREDRAW, 1, 0);
         _ = win.InvalidateRect(list, null, win.TRUE);
     }
