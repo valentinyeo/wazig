@@ -51,18 +51,20 @@ pub const Stretch = struct {
     /// True when `in` (in_frames starting at absolute frame in_base) holds a
     /// full window at the current position.
     pub fn canEmit(self: *const Stretch, in_base: u64, in_frames: u64) bool {
-        return self.relFrames(in_base) + lookahead_frames <= in_frames;
+        // Saturating: a reset behind the accumulator base must not wrap.
+        return self.relFrames(in_base) +| lookahead_frames <= in_frames;
     }
 
-    /// Writes the next `hop_frames`-frame block into `out` and returns how
-    /// many source frames were consumed by the search offset, so the caller
-    /// can advance its own position. Requires at least `lookahead_frames`
-    /// input frames beyond `pos`.
+    /// Writes the next `hop_frames`-frame block into `out`. Requires at
+    /// least `lookahead_frames` input frames beyond `pos` (checked with
+    /// `canEmit`).
     pub fn emitWindow(self: *Stretch, in: []const f32, in_base: u64, in_frames: u64, out: []f32) void {
         const ch = self.channels;
         std.debug.assert(in_frames >= self.relFrames(in_base) + lookahead_frames);
         std.debug.assert(out.len >= hop_frames * ch);
-        const rel_pos: usize = @intCast(self.relFrames(in_base));
+        // Clamp keeps reads in-bounds in release builds if the caller's
+        // position bookkeeping is ever wrong (the assert is compiled out).
+        const rel_pos: usize = @intCast(@min(self.relFrames(in_base), in_frames - lookahead_frames));
 
         var best_off: usize = 0;
         if (self.has_tail) {
@@ -122,7 +124,8 @@ pub const Stretch = struct {
     }
 
     fn relFrames(self: *const Stretch, in_base: u64) u64 {
-        return self.pos_scaled / 100 - in_base;
+        // Saturating: a reset behind the accumulator base must not wrap.
+        return self.pos_scaled / 100 -| in_base;
     }
 };
 
@@ -171,7 +174,7 @@ test "stretch 200 consumes about half of the input" {
     const out = try std.testing.allocator.alloc(f32, hop_frames);
     defer std.testing.allocator.free(out);
     var blocks: usize = 0;
-    while (st.sourceFramesConsumed() + lookahead_frames <= frames) : (blocks += 1) {
+    while (st.canEmit(0, frames)) : (blocks += 1) {
         st.emitWindow(in, 0, frames, out);
     }
     // 48000 source frames at 2x -> ~24000 output frames -> ~33 blocks.
