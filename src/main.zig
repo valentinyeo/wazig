@@ -1897,9 +1897,11 @@ var player_class_registered: bool = false;
 
 fn closePlayer(a: *App) void {
     if (a.mf_player) |player| {
+        // Drop the field first: Shutdown pumps messages on the STA, and a
+        // re-entrant paint or resize must not see a released player.
+        a.mf_player = null;
         _ = player.lpVtbl.*.Shutdown.?(player);
         _ = player.lpVtbl.*.Release.?(player);
-        a.mf_player = null;
     }
     if (a.player_window) |hwnd| {
         a.player_window = null;
@@ -1957,17 +1959,19 @@ fn playVideoInline(a: *App, message: *const Message) void {
     const height = rect.bottom - rect.top;
 
     if (!player_class_registered) {
+        const class_brush = win.CreateSolidBrush(color_bg);
         var class = win.WNDCLASSEXW{
             .cbSize = @sizeOf(win.WNDCLASSEXW),
             .style = win.CS_HREDRAW | win.CS_VREDRAW,
             .lpfnWndProc = playerProc,
             .hInstance = a.instance,
             .hCursor = win.LoadCursorW(null, @ptrFromInt(32512)),
-            .hbrBackground = win.CreateSolidBrush(color_bg),
+            .hbrBackground = class_brush,
             .lpszClassName = lit("MessagesVideoPlayer"),
             .hIconSm = null,
         };
         if (win.RegisterClassExW(&class) == 0) {
+            if (class_brush) |brush| _ = win.DeleteObject(brush);
             setStatus(a, "Could not open the video player");
             return;
         }
@@ -3831,21 +3835,26 @@ fn drawCanvas(hwnd: win.HWND, a: *App) void {
             }
             message.media_hit = .{ .left = image_left, .top = image_top, .right = image_left + message.bitmap_width, .bottom = image_top + message.bitmap_height };
             if (std.ascii.eqlIgnoreCase(message.media_type.slice(), "video")) {
-                const center_x = image_left + @divTrunc(message.bitmap_width, 2);
-                const center_y = image_top + @divTrunc(message.bitmap_height, 2);
-                const button_brush = win.CreateSolidBrush(color_bg) orelse null;
-                const button_pen = win.CreatePen(win.PS_SOLID, 2, color_accent);
-                const old_pen2 = win.SelectObject(hdc, button_pen);
-                const old_brush2 = win.SelectObject(hdc, if (button_brush) |bb| @ptrCast(bb) else win.GetStockObject(win.BLACK_BRUSH));
-                _ = win.Ellipse(hdc, center_x - 26, center_y - 26, center_x + 26, center_y + 26);
-                _ = win.SelectObject(hdc, old_brush2);
-                _ = win.SelectObject(hdc, old_pen2);
-                if (button_pen) |pen| _ = win.DeleteObject(pen);
-                if (button_brush) |dead_brush| _ = win.DeleteObject(dead_brush);
-                _ = win.SelectObject(hdc, @ptrCast(a.font_bold.?));
-                _ = win.SetTextColor(hdc, color_text);
-                var play_rect = win.RECT{ .left = center_x - 26, .top = center_y - 26, .right = center_x + 26, .bottom = center_y + 26 };
-                _ = win.DrawTextW(hdc, lit("▶"), -1, &play_rect, win.DT_CENTER | win.DT_SINGLELINE | win.DT_VCENTER);
+                // Keep the play button inside the thumbnail; tiny thumbnails
+                // shrink it, and a zero-size bitmap draws nothing.
+                const radius = @min(26, @min(@divTrunc(message.bitmap_width, 2), @divTrunc(message.bitmap_height, 2)));
+                if (radius > 4) {
+                    const center_x = image_left + @divTrunc(message.bitmap_width, 2);
+                    const center_y = image_top + @divTrunc(message.bitmap_height, 2);
+                    const button_brush = win.CreateSolidBrush(color_bg) orelse null;
+                    const button_pen = win.CreatePen(win.PS_SOLID, 2, color_accent);
+                    const old_pen2 = win.SelectObject(hdc, button_pen);
+                    const old_brush2 = win.SelectObject(hdc, if (button_brush) |bb| @ptrCast(bb) else win.GetStockObject(win.BLACK_BRUSH));
+                    _ = win.Ellipse(hdc, center_x - radius, center_y - radius, center_x + radius, center_y + radius);
+                    _ = win.SelectObject(hdc, old_brush2);
+                    _ = win.SelectObject(hdc, old_pen2);
+                    if (button_pen) |pen| _ = win.DeleteObject(pen);
+                    if (button_brush) |dead_brush| _ = win.DeleteObject(dead_brush);
+                    _ = win.SelectObject(hdc, @ptrCast(a.font_bold.?));
+                    _ = win.SetTextColor(hdc, color_text);
+                    var play_rect = win.RECT{ .left = center_x - radius, .top = center_y - radius, .right = center_x + radius, .bottom = center_y + radius };
+                    _ = win.DrawTextW(hdc, lit("▶"), -1, &play_rect, win.DT_CENTER | win.DT_SINGLELINE | win.DT_VCENTER);
+                }
             }
             text_top += message.bitmap_height + 8;
         } else if (isAudio(message)) {
