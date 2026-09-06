@@ -1551,7 +1551,7 @@ fn playerCallbackAddRef(_: [*c]win.IMFPMediaPlayerCallback) callconv(.c) win.ULO
 }
 
 fn playerCallbackRelease(_: [*c]win.IMFPMediaPlayerCallback) callconv(.c) win.ULONG {
-    return @atomicRmw(u32, &player_callback_refs, .Sub, 1, .monotonic);
+    return @atomicRmw(u32, &player_callback_refs, .Sub, 1, .monotonic) - 1;
 }
 
 fn playerCallbackEvent(_: [*c]win.IMFPMediaPlayerCallback, event: [*c]win.MFP_EVENT_HEADER) callconv(.c) void {
