@@ -5,6 +5,7 @@ const avatar_mask = @import("avatar_mask.zig");
 const dictation = @import("dictation.zig");
 const played = @import("played.zig");
 const compose_layout = @import("compose_layout.zig");
+const media_age = @import("media_age.zig");
 const webp_detect = @import("webp.zig");
 const scrollbar = @import("scrollbar.zig");
 
@@ -252,6 +253,7 @@ const Message = struct {
     sender: WideText(159) = .{},
     text: WideText(4095) = .{},
     time: WideText(15) = .{},
+    timestamp: Utf8Text(47) = .{},
     media_type: Utf8Text(31) = .{},
     mime_type: Utf8Text(95) = .{},
     local_path: WideText(519) = .{},
@@ -313,6 +315,44 @@ const MsgCacheEntry = struct {
     jid: Utf8Text(191) = .{},
     data: ?[]u8 = null,
 };
+
+// One attachment download is a background wacli child; up to three run in
+// parallel and independently of the mark-read child. Every job serializes
+// on the store through wacli's --lock-wait instead of gating on each other.
+const max_media_children = 3;
+const media_timeout_ms: u64 = 90_000;
+// Attachments older than this are not fetched; the store keeps their files
+// once downloaded, and the 14-day eviction window matches the product rule.
+const media_cache_days: i64 = 14;
+const MediaDownload = struct {
+    child: ?std.process.Child = null,
+    jid: Utf8Text(191) = .{},
+    id: Utf8Text(191) = .{},
+    started_ms: u64 = 0,
+};
+
+// Bounded retries: a download may fail transiently (store lock lost to a
+// parallel job, network blip) up to 2 times; after the 3rd failure it is
+// marked terminal for the session and retried on the next app start.
+const MediaFailure = struct { hash: u64 = 0, count: u8 = 0 };
+const max_media_retries = 3;
+
+fn mediaBusy(a: *const App) bool {
+    for (&a.media_downloads) |*slot| if (slot.child != null) return true;
+    return false;
+}
+
+fn mediaDownloading(a: *const App, id: []const u8) bool {
+    for (&a.media_downloads) |*slot| {
+        if (slot.child != null and std.mem.eql(u8, slot.id.slice(), id)) return true;
+    }
+    return false;
+}
+
+fn freeMediaSlot(a: *App) ?*MediaDownload {
+    for (&a.media_downloads) |*slot| if (slot.child == null) return slot;
+    return null;
+}
 
 const App = struct {
     allocator: std.mem.Allocator,
@@ -402,7 +442,7 @@ const App = struct {
     audio_auto_advance: bool = false,
     audio_chain_waiting: bool = false,
     audio_chain_id: Utf8Text(191) = .{},
-    media_child: ?std.process.Child = null,
+    media_downloads: [max_media_children]MediaDownload = [_]MediaDownload{.{}} ** max_media_children,
     read_child: ?std.process.Child = null,
     read_spawn_failures: u32 = 0,
     read_started_ms: u64 = 0,
@@ -415,6 +455,11 @@ const App = struct {
     pending_send_count: usize = 0,
     media_attempts: [512]u64 = [_]u64{0} ** 512,
     media_attempt_count: usize = 0,
+    // After any failed download, auto-scanning pauses for 30s so a
+    // permanently broken attachment cannot burn a tick (and starve the
+    // messages behind it) on every timer expiry.
+    media_retry_after_ms: u64 = 0,
+    media_failures: [16]MediaFailure = [_]MediaFailure{.{}} ** 16,
     avatar_session: ?*avatar.Session = null,
     transcribe_session: ?*dictation.FileSession = null,
     sel_message: ?usize = null,
@@ -1455,7 +1500,8 @@ fn removeFirstPendingRead(a: *App) void {
 // store lock took. Run it as a background job like sends and archives.
 fn startNextMarkRead(a: *App) void {
     if (a.read_child != null or a.pending_read_count == 0) return;
-    if (a.media_child != null or a.send_child != null or a.pending_send_count > 0 or
+    // Downloads run in parallel: both writes just wait on the store lock.
+    if (a.send_child != null or a.pending_send_count > 0 or
         a.archive_child != null or a.pending_archive_count > 0 or avatarBusy(a)) return;
     stopSync(a);
     const child = std.process.spawn(a.io, .{
@@ -1518,12 +1564,11 @@ fn checkMarkRead(a: *App) void {
     } else startNextMarkRead(a);
 }
 
-// A manual download clicked while a mark-read job held the store waits here;
-// start it once no read job or download is running and its message is on
-// screen (the request is dropped if the user switched chats meanwhile).
+// A manual download click that could not start waits here; retry it once a
+// download slot is free and its message is on screen (the request is dropped
+// if the user switched chats meanwhile).
 fn retryPendingDownload(a: *App) void {
-    if (a.pending_download_id.len == 0 or a.read_child != null or a.pending_read_count > 0 or
-        a.media_child != null) return;
+    if (a.pending_download_id.len == 0 or freeMediaSlot(a) == null) return;
     if (a.selected_chat >= a.chat_count) return;
     if (!std.mem.eql(u8, a.pending_download_jid.slice(), a.chats[a.selected_chat].jid.slice())) {
         a.pending_download_jid.set("");
@@ -1680,11 +1725,11 @@ fn advanceAudio(a: *App, after_id: []const u8) bool {
         if (message.local_path.len > 0) {
             startAudioPlayback(a, message);
             return true;
-        } else if (a.media_child == null and a.read_child == null and a.pending_read_count == 0) {
+        } else if (freeMediaSlot(a) != null or mediaDownloading(a, message.id.slice())) {
             downloadMedia(a, index, true);
             // Arm only if the download actually started; a failed spawn just
             // ends the chain instead of leaking a stale trigger.
-            if (a.media_child != null) {
+            if (mediaDownloading(a, message.id.slice())) {
                 a.audio_chain_waiting = true;
                 a.audio_chain_id.set(message.id.slice());
             }
@@ -2127,27 +2172,24 @@ fn fillDibFromSource(a: *App, message: *Message, source: *win.IWICBitmapSource, 
     message.bitmap_height = @intCast(target_height);
 }
 
-fn downloadMedia(a: *App, message_index: usize, automatic: bool) void {
-    if (message_index >= a.message_count or a.selected_chat >= a.chat_count) return;
-    const message = &a.messages[message_index];
-    if (message.media_type.len == 0 or message.id.len == 0) return;
-    if (a.media_child != null or a.read_child != null or a.pending_read_count > 0) {
-        // Reads have no queue a click can join, so remember one request
-        // and start it once the mark-read job finishes. The slot holds a
-        // single request: an automatic caller never replaces a queued user
-        // click, it just retries on its next timer tick.
-        if (!automatic or a.pending_download_id.len == 0) {
-            a.pending_download_jid.set(a.chats[a.selected_chat].jid.slice());
-            a.pending_download_id.set(message.id.slice());
-        }
-        if (!automatic) setStatus(a, "Attachment download queued");
-        return;
-    }
-    setStatus(a, if (automatic) "Downloading media..." else "Downloading attachment...");
-    if (a.hwnd) |hwnd| _ = win.UpdateWindow(hwnd);
+// Current wall-clock unix seconds via FILETIME: std.time lost its
+// timestamp helpers in Zig 0.16 and the app is Windows-only anyway.
+fn nowUnixSeconds() i64 {
+    var ft: win.FILETIME = undefined;
+    win.GetSystemTimeAsFileTime(&ft);
+    const q: i64 = (@as(i64, ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
+    return @divTrunc(q - 116444736000000000, 10_000_000);
+}
+
+fn startMediaDownload(a: *App, chat_jid: []const u8, message_id: []const u8) bool {
+    // Never two children for one attachment: every caller (auto scan, audio
+    // chain, manual click) funnels through here.
+    if (mediaDownloading(a, message_id)) return false;
+    const slot = freeMediaSlot(a) orelse return false;
+    slot.jid.set(chat_jid);
+    slot.id.set(message_id);
     stopSync(a);
-    const chat = &a.chats[a.selected_chat];
-    const args = [_][]const u8{ a.wacli_path, "--json", "--lock-wait", "10s", "--timeout", "60s", "media", "download", "--chat", chat.jid.slice(), "--id", message.id.slice() };
+    const args = [_][]const u8{ a.wacli_path, "--json", "--lock-wait", "10s", "--timeout", "60s", "media", "download", "--chat", slot.jid.slice(), "--id", slot.id.slice() };
     const child = std.process.spawn(a.io, .{
         .argv = &args,
         .stdin = .ignore,
@@ -2155,20 +2197,113 @@ fn downloadMedia(a: *App, message_index: usize, automatic: bool) void {
         .stderr = .ignore,
         .create_no_window = true,
     }) catch {
+        slot.jid.set("");
+        slot.id.set("");
+        // Count a spawn failure like a download failure (bounded retries,
+        // cooldown) instead of instantly blacklisting: a manual click must
+        // not be lost to one transient spawn error.
+        noteMediaFailure(a, message_id);
         setStatus(a, "Could not start attachment download");
-        startSync(a);
-        return;
+        if (!mediaBusy(a)) startSync(a);
+        return false;
     };
-    a.media_child = child;
+    slot.child = child;
+    slot.started_ms = win.GetTickCount64();
+    return true;
 }
 
-fn mediaWasAttempted(a: *App, id: []const u8) bool {
+fn downloadMedia(a: *App, message_index: usize, automatic: bool) void {
+    if (message_index >= a.message_count or a.selected_chat >= a.chat_count) return;
+    const message = &a.messages[message_index];
+    if (message.media_type.len == 0 or message.id.len == 0) return;
+    // Already on disk (e.g. a parallel download finished since the request):
+    // a retry must not re-download.
+    if (message.local_path.len > 0) return;
+    const chat = &a.chats[a.selected_chat];
+    // Already downloading in another slot: nothing to queue.
+    if (mediaDownloading(a, message.id.slice())) return;
+    if (freeMediaSlot(a) == null) {
+        // Slots full: remember one manual click and retry it when a slot
+        // frees up; automatic requests just wait for their next timer tick.
+        if (!automatic) {
+            a.pending_download_jid.set(chat.jid.slice());
+            a.pending_download_id.set(message.id.slice());
+            setStatus(a, "Attachment download queued");
+        }
+        return;
+    }
+    // The only failure left here is a spawn failure, which sets its own
+    // status and must not register a pending retry.
+    if (!startMediaDownload(a, chat.jid.slice(), message.id.slice())) return;
+    setStatus(a, if (automatic) "Downloading media..." else "Downloading attachment...");
+    if (a.hwnd) |hwnd| _ = win.UpdateWindow(hwnd);
+}
+
+// Pure membership check: the attempt ring records downloads that finished
+// (successfully or not) or could not even spawn, so a message is tried once
+// per session and retried on the next app start.
+fn mediaAttempted(a: *const App, id: []const u8) bool {
     const hash = std.hash.Wyhash.hash(0, id);
     for (a.media_attempts[0..a.media_attempt_count]) |attempt| if (attempt == hash) return true;
+    return false;
+}
+
+fn markMediaAttempted(a: *App, id: []const u8) void {
+    const hash = std.hash.Wyhash.hash(0, id);
     if (a.media_attempt_count >= a.media_attempts.len) a.media_attempt_count = 0;
     a.media_attempts[a.media_attempt_count] = hash;
     a.media_attempt_count += 1;
-    return false;
+}
+
+// A success erases past failures so the bounded-retry table cannot fill
+// with attachments that recovered on their own.
+fn clearMediaFailure(a: *App, id: []const u8) void {
+    const hash = std.hash.Wyhash.hash(0, id);
+    for (&a.media_failures) |*entry| {
+        if (entry.hash == hash) {
+            entry.hash = 0;
+            entry.count = 0;
+            return;
+        }
+    }
+}
+
+fn noteMediaFailure(a: *App, id: []const u8) void {
+    const hash = std.hash.Wyhash.hash(0, id);
+    var count: u8 = 0;
+    var matched: ?*MediaFailure = null;
+    for (&a.media_failures) |*entry| {
+        if (entry.hash == hash) {
+            matched = entry;
+            count = entry.count;
+            break;
+        }
+    }
+    count += 1;
+    a.media_retry_after_ms = win.GetTickCount64() + 30_000;
+    if (count >= max_media_retries) {
+        // Reclaim the table slot so 16 old failures cannot lock out new ones.
+        if (matched) |entry| {
+            entry.hash = 0;
+            entry.count = 0;
+        }
+        markMediaAttempted(a, id);
+        return;
+    }
+    if (matched) |entry| {
+        entry.count = count;
+        return;
+    }
+    for (&a.media_failures) |*entry| {
+        if (entry.hash == 0 and entry.count == 0) {
+            entry.hash = hash;
+            entry.count = count;
+            return;
+        }
+    }
+    // ponytail: 16 attachments failing concurrently is implausible; if it
+    // happens, degrade to terminal marking rather than growing state.
+    markMediaAttempted(a, id);
 }
 
 fn isDownloadableMedia(message: *const Message) bool {
@@ -2177,14 +2312,22 @@ fn isDownloadableMedia(message: *const Message) bool {
 }
 
 fn autoDownloadNextMedia(a: *App) void {
-    // A mark-read job holds the store on every chat open: downloadMedia would
-    // return without starting, so do not scan now — mediaWasAttempted would
-    // blacklist every media message without ever downloading it.
-    if (a.media_child != null or a.read_child != null or a.pending_read_count > 0 or
-        a.archive_child != null or a.pending_archive_count > 0) return;
-    for (a.messages[0..a.message_count], 0..) |*message, index| {
-        if (!isDownloadableMedia(message) or message.local_path.len > 0 or message.id.len == 0) continue;
-        if (mediaWasAttempted(a, message.id.slice())) continue;
+    // Slots full: the next finished download re-enters here from the timer.
+    if (freeMediaSlot(a) == null) return;
+    // Failure cooldown: give transient store-lock or network failures time
+    // to clear before trying again.
+    if (win.GetTickCount64() < a.media_retry_after_ms) return;
+    // Newest first: the media the user is looking at arrives first.
+    var index = a.message_count;
+    while (index > 0) {
+        index -= 1;
+        const message = &a.messages[index];
+        if (!isDownloadableMedia(message) or message.local_path.len > 0 or message.id.len == 0 or
+            mediaDownloading(a, message.id.slice())) continue;
+        // Skip attachments older than the cache cutoff; the store's
+        // LocalPath (kept across restarts) already holds anything fetched.
+        if (!media_age.withinDays(message.timestamp.slice(), nowUnixSeconds(), media_cache_days)) continue;
+        if (mediaAttempted(a, message.id.slice())) continue;
         downloadMedia(a, index, true);
         return;
     }
@@ -2240,7 +2383,7 @@ fn requestNextAvatar(a: *App) void {
 }
 
 fn requestAvatar(a: *App, chat_index: usize) void {
-    if (a.read_child != null or a.pending_read_count > 0 or a.media_child != null or a.send_child != null or a.archive_child != null or a.pending_archive_count > 0 or avatarBusy(a)) return;
+    if (a.read_child != null or a.pending_read_count > 0 or mediaBusy(a) or a.send_child != null or a.archive_child != null or a.pending_archive_count > 0 or avatarBusy(a)) return;
     if (a.chat_count == 0 or chat_index >= a.chat_count) return;
     const entry = avatarForChat(a, a.chats[chat_index].jid.slice()) orelse return;
     if (entry.status != .unknown or entry.path.len == 0) return;
@@ -2541,28 +2684,68 @@ fn speedLabel(player: ?*audio.Player) [*:0]const u16 {
 }
 
 fn checkMediaDownload(a: *App) void {
-    if (a.media_child) |*child| {
-        const handle = child.id orelse return;
-        var code: win.DWORD = 0;
-        if (win.GetExitCodeProcess(handle, &code) == 0 or code == win.STILL_ACTIVE) return;
-        _ = child.wait(a.io) catch {};
-        a.media_child = null;
+    var finished_ok: usize = 0;
+    var finished_failed: usize = 0;
+    var chain_slot_done = false;
+    for (&a.media_downloads) |*slot| {
+        if (slot.child) |*child| {
+            const timed_out = win.GetTickCount64() - slot.started_ms > media_timeout_ms;
+            var code: win.DWORD = 0;
+            var got_code = false;
+            if (child.id) |handle| got_code = win.GetExitCodeProcess(handle, &code) != 0;
+            if (got_code and code == win.STILL_ACTIVE and !timed_out) continue;
+            // The timeout covers every stuck case, including a missing or
+            // dead handle where the exit code can no longer be read; a slot
+            // in that state is reaped instead of wedging forever. A child
+            // that already exited keeps its real exit code even if it ran
+            // past the timeout, so a finished download is not called failed.
+            if (timed_out or !got_code) _ = child.kill(a.io);
+            if (!got_code) code = 1;
+            _ = child.wait(a.io) catch {};
+            if (code == 0) {
+                markMediaAttempted(a, slot.id.slice());
+                clearMediaFailure(a, slot.id.slice());
+            } else {
+                noteMediaFailure(a, slot.id.slice());
+            }
+            // The chained note's own slot decides the chain's fate; an
+            // unrelated slot finishing must leave the chain armed.
+            if (std.mem.eql(u8, slot.id.slice(), a.audio_chain_id.slice())) chain_slot_done = true;
+            slot.child = null;
+            slot.jid.set("");
+            slot.id.set("");
+            if (code == 0) finished_ok += 1 else finished_failed += 1;
+        }
+    }
+    // One refresh per tick. refreshMessages goes through the async wacli
+    // worker (never the UI thread); its --read-only query may wait on the
+    // store lock behind live downloads, which is fine for a worker call.
+    if (finished_ok + finished_failed > 0) {
         startSync(a);
         refreshMessages(a);
-        if (a.audio_chain_waiting) {
+        if (a.audio_chain_waiting and chain_slot_done) {
             a.audio_chain_waiting = false;
-            if (code == 0) {
-                for (a.messages[0..a.message_count]) |*message| {
-                    if (std.mem.eql(u8, message.id.slice(), a.audio_chain_id.slice())) {
-                        if (message.local_path.len > 0) startAudioPlayback(a, message);
-                        break;
+            var chain_started = false;
+            for (a.messages[0..a.message_count]) |*message| {
+                if (std.mem.eql(u8, message.id.slice(), a.audio_chain_id.slice())) {
+                    if (message.local_path.len > 0) {
+                        startAudioPlayback(a, message);
+                        chain_started = true;
                     }
+                    break;
                 }
-            } else if (a.audio_state != .empty) {
-                a.audio_auto_advance = false;
             }
+            // The chained note did not come down (no file after the
+            // refresh): end the autoplay chain like any other failure.
+            if (!chain_started and a.audio_state != .empty) a.audio_auto_advance = false;
         }
-        setStatus(a, if (code == 0) "Attachment downloaded" else "Download failed, the attachment may have expired");
+        // With mixed results, lead with the success; a lone failure is the
+        // only case where the failure message is the whole story.
+        if (finished_ok > 0) {
+            setStatus(a, "Attachment downloaded");
+        } else {
+            setStatus(a, "Download failed, the attachment may have expired");
+        }
     }
 }
 
@@ -2850,6 +3033,7 @@ fn applyMessageData(a: *App, raw: []const u8, final: bool) void {
         message.filename.set(a.allocator, getString(object, "Filename"));
         message.reaction_to.set(getString(object, "ReactionToID"));
         message.reaction.set(a.allocator, getString(object, "ReactionEmoji"));
+        message.timestamp.set(getString(object, "Timestamp"));
         formatTime(&message.time, a.allocator, getString(object, "Timestamp"));
         a.messages[a.message_count] = message;
         a.message_count += 1;
@@ -2898,7 +3082,7 @@ fn startSync(a: *App) void {
     // serialize on the store lock, so don't fight them. checkSync restarts
     // sync once the last job finishes.
     if (a.sync_child != null or a.read_child != null or a.pending_read_count > 0 or
-        a.media_child != null or a.send_child != null or a.pending_send_count > 0 or
+        mediaBusy(a) or a.send_child != null or a.pending_send_count > 0 or
         a.archive_child != null or a.pending_archive_count > 0 or avatarBusy(a) or
         wacliPendingGet(a, .reaction) > 0) return;
     const child = std.process.spawn(a.io, .{
@@ -2932,7 +3116,7 @@ fn stopSync(a: *App) void {
 }
 
 fn checkSync(a: *App) void {
-    if (a.media_child != null or a.read_child != null or a.send_child != null or a.pending_send_count > 0 or a.archive_child != null or a.pending_archive_count > 0 or avatarBusy(a)) return;
+    if (mediaBusy(a) or a.read_child != null or a.send_child != null or a.pending_send_count > 0 or a.archive_child != null or a.pending_archive_count > 0 or avatarBusy(a)) return;
     if (a.sync_child) |*child| {
         if (child.id) |handle| {
             var code: win.DWORD = 0;
@@ -3439,7 +3623,7 @@ fn reactToSelected(a: *App, command: u16) void {
 }
 
 fn applyReaction(a: *App, result: *WacliResult) void {
-    defer if (a.media_child == null) startSync(a);
+    defer if (!mediaBusy(a)) startSync(a);
     if (!result.ok) {
         setStatus(a, "Reaction failed");
         return;
@@ -3536,7 +3720,7 @@ fn removeFirstPendingArchive(a: *App) void {
 
 fn startNextArchive(a: *App) void {
     if (a.archive_child != null or a.read_child != null or a.pending_archive_count == 0) return;
-    if (a.media_child != null or a.send_child != null or a.pending_send_count > 0 or avatarBusy(a)) return;
+    if (mediaBusy(a) or a.send_child != null or a.pending_send_count > 0 or avatarBusy(a)) return;
     stopSync(a);
     const pending = &a.pending_archives[0];
     const child = std.process.spawn(a.io, .{
@@ -5458,22 +5642,27 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
                 checkMarkRead(a);
                 checkAvatarDownload(a);
                 checkArchive(a);
-                if (a.media_child == null) {
-                    checkSync(a);
-                    a.group_refresh_ticks += 1;
-                    if (a.group_refresh_ticks >= 60) {
-                        refreshGroups(a);
-                        a.group_refresh_ticks = 0;
-                    }
-                    const changed = storeChanged(a);
-                    if (changed and !a.chat_selection_pending) {
-                        refreshChats(a);
-                        if (!messagesAreCurrent(a)) refreshMessages(a);
-                    }
-                    retryPendingDownload(a);
-                    autoDownloadNextMedia(a);
-                    requestAvatar(a, a.selected_chat);
+                // Reads now run on the async wacli worker, so they keep
+                // flowing while downloads hold the store lock; downloads
+                // themselves no longer gate on mark-read or vice versa,
+                // both queue on the store lock.
+                checkSync(a);
+                a.group_refresh_ticks += 1;
+                if (a.group_refresh_ticks >= 60) {
+                    refreshGroups(a);
+                    a.group_refresh_ticks = 0;
                 }
+                const changed = storeChanged(a);
+                if (changed and !a.chat_selection_pending) {
+                    refreshChats(a);
+                    if (!messagesAreCurrent(a)) refreshMessages(a);
+                }
+                // A queued manual click goes first: the auto scan skips
+                // attachments older than the cutoff, so without this it
+                // could never start.
+                retryPendingDownload(a);
+                autoDownloadNextMedia(a);
+                requestAvatar(a, a.selected_chat);
             } else if (wparam == timer_search) {
                 _ = win.KillTimer(hwnd, timer_search);
                 refreshChats(a);
@@ -5525,8 +5714,10 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
             _ = win.KillTimer(hwnd, timer_search);
             _ = win.KillTimer(hwnd, timer_animation);
             _ = win.KillTimer(hwnd, timer_chat_select);
-            if (a.media_child) |*child| child.kill(a.io);
-            a.media_child = null;
+            for (&a.media_downloads) |*slot| {
+                if (slot.child) |*child| child.kill(a.io);
+                slot.child = null;
+            }
             if (a.send_child) |*child| child.kill(a.io);
             a.send_child = null;
             if (a.archive_child) |*child| child.kill(a.io);
