@@ -256,11 +256,16 @@ const PaletteItem = struct {
     shortcut: WideText(15) = .{},
     command: u16 = 0,
     url: WideText(519) = .{},
+    // Chat entries are resolved by their stable id at activation time; the
+    // chat list can reorder (new message, pin) while the palette is open.
+    chat_jid: Utf8Text(191) = .{},
 };
 
 // buildPaletteItems registers more items than the original cap allowed, so
 // entries near the end were silently dropped.
-const max_palette_items = 48;
+// 64 command slots plus one per chat, so palette search can always reach
+// every chat in the list (older chats are the ones name search matters for).
+const max_palette_items = 64 + max_chats;
 const palette_width: i32 = 540;
 const palette_row_height: i32 = 40;
 const palette_edit_zone: i32 = 64;
@@ -4697,6 +4702,27 @@ fn appendPalette(a: *App, label: []const u8, shortcut: []const u8, command: u16)
     item.label.set(a.allocator, label);
     item.shortcut.set(a.allocator, shortcut);
     item.command = command;
+    // Link and chat items keep extra state across palette rebuilds; stale
+    // values from an earlier mode would hijack activation.
+    item.url = .{};
+    item.chat_jid = .{};
+}
+
+// Chat entries reuse the command palette list: the label is the chat name as
+// shown in the chat list, and a.chats is already ordered most recent first.
+fn appendPaletteChat(a: *App, index: usize) void {
+    if (a.palette_item_count >= max_palette_items) return;
+    const chat = &a.chats[index];
+    if (chat.name.len == 0) return;
+    const item = &a.palette_items[a.palette_item_count];
+    a.palette_item_count += 1;
+    item.label.len = @min(chat.name.len, item.label.buf.len - 1);
+    @memcpy(item.label.buf[0..item.label.len], chat.name.buf[0..item.label.len]);
+    item.label.buf[item.label.len] = 0;
+    item.shortcut.set(a.allocator, "");
+    item.command = 0;
+    item.url = .{};
+    item.chat_jid.set(chat.jid.slice());
 }
 
 fn buildPaletteItems(a: *App) void {
@@ -4749,6 +4775,7 @@ fn buildPaletteItems(a: *App) void {
     }
     appendPalette(a, "Open video in external player", "", command_open_video_external);
     appendPalette(a, "Quit Messages", "Q", command_quit);
+    for (0..a.chat_count) |index| appendPaletteChat(a, index);
 }
 
 fn lowerUnit(unit: u16) u16 {
@@ -4856,6 +4883,27 @@ fn paletteActivate(a: *App) void {
     }
     if (a.palette_selected >= a.palette_match_count) return;
     const item = &a.palette_items[a.palette_matches[a.palette_selected]];
+    if (item.chat_jid.len > 0) {
+        closePalette(a);
+        var chat_index: ?usize = null;
+        for (a.chats[0..a.chat_count], 0..) |*chat, index| {
+            if (std.mem.eql(u8, chat.jid.slice(), item.chat_jid.slice())) {
+                chat_index = index;
+                break;
+            }
+        }
+        // Gone from the visible list (refresh, archive) means nothing to open.
+        const selected = chat_index orelse return;
+        // Same flow as clicking the chat in the list: open it and land in
+        // the composer with the caret at the end.
+        discardStagedImage(a);
+        a.selected_chat = @intCast(selected);
+        a.user_viewed = true;
+        refreshMessages(a);
+        focusCompose(a);
+        if (a.hwnd) |hwnd| _ = win.InvalidateRect(hwnd, null, win.TRUE);
+        return;
+    }
     if (item.url.len > 0) {
         const url_ptr = item.url.ptr();
         closePalette(a);
@@ -5096,7 +5144,9 @@ fn drawPaletteItem(a: *App, item: *win.DRAWITEMSTRUCT) void {
     }
     _ = win.SelectObject(item.hDC, @ptrCast(a.font.?));
     _ = win.SetTextColor(item.hDC, color_text);
-    var label_rect = win.RECT{ .left = item.rcItem.left + 20, .top = item.rcItem.top, .right = item.rcItem.right - 130, .bottom = item.rcItem.bottom };
+    // Chat rows have no shortcut, so their labels can use the full width.
+    const label_right = if (palette_item.shortcut.len > 0) item.rcItem.right - 130 else item.rcItem.right - 20;
+    var label_rect = win.RECT{ .left = item.rcItem.left + 20, .top = item.rcItem.top, .right = label_right, .bottom = item.rcItem.bottom };
     _ = win.DrawTextW(item.hDC, palette_item.label.ptr(), @intCast(palette_item.label.len), &label_rect, win.DT_LEFT | win.DT_SINGLELINE | win.DT_END_ELLIPSIS | win.DT_VCENTER);
     if (palette_item.shortcut.len > 0) {
         _ = win.SelectObject(item.hDC, @ptrCast(a.font_small.?));
