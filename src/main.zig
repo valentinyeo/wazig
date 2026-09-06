@@ -3242,7 +3242,14 @@ fn layout(a: *App, width: i32, height: i32) void {
     const search_height: i32 = 48;
     const status_height: i32 = 26;
     const compose_height: i32 = 66;
-    if (a.search) |hwnd| _ = win.MoveWindow(hwnd, 12, header_height + 8, left_width - 24, 34, win.TRUE);
+    if (a.search) |hwnd| {
+        _ = win.MoveWindow(hwnd, 12, header_height + 8, left_width - 24, 34, win.TRUE);
+        // Child EDIT controls can't use DWM corner rounding, so clip to a rounded region instead.
+        if (win.CreateRoundRectRgn(0, 0, left_width - 24 + 1, 34 + 1, 12, 12)) |rgn| {
+            // On success the system owns the region; only free it if the call failed.
+            if (win.SetWindowRgn(hwnd, rgn, win.TRUE) == 0) _ = win.DeleteObject(rgn);
+        }
+    }
     if (a.chats_hwnd) |hwnd| _ = win.MoveWindow(hwnd, 0, header_height + search_height, left_width, height - header_height - search_height - status_height, win.TRUE);
     if (a.status) |hwnd| _ = win.MoveWindow(hwnd, 12, height - status_height, left_width - 24, status_height, win.TRUE);
     if (a.canvas) |hwnd| _ = win.MoveWindow(hwnd, left_width + 1, header_height, width - left_width - 1, height - header_height - compose_height, win.TRUE);
