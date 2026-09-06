@@ -3402,13 +3402,14 @@ fn setStatus(a: *App, text: []const u8) void {
 fn removeFirstPendingSend(a: *App) void {
     // Paste-to-send files live in the paste folder and are deleted once the
     // queued send (or its spawn failure) finishes with them.
-    if (a.pending_sends[0].file.len > 0) deleteFileUtf8(a.pending_sends[0].file.slice());
     if (a.pending_send_count == 0) return;
+    if (a.pending_sends[0].file.len > 0) deleteFileUtf8(a.pending_sends[0].file.slice());
     var index: usize = 1;
     while (index < a.pending_send_count) : (index += 1) {
         a.pending_sends[index - 1] = a.pending_sends[index];
     }
     a.pending_send_count -= 1;
+    a.pending_sends[a.pending_send_count] = .{};
 }
 
 fn startNextSend(a: *App) void {
@@ -3499,6 +3500,10 @@ fn discardStagedImage(a: *App) void {
     const path = a.staged_image.path;
     releaseStagedImage(a);
     if (path.len > 0) deleteFileUtf8(path.slice());
+    // Reclaim the preview band everywhere the staged image can go away,
+    // not just the Esc path.
+    layout(a, a.compose_client_width, a.compose_client_height);
+    if (a.hwnd) |hwnd| _ = win.InvalidateRect(hwnd, null, win.TRUE);
 }
 
 fn releaseStagedImage(a: *App) void {
@@ -3582,7 +3587,8 @@ fn writePngFile(a: *App, path_wide: [*:0]const u16, width: u32, height: u32, pix
     if (frame.*.lpVtbl.*.Initialize.?(frame, null) < 0) return false;
     if (frame.*.lpVtbl.*.SetSize.?(frame, width, height) < 0) return false;
     var format = win.GUID_WICPixelFormat32bppBGR;
-    _ = frame.*.lpVtbl.*.SetPixelFormat.?(frame, &format);
+    if (frame.*.lpVtbl.*.SetPixelFormat.?(frame, &format) < 0 or
+        !std.mem.eql(u8, std.mem.asBytes(&format), std.mem.asBytes(&win.GUID_WICPixelFormat32bppBGR))) return false;
     if (frame.*.lpVtbl.*.WritePixels.?(frame, height, @intCast(width * 4), @intCast(pixels.len), @constCast(pixels.ptr)) < 0) return false;
     if (frame.*.lpVtbl.*.Commit.?(frame) < 0) return false;
     return encoder.*.lpVtbl.*.Commit.?(encoder) >= 0;
@@ -3622,26 +3628,76 @@ fn stageNewPath(a: *App, buffer: []u8, extension: []const u8) ?usize {
 fn stageImageFromClipboard(a: *App) bool {
     if (a.compose == null or a.wic_factory == null or a.chat_count == 0 or a.selected_chat >= a.chat_count) return false;
     if (win.IsClipboardFormatAvailable(win.CF_DIB) == 0 and win.IsClipboardFormatAvailable(win.CF_BITMAP) == 0 and win.IsClipboardFormatAvailable(win.CF_HDROP) == 0) return false;
+    // Many apps publish an image next to CF_UNICODETEXT (Excel, Word);
+    // with text on the clipboard the edit control's normal paste wins.
+    if (win.IsClipboardFormatAvailable(win.CF_UNICODETEXT) != 0 or win.IsClipboardFormatAvailable(win.CF_TEXT) != 0) return false;
     if (selectedChatIsTelegram(a)) {
         setStatus(a, "Sending pasted images is not available for Telegram chats");
         return true;
     }
     if (win.OpenClipboard(a.hwnd orelse null) == 0) return false;
-    defer _ = win.CloseClipboard();
-
+    // The clipboard is a system-wide exclusive resource: copy the payload
+    // out, close it, then do the slow file I/O and encoding.
     var path_buffer: [520]u8 = undefined;
     var path_len: usize = 0;
     var pixels: ?paste_image.Bitmap = null;
+    var source_name: ?[]u8 = null;
 
-    if (win.GetClipboardData(win.CF_HDROP)) |hdrop| {
-        // A copied file: reuse the original bytes, but only for formats
-        // wacli uploads as images.
-        var name_buffer: [520]u16 = undefined;
-        const chars = win.DragQueryFileW(@ptrCast(@alignCast(hdrop)), 0, &name_buffer, name_buffer.len);
-        const name_len = std.unicode.utf16LeToUtf8Alloc(a.allocator, name_buffer[0..chars]) catch {
+    {
+        defer _ = win.CloseClipboard();
+        if (win.GetClipboardData(win.CF_HDROP)) |hdrop| {
+            // A copied file: reuse the original bytes, but only for formats
+            // wacli uploads as images.
+            var name_buffer: [520]u16 = undefined;
+            const chars = win.DragQueryFileW(@ptrCast(@alignCast(hdrop)), 0, &name_buffer, name_buffer.len);
+            source_name = std.unicode.utf16LeToUtf8Alloc(a.allocator, name_buffer[0..chars]) catch {
+                setStatus(a, "Clipboard holds no image to paste");
+                return true;
+            };
+        } else if (win.GetClipboardData(win.CF_DIB)) |handle| {
+            pixels = clipboardDibPixels(a, handle) orelse {
+                setStatus(a, "Clipboard holds no image to paste");
+                return true;
+            };
+        } else if (win.GetClipboardData(win.CF_BITMAP)) |handle| {
+            // A bare HBITMAP without a DIB: ask GDI for top-down 32bpp rows.
+            var bitmap_header: win.BITMAP = undefined;
+            if (win.GetObjectW(handle, @sizeOf(win.BITMAP), &bitmap_header) == 0 or bitmap_header.bmWidth <= 0 or bitmap_header.bmHeight <= 0) {
+                setStatus(a, "Clipboard holds no image to paste");
+                return true;
+            }
+            const w: u32 = @intCast(bitmap_header.bmWidth);
+            const h: u32 = @intCast(bitmap_header.bmHeight);
+            var info = std.mem.zeroes(win.BITMAPINFO);
+            info.bmiHeader.biSize = @sizeOf(win.BITMAPINFOHEADER);
+            info.bmiHeader.biWidth = @intCast(w);
+            info.bmiHeader.biHeight = -@as(i32, @intCast(h));
+            info.bmiHeader.biPlanes = 1;
+            info.bmiHeader.biBitCount = 32;
+            info.bmiHeader.biCompression = win.BI_RGB;
+            const buffer = a.allocator.alloc(u8, w * h * 4) catch {
+                setStatus(a, "Could not stage the pasted image");
+                return true;
+            };
+            const screen_dc = win.GetDC(null);
+            const rows = win.GetDIBits(screen_dc, @ptrCast(@alignCast(handle)), 0, h, buffer.ptr, &info, win.DIB_RGB_COLORS);
+            if (screen_dc != null) _ = win.ReleaseDC(null, screen_dc);
+            if (rows != h) {
+                a.allocator.free(buffer);
+                setStatus(a, "Clipboard holds no image to paste");
+                return true;
+            }
+            var offset: usize = 0;
+            while (offset < buffer.len) : (offset += 4) buffer[offset + 3] = 255;
+            pixels = .{ .width = w, .height = h, .pixels = buffer };
+        } else {
             setStatus(a, "Clipboard holds no image to paste");
             return true;
-        };
+        }
+    }
+
+    // A copied file: stage it outside the clipboard (see the block above).
+    if (source_name) |name_len| {
         defer a.allocator.free(name_len);
         var extension: []const u8 = "";
         const file_extension = std.fs.path.extension(name_len);
@@ -3657,6 +3713,8 @@ fn stageImageFromClipboard(a: *App) bool {
             return true;
         };
         const data = readFileWin(a.allocator, name_len, 32 * 1024 * 1024) orelse {
+            deleteFileUtf8(path_buffer[0..path_len]);
+            path_len = 0;
             setStatus(a, "Could not read the copied image file");
             return true;
         };
@@ -3667,42 +3725,6 @@ fn stageImageFromClipboard(a: *App) bool {
             setStatus(a, "Could not stage the pasted image");
             return true;
         };
-    } else if (win.GetClipboardData(win.CF_DIB)) |handle| {
-        pixels = clipboardDibPixels(a, handle);
-    } else if (win.GetClipboardData(win.CF_BITMAP)) |handle| {
-        // A bare HBITMAP without a DIB: ask GDI for top-down 32bpp rows.
-        var bitmap_header: win.BITMAP = undefined;
-        if (win.GetObjectW(handle, @sizeOf(win.BITMAP), &bitmap_header) == 0 or bitmap_header.bmWidth <= 0 or bitmap_header.bmHeight <= 0) {
-            setStatus(a, "Clipboard holds no image to paste");
-            return true;
-        }
-        const w: u32 = @intCast(bitmap_header.bmWidth);
-        const h: u32 = @intCast(bitmap_header.bmHeight);
-        var info = std.mem.zeroes(win.BITMAPINFO);
-        info.bmiHeader.biSize = @sizeOf(win.BITMAPINFOHEADER);
-        info.bmiHeader.biWidth = @intCast(w);
-        info.bmiHeader.biHeight = -@as(i32, @intCast(h));
-        info.bmiHeader.biPlanes = 1;
-        info.bmiHeader.biBitCount = 32;
-        info.bmiHeader.biCompression = win.BI_RGB;
-        const buffer = a.allocator.alloc(u8, w * h * 4) catch {
-            setStatus(a, "Could not stage the pasted image");
-            return true;
-        };
-        const screen_dc = win.GetDC(null);
-        const rows = win.GetDIBits(screen_dc, @ptrCast(@alignCast(handle)), 0, h, buffer.ptr, &info, win.DIB_RGB_COLORS);
-        if (screen_dc != null) _ = win.ReleaseDC(null, screen_dc);
-        if (rows != h) {
-            a.allocator.free(buffer);
-            setStatus(a, "Clipboard holds no image to paste");
-            return true;
-        }
-        var offset: usize = 0;
-        while (offset < buffer.len) : (offset += 4) buffer[offset + 3] = 255;
-        pixels = .{ .width = w, .height = h, .pixels = buffer };
-    } else {
-        setStatus(a, "Clipboard holds no image to paste");
-        return true;
     }
 
     // Encode DIB pixels to a staged PNG (the HDROP path already has a file).
@@ -3821,6 +3843,7 @@ fn sendMessage(a: *App) void {
     pending.text.set(text);
     pending.reply_to.set(a.reply_to.slice());
     pending.reply_sender.set(a.reply_sender.slice());
+    pending.file = .{};
     clearReply(a);
     a.pending_send_count += 1;
     a.user_viewed = true;
@@ -3950,7 +3973,7 @@ fn selectChat(a: *App, delta: i32, wrap: bool) void {
     } else {
         next = std.math.clamp(next, 0, count - 1);
     }
-    discardStagedImage(a);
+    if (next != a.selected_chat) discardStagedImage(a);
     a.selected_chat = @intCast(next);
     a.user_viewed = true;
     if (a.chats_hwnd) |list| {
