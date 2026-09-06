@@ -280,6 +280,10 @@ const App = struct {
     archive_child: ?std.process.Child = null,
     pending_archives: [max_pending_sends]PendingArchive = [_]PendingArchive{.{}} ** max_pending_sends,
     pending_archive_count: usize = 0,
+    markread_child: ?std.process.Child = null,
+    markread_active: Utf8Text(191) = .{},
+    pending_markreads: [4]Utf8Text(191) = [_]Utf8Text(191){.{}} ** 4,
+    pending_markread_count: usize = 0,
     group_refresh_ticks: u8 = 0,
     deepgram_configured: bool = false,
     deepgram_key: []const u8 = "",
@@ -695,11 +699,59 @@ fn markChatRead(a: *App) void {
     if (!chat.unread and chat.unread_count == 0) return;
     chat.unread = false;
     chat.unread_count = 0;
-    const args = [_][]const u8{ a.wacli_path, "--json", "--lock-wait", "10s", "chats", "mark-read", "--chat", chat.jid.slice() };
-    if (runWacliExclusive(a, &args)) |parsed| {
-        parsed.deinit();
-    } else |_| {}
-    refreshChats(a);
+    queueMarkRead(a, chat.jid.slice());
+    startNextMarkRead(a);
+}
+
+fn queueMarkRead(a: *App, jid: []const u8) void {
+    if (std.mem.eql(u8, a.markread_active.slice(), jid)) return;
+    for (a.pending_markreads[0..a.pending_markread_count]) |*pending| {
+        if (std.mem.eql(u8, pending.slice(), jid)) return;
+    }
+    // ponytail: 4-slot cap; a full queue drops the oldest unread chats'
+    // mark-read (they still show read locally until the next sync).
+    if (a.pending_markread_count >= a.pending_markreads.len) return;
+    a.pending_markreads[a.pending_markread_count].set(jid);
+    a.pending_markread_count += 1;
+}
+
+fn startNextMarkRead(a: *App) void {
+    if (a.markread_child != null or a.pending_markread_count == 0) return;
+    a.markread_active.set(a.pending_markreads[0].slice());
+    var index: usize = 1;
+    while (index < a.pending_markread_count) : (index += 1) a.pending_markreads[index - 1] = a.pending_markreads[index];
+    a.pending_markread_count -= 1;
+    stopSync(a);
+    const child = std.process.spawn(a.io, .{
+        .argv = &.{ a.wacli_path, "--json", "--lock-wait", "10s", "chats", "mark-read", "--chat", a.markread_active.slice() },
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+        .create_no_window = true,
+    }) catch {
+        a.markread_active.set("");
+        setStatus(a, "Could not start mark-as-read");
+        startSync(a);
+        return;
+    };
+    a.markread_child = child;
+}
+
+fn checkMarkRead(a: *App) void {
+    if (a.markread_child) |*child| {
+        const handle = child.id orelse return;
+        var code: win.DWORD = 0;
+        if (win.GetExitCodeProcess(handle, &code) == 0 or code == win.STILL_ACTIVE) return;
+        _ = child.wait(a.io) catch {};
+        a.markread_child = null;
+        a.markread_active.set("");
+        if (a.pending_markread_count > 0) {
+            startNextMarkRead(a);
+        } else {
+            startSync(a);
+            refreshChats(a);
+        }
+    } else if (a.pending_markread_count > 0) startNextMarkRead(a);
 }
 
 fn clearMessages(a: *App) void {
@@ -1651,6 +1703,9 @@ fn refreshMessages(a: *App) void {
 
 fn startSync(a: *App) void {
     if (a.sync_child != null) return;
+    // Never restart the live sync while a queued mark-read write is in
+    // flight; wacli fails with "store is locked" otherwise.
+    if (a.markread_child != null) return;
     const child = std.process.spawn(a.io, .{
         .argv = &.{ a.wacli_path, "--events", "sync", "--follow", "--max-reconnect", "0", "--stale-threshold", "1m", "--refresh-contacts", "--refresh-groups", "--download-media" },
         .stdin = .ignore,
@@ -3531,6 +3586,7 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
                 checkSend(a);
                 checkAvatarDownload(a);
                 checkArchive(a);
+                checkMarkRead(a);
                 if (a.media_child == null) {
                     checkSync(a);
                     a.group_refresh_ticks += 1;
@@ -3598,6 +3654,8 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
             a.send_child = null;
             if (a.archive_child) |*child| child.kill(a.io);
             a.archive_child = null;
+            if (a.markread_child) |*child| child.kill(a.io);
+            a.markread_child = null;
             stopSync(a);
             if (a.sync_job) |job| _ = win.CloseHandle(job);
             a.sync_job = null;
