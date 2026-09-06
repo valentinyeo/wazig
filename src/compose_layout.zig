@@ -23,8 +23,9 @@ pub fn compute(dragged: i32, content_height: i32, client_height: i32) Composer {
     var edit: i32 = @max(@max(edit_min_height, dragged), content_height);
     edit = @min(edit, cap);
     const room_for_edit: i32 = client_height - canvas_min_height - strip_padding;
-    if (room_for_edit > 0 and edit > room_for_edit) edit = room_for_edit;
-    if (edit < edit_min_height) edit = @min(edit_min_height, @max(0, room_for_edit));
+    // Hard bound: the strip never exceeds the window; when even the minimum
+    // does not fit, the edit collapses to 0 rather than overflowing the pane.
+    if (edit > room_for_edit) edit = @max(0, room_for_edit);
     return .{ .edit_height = edit, .strip_height = edit + strip_padding };
 }
 
@@ -48,4 +49,10 @@ test "clamps to keep the message pane usable" {
     const c = compute(400, 400, 300);
     try @import("std").testing.expectEqual(@as(i32, 118), c.edit_height);
     try @import("std").testing.expectEqual(@as(i32, 140), c.strip_height);
+}
+
+test "collapses instead of overflowing a tiny window" {
+    const c = compute(400, 400, 150);
+    try @import("std").testing.expectEqual(@as(i32, 0), c.edit_height);
+    try @import("std").testing.expectEqual(@as(i32, 22), c.strip_height);
 }

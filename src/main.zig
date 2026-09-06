@@ -469,19 +469,20 @@ fn saveDictationLanguage(language: dictation.Language) void {
     _ = win.RegSetValueExW(key, lit("DictationLanguage"), 0, win.REG_DWORD, @ptrCast(&value), @sizeOf(win.DWORD));
 }
 
+fn composerDragBandLeft(a: *App) i32 {
+    return std.math.clamp(@divTrunc(a.compose_client_width, 3), 280, 390) + 1;
+}
+
 /// Dragged composer height is persisted in 96-DPI logical pixels and rescaled
 /// for the current monitor so it keeps the same physical size across screens.
 fn loadComposeDragged(hwnd: win.HWND) i32 {
     var value: win.DWORD = 0;
     var size: win.DWORD = @sizeOf(win.DWORD);
     if (win.RegGetValueW(winHandle(win.HKEY, 0x80000001), lit("Software\\Messages"), lit("ComposeMinHeight"), win.RRF_RT_REG_DWORD, null, &value, &size) != win.ERROR_SUCCESS) return 0;
-    var saved_dpi: win.DWORD = 96;
-    var dpi_size: win.DWORD = @sizeOf(win.DWORD);
-    if (win.RegGetValueW(winHandle(win.HKEY, 0x80000001), lit("Software\\Messages"), lit("ComposeDpi"), win.RRF_RT_REG_DWORD, null, &saved_dpi, &dpi_size) != win.ERROR_SUCCESS or saved_dpi < 96) saved_dpi = 96;
     const dpi: i32 = @intCast(win.GetDpiForWindow(hwnd));
     if (dpi <= 0) return 0;
-    const logical: i32 = @intCast(value);
-    return std.math.clamp(@divTrunc(logical * dpi, @as(i32, @intCast(saved_dpi))), 0, 400);
+    const logical: i32 = @intCast(@min(value, 400));
+    return std.math.clamp(@divTrunc(logical * dpi, 96), 0, 400);
 }
 
 fn saveComposeDragged(hwnd: win.HWND, dragged: i32) void {
@@ -489,12 +490,10 @@ fn saveComposeDragged(hwnd: win.HWND, dragged: i32) void {
     var disposition: win.DWORD = 0;
     if (win.RegCreateKeyExW(winHandle(win.HKEY, 0x80000001), lit("Software\\Messages"), 0, null, 0, win.KEY_SET_VALUE, null, &key, &disposition) != win.ERROR_SUCCESS) return;
     defer _ = win.RegCloseKey(key);
-    const dpi: i32 = @intCast(win.GetDpiForWindow(hwnd));
-    const logical: i32 = if (dpi > 0) @divTrunc(dragged * 96, dpi) else dragged;
-    var stored: win.DWORD = @intCast(std.math.clamp(logical, 0, 400));
+    // Stored in 96-DPI logical pixels; load rescales by the current DPI.
+    const dpi: i32 = @max(@as(i32, @intCast(win.GetDpiForWindow(hwnd))), 96);
+    var stored: win.DWORD = @intCast(std.math.clamp(@divTrunc(dragged * 96, dpi), 0, 400));
     _ = win.RegSetValueExW(key, lit("ComposeMinHeight"), 0, win.REG_DWORD, @ptrCast(&stored), @sizeOf(win.DWORD));
-    var saved_dpi: win.DWORD = 96;
-    _ = win.RegSetValueExW(key, lit("ComposeDpi"), 0, win.REG_DWORD, @ptrCast(&saved_dpi), @sizeOf(win.DWORD));
 }
 
 fn saveFontScale(scale: i32) void {
@@ -3295,7 +3294,8 @@ fn composerContentHeight(a: *App) i32 {
     const margins = (fmt.top - rc_cli.top) + (rc_cli.bottom - fmt.bottom);
     const hdc = win.GetDC(compose);
     defer _ = win.ReleaseDC(compose, hdc);
-    const line_h = textLineHeight(hdc, a.font.?);
+    const font = a.font orelse return compose_layout.edit_min_height;
+    const line_h = textLineHeight(hdc, font);
     const lines: i32 = @intCast(win.SendMessageW(compose, win.EM_GETLINECOUNT, 0, 0));
     return @max(compose_layout.edit_min_height, lines * line_h + margins + composerNonClientY(compose));
 }
@@ -3342,7 +3342,12 @@ fn layout(a: *App, width: i32, height: i32) void {
     if (a.emoji_btn) |hwnd| _ = win.MoveWindow(hwnd, width - 236, height - 55, 44, 44, win.TRUE);
     if (a.dictate) |hwnd| _ = win.MoveWindow(hwnd, width - 176, height - 55, 84, 44, win.TRUE);
     if (a.send) |hwnd| _ = win.MoveWindow(hwnd, width - 82, height - 55, 68, 44, win.TRUE);
-    if (a.hwnd) |main_hwnd| _ = win.InvalidateRect(main_hwnd, null, win.TRUE);
+    if (a.hwnd) |main_hwnd| {
+        // Only the strip's own background is painted by the main window; the
+        // canvas and edit repaint themselves when MoveWindow resizes them.
+        var strip = win.RECT{ .left = left_width + 1, .top = a.compose_strip_top, .right = width, .bottom = height };
+        _ = win.InvalidateRect(main_hwnd, &strip, win.TRUE);
+    }
 }
 
 fn loadAvatarBitmap(a: *App, path: [*:0]const u16) ?win.HBITMAP {
@@ -4297,12 +4302,14 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
         },
         win.WM_ERASEBKGND => return 1,
         win.WM_SETCURSOR => {
-            // Sizing cursor over the composer's top drag band (parent-owned padding).
-            if (a.compose != null) {
+            // Sizing cursor over the composer's top drag band (parent-owned padding,
+            // right pane only so the chat list is unaffected).
+            if (a.compose != null and a.compose_client_width > 0) {
+                const band_left = composerDragBandLeft(a);
                 var pt: win.POINT = undefined;
                 _ = win.GetCursorPos(&pt);
                 _ = win.ScreenToClient(hwnd, &pt);
-                if (pt.y >= a.compose_strip_top and pt.y < a.compose_strip_top + 11 and pt.x > 0) {
+                if (pt.x >= band_left and pt.y >= a.compose_strip_top and pt.y < a.compose_strip_top + 11) {
                     // IDC_SIZENS = MAKEINTRESOURCE(32646); the macro doesn't translate.
                     _ = win.SetCursor(win.LoadCursorW(null, @as([*:0]const u16, @ptrFromInt(32646))));
                     return 1;
@@ -4311,9 +4318,10 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
             return win.DefWindowProcW(hwnd, message, wparam, lparam);
         },
         win.WM_LBUTTONDOWN => {
-            if (a.compose != null) {
+            if (a.compose != null and a.compose_client_width > 0) {
+                const x: i32 = @as(i16, @bitCast(loword(@as(usize, @bitCast(lparam)))));
                 const y: i32 = @as(i16, @bitCast(hiword(@as(usize, @bitCast(lparam)))));
-                if (y >= a.compose_strip_top and y < a.compose_strip_top + 11) {
+                if (x >= composerDragBandLeft(a) and y >= a.compose_strip_top and y < a.compose_strip_top + 11) {
                     a.compose_dragging = true;
                     _ = win.SetCapture(hwnd);
                     return 0;
@@ -4334,7 +4342,9 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
             if (a.compose_dragging) {
                 a.compose_dragging = false;
                 _ = win.ReleaseCapture();
-                if (a.compose_dragged > 44) saveComposeDragged(hwnd, a.compose_dragged);
+                // Save unconditionally so dragging back to the minimum clears
+                // a previously saved taller height.
+                saveComposeDragged(hwnd, a.compose_dragged);
                 return 0;
             }
             return win.DefWindowProcW(hwnd, message, wparam, lparam);
