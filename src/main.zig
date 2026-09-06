@@ -3997,8 +3997,9 @@ fn setComposeTop(hwnd: win.HWND, target: i32) void {
 }
 
 fn canvasStripRect(a: *App) win.RECT {
+    const canvas = a.canvas orelse return .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
     var client: win.RECT = undefined;
-    _ = win.GetClientRect(a.canvas.?, &client);
+    _ = win.GetClientRect(canvas, &client);
     return .{ .left = client.right - scrollbar_width, .top = client.top, .right = client.right, .bottom = client.bottom };
 }
 
@@ -4576,6 +4577,13 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
         win.WM_LBUTTONDOWN => {
             const x: i32 = @as(i16, @bitCast(loword(@as(usize, @bitCast(lparam)))));
             const y: i32 = @as(i16, @bitCast(hiword(@as(usize, @bitCast(lparam)))));
+            // The composer's resize band takes precedence over the scrollbar
+            // strip: their top 11px overlap when the edit is at minimum height.
+            if (a.compose != null and y >= a.compose_strip_top and y < a.compose_strip_top + 11) {
+                a.compose_dragging = true;
+                _ = win.SetCapture(hwnd);
+                return 0;
+            }
             if (a.chats_hwnd) |list| {
                 const strip = stripRightOf(list, hwnd);
                 if (hitStrip(strip, x, y)) {
@@ -4591,13 +4599,6 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
                     const info = composeScrollInfo(a, edit);
                     if (scrollbar.thumbGeom(trackOf(strip).top, trackOf(strip).h, info.total, info.page, info.top, scrollbar_min_thumb) != null)
                         beginStripDrag(a, hwnd, strip, info, y, .compose, setComposeScroll);
-                    return 0;
-                }
-            }
-            if (a.compose != null) {
-                if (y >= a.compose_strip_top and y < a.compose_strip_top + 11) {
-                    a.compose_dragging = true;
-                    _ = win.SetCapture(hwnd);
                     return 0;
                 }
             }
