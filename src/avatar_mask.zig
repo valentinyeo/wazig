@@ -16,13 +16,21 @@ pub fn alphaAt(x: usize, y: usize, size: usize) u8 {
     return @intFromFloat(coverage * 255.0);
 }
 
-/// Sets the alpha channel of a top-down 32bpp BGRA buffer to the circle mask.
+/// Applies the circle mask to a top-down 32bpp BGRA buffer, premultiplying
+/// the color by the alpha so the buffer satisfies the AC_SRC_ALPHA contract
+/// (WIC emits PBGRA with opaque alpha; lowering alpha alone would leave
+/// color > alpha and produce a bright halo at the rim).
 pub fn applyMask(pixels: []u8, size: usize) void {
     var y: usize = 0;
     while (y < size) : (y += 1) {
         var x: usize = 0;
         while (x < size) : (x += 1) {
-            pixels[(y * size + x) * 4 + 3] = alphaAt(x, y, size);
+            const a: u16 = alphaAt(x, y, size);
+            const i = (y * size + x) * 4;
+            pixels[i + 0] = @intCast(@as(u16, pixels[i + 0]) * a / 255);
+            pixels[i + 1] = @intCast(@as(u16, pixels[i + 1]) * a / 255);
+            pixels[i + 2] = @intCast(@as(u16, pixels[i + 2]) * a / 255);
+            pixels[i + 3] = @intCast(a);
         }
     }
 }
@@ -58,8 +66,21 @@ test "fillCircle premultiplies color" {
     const size = 8;
     var pixels = [_]u8{0} ** (size * size * 4);
     fillCircle(&pixels, size, 255, 128, 0);
-    const center = ((size / 2) * size + (size / 2)) * 4;
-    try std.testing.expectEqual(@as(u8, 255), pixels[center + 3]);
-    try std.testing.expectEqual(pixels[center + 3], pixels[center + 2]); // R premultiplied
+    // Partial-alpha edge pixel (x=0, y=1): coverage ~0.2, so premultiplied
+    // red ~50 while unpremultiplied would be 255.
+    const i = (1 * size + 0) * 4;
+    try std.testing.expect(pixels[i + 3] > 0 and pixels[i + 3] < 255);
+    try std.testing.expectEqual(pixels[i + 3], pixels[i + 2]); // red == alpha
+    try std.testing.expectApproxEqAbs(@as(f32, @floatFromInt(pixels[i + 1])), @as(f32, @floatFromInt(pixels[i + 3])) * 128.0 / 255.0, 1.5);
     try std.testing.expectEqual(@as(u8, 0), pixels[0 + 3]); // corner transparent
+}
+
+test "applyMask premultiplies an opaque buffer" {
+    const size = 8;
+    var pixels = [_]u8{255} ** (size * size * 4);
+    applyMask(&pixels, size);
+    const i = (1 * size + 0) * 4;
+    try std.testing.expect(pixels[i + 3] > 0 and pixels[i + 3] < 255);
+    try std.testing.expect(pixels[i + 2] <= pixels[i + 3]); // color <= alpha
+    try std.testing.expectEqual(@as(u8, 255), pixels[((size / 2) * size + (size / 2)) * 4 + 3]); // center opaque
 }
