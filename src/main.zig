@@ -20,7 +20,8 @@ const win = @cImport({
     @cInclude("winhttp.h");
 });
 
-const app_version = "0.9.7";
+const build_info = @import("build_info");
+const app_version = build_info.version;
 const update = @import("update.zig");
 
 const max_chats = 256;
