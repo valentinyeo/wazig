@@ -1227,6 +1227,7 @@ fn ensureBitmap(a: *App, message: *Message) void {
 fn downloadMedia(a: *App, message_index: usize, automatic: bool) void {
     if (message_index >= a.message_count or a.selected_chat >= a.chat_count) return;
     const message = &a.messages[message_index];
+    if (message.media_type.len == 0 or message.id.len == 0) return;
     if (a.media_child != null or a.read_child != null or a.pending_read_count > 0) {
         if (!automatic and message.id.len > 0) {
             // Reads have no queue a click can join, so remember the request
@@ -1239,7 +1240,6 @@ fn downloadMedia(a: *App, message_index: usize, automatic: bool) void {
         if (!automatic) setStatus(a, "Waiting for the current download to finish");
         return;
     }
-    if (message.media_type.len == 0 or message.id.len == 0) return;
     setStatus(a, if (automatic) "Downloading media..." else "Downloading attachment...");
     if (a.hwnd) |hwnd| _ = win.UpdateWindow(hwnd);
     stopSync(a);
