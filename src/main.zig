@@ -4035,14 +4035,16 @@ const SetScrollTop = *const fn (*App, i32) void;
 
 fn beginStripDrag(a: *App, hwnd: win.HWND, strip: win.RECT, info: ScrollInfo, y: i32, target: SbDrag, set_top: SetScrollTop) void {
     const t = trackOf(strip);
-    set_top(a, scrollbar.topFromPoint(y, t.top, t.h, info.total, info.page, scrollbar_min_thumb));
+    const top = scrollbar.topFromPoint(y, t.top, t.h, info.total, info.page, scrollbar_min_thumb) orelse return;
+    set_top(a, top);
     a.sb_drag = target;
     _ = win.SetCapture(hwnd);
 }
 
 fn dragStrip(a: *App, strip: win.RECT, info: ScrollInfo, y: i32, set_top: SetScrollTop) void {
     const t = trackOf(strip);
-    set_top(a, scrollbar.topFromPoint(y, t.top, t.h, info.total, info.page, scrollbar_min_thumb));
+    const top = scrollbar.topFromPoint(y, t.top, t.h, info.total, info.page, scrollbar_min_thumb) orelse return;
+    set_top(a, top);
 }
 
 // Poll scroll positions once per animation tick: child controls scroll
