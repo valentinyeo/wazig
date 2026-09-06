@@ -1402,13 +1402,15 @@ fn downloadMedia(a: *App, message_index: usize, automatic: bool) void {
     const message = &a.messages[message_index];
     if (message.media_type.len == 0 or message.id.len == 0) return;
     if (a.media_child != null or a.read_child != null or a.pending_read_count > 0) {
-        if (!automatic) {
-            // Reads have no queue a click can join, so remember the request
-            // and start it once the mark-read job finishes.
+        // Reads have no queue a click can join, so remember one request
+        // and start it once the mark-read job finishes. The slot holds a
+        // single request: an automatic caller never replaces a queued user
+        // click, it just retries on its next timer tick.
+        if (!automatic or a.pending_download_id.len == 0) {
             a.pending_download_jid.set(a.chats[a.selected_chat].jid.slice());
             a.pending_download_id.set(message.id.slice());
-            setStatus(a, "Attachment download queued");
         }
+        if (!automatic) setStatus(a, "Attachment download queued");
         return;
     }
     setStatus(a, if (automatic) "Downloading media..." else "Downloading attachment...");
@@ -1445,7 +1447,11 @@ fn isDownloadableMedia(message: *const Message) bool {
 }
 
 fn autoDownloadNextMedia(a: *App) void {
-    if (a.media_child != null or a.read_child != null or a.archive_child != null or a.pending_archive_count > 0) return;
+    // A mark-read job holds the store on every chat open: downloadMedia would
+    // return without starting, so do not scan now — mediaWasAttempted would
+    // blacklist every media message without ever downloading it.
+    if (a.media_child != null or a.read_child != null or a.pending_read_count > 0 or
+        a.archive_child != null or a.pending_archive_count > 0) return;
     for (a.messages[0..a.message_count], 0..) |*message, index| {
         if (!isDownloadableMedia(message) or message.local_path.len > 0 or message.id.len == 0) continue;
         if (mediaWasAttempted(a, message.id.slice())) continue;
