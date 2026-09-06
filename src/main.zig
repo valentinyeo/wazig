@@ -404,6 +404,9 @@ const App = struct {
     displayed_timestamp: Utf8Text(47) = .{},
     played_set: played.Set = .{},
     played_path: []u8 = &.{},
+    // The wacli worker thread shares allocator and io with the UI thread:
+    // safe because start.zig provides c_allocator and std.Io.Threaded, both
+    // thread-safe. wacli_pending is only touched under wacli_mutex.
     wacli_thread: ?std.Thread = null,
     wacli_mutex: std.Io.Mutex = .init,
     wacli_cond: std.Io.Condition = .init,
@@ -649,9 +652,12 @@ fn wacliEnqueue(a: *App, job: WacliJob, urgent: bool) void {
         // Superseded refreshes are droppable; reactions are dropped only as a
         // last resort: the victim's pending count drops to zero, so the
         // checkSync timer restarts live sync within a second either way.
-        var victim: usize = 0;
-        var index: usize = 0;
-        while (index < a.wacli_queue_len) : (index += 1) {
+        // Scan from the back so the oldest droppable job is evicted; index 0
+        // holds the newest (urgent) job and must survive.
+        var victim: usize = a.wacli_queue_len - 1;
+        var index: usize = a.wacli_queue_len;
+        while (index > 0) {
+            index -= 1;
             if (a.wacli_queue[index].kind != .reaction) {
                 victim = index;
                 break;
@@ -675,6 +681,25 @@ fn wacliEnqueue(a: *App, job: WacliJob, urgent: bool) void {
     a.wacli_cond.signal(a.io);
     a.wacli_mutex.unlock(a.io);
     if (dropped_reaction) setStatus(a, "Reaction queue is full; try again");
+    if (a.wacli_thread == null) wacliPumpSync(a);
+}
+
+// Fallback when the worker thread never started: run queued jobs inline on
+// the UI thread. Blocking, but the app stays functional.
+fn wacliPumpSync(a: *App) void {
+    while (true) {
+        a.wacli_mutex.lockUncancelable(a.io);
+        if (a.wacli_thread != null or a.wacli_queue_len == 0) {
+            a.wacli_mutex.unlock(a.io);
+            return;
+        }
+        const job = a.wacli_queue[0];
+        var shift: usize = 0;
+        while (shift + 1 < a.wacli_queue_len) : (shift += 1) a.wacli_queue[shift] = a.wacli_queue[shift + 1];
+        a.wacli_queue_len -= 1;
+        a.wacli_mutex.unlock(a.io);
+        wacliRunJob(a, job);
+    }
 }
 
 fn wacliShutdown(a: *App) void {
