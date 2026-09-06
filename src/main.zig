@@ -47,6 +47,12 @@ const timer_chat_select = 4;
 const timer_update_check = 5;
 const timer_update_restart = 6;
 const wm_update_ready = win.WM_APP + 2;
+const wm_wacli_done = win.WM_APP + 3;
+const wacli_queue_size = 8;
+const max_wacli_args = 16;
+const wacli_arg_cap = 512;
+const max_msg_cache = 8;
+const msg_cache_max_bytes = 4 * 1024 * 1024;
 const update_check_interval_ms: u32 = 4 * 60 * 60 * 1000;
 const update_restart_delay_ms: u32 = 10 * 1000;
 const scrollbar_width: i32 = 8; // 6px thumb + 1px inset on each side
@@ -249,6 +255,41 @@ const Message = struct {
     bubble_hit: win.RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 },
 };
 
+// Background wacli reads: one worker thread runs every wacli call so the UI
+// thread never blocks on process startup (100-300 ms per spawn). The worker
+// posts a WacliResult pointer back with wm_wacli_done; the UI thread parses
+// and applies it. Jobs carry a generation token so a stale answer can never
+// overwrite a newer view.
+const WacliJobKind = enum(u8) { chats, groups, messages, reaction };
+const wacli_kind_count = @typeInfo(WacliJobKind).@"enum".fields.len;
+
+const WacliJob = struct {
+    kind: WacliJobKind = .chats,
+    gen: u64 = 0,
+    jid: Utf8Text(191) = .{},
+    msg_id: Utf8Text(191) = .{},
+    extra: Utf8Text(63) = .{},
+    arg_count: usize = 0,
+    args: [max_wacli_args]Utf8Text(wacli_arg_cap) = [_]Utf8Text(wacli_arg_cap){.{}} ** max_wacli_args,
+};
+
+const WacliResult = struct {
+    kind: WacliJobKind = .chats,
+    gen: u64 = 0,
+    ok: bool = false,
+    jid: Utf8Text(191) = .{},
+    msg_id: Utf8Text(191) = .{},
+    extra: Utf8Text(63) = .{},
+    data: []u8 = &.{},
+};
+
+// Last raw wacli response per chat, so switching back to a recent chat paints
+// its messages instantly while the fresh read runs.
+const MsgCacheEntry = struct {
+    jid: Utf8Text(191) = .{},
+    data: ?[]u8 = null,
+};
+
 const App = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -375,6 +416,21 @@ const App = struct {
     displayed_timestamp: Utf8Text(47) = .{},
     played_set: played.Set = .{},
     played_path: []u8 = &.{},
+    // The wacli worker thread shares allocator and io with the UI thread:
+    // safe because start.zig provides c_allocator and std.Io.Threaded, both
+    // thread-safe. wacli_pending is only touched under wacli_mutex.
+    wacli_thread: ?std.Thread = null,
+    wacli_mutex: std.Io.Mutex = .init,
+    wacli_cond: std.Io.Condition = .init,
+    wacli_queue: [wacli_queue_size]WacliJob = [_]WacliJob{.{}} ** wacli_queue_size,
+    wacli_queue_len: usize = 0,
+    wacli_quit: bool = false,
+    wacli_pending: [wacli_kind_count]u32 = [_]u32{0} ** wacli_kind_count,
+    messages_gen: u64 = 0,
+    chats_gen: u64 = 0,
+    chats_pending_flags: u8 = 0,
+    msg_cache: [max_msg_cache]MsgCacheEntry = [_]MsgCacheEntry{.{}} ** max_msg_cache,
+    msg_cache_len: usize = 0,
     store_watch_path: WideText(519) = .{},
     last_store_write: u64 = 0,
 };
@@ -583,29 +639,203 @@ fn getInt(object: std.json.ObjectMap, key: []const u8) i64 {
     };
 }
 
-fn runWacli(a: *App, argv: []const []const u8) !std.json.Parsed(std.json.Value) {
-    const result = try std.process.run(a.allocator, a.io, .{
-        .argv = argv,
+fn wacliJobArgs(job: *WacliJob, args: []const []const u8) void {
+    job.arg_count = @min(args.len, max_wacli_args);
+    for (args[0..job.arg_count], 0..) |argument, index| job.args[index].set(argument);
+}
+
+fn wacliPendingGet(a: *App, kind: WacliJobKind) u32 {
+    a.wacli_mutex.lockUncancelable(a.io);
+    const value = a.wacli_pending[@intFromEnum(kind)];
+    a.wacli_mutex.unlock(a.io);
+    return value;
+}
+
+fn wacliPendingSub(a: *App, kind: WacliJobKind) void {
+    a.wacli_mutex.lockUncancelable(a.io);
+    if (a.wacli_pending[@intFromEnum(kind)] > 0) a.wacli_pending[@intFromEnum(kind)] -= 1;
+    a.wacli_mutex.unlock(a.io);
+}
+
+fn wacliEnqueue(a: *App, job: WacliJob, urgent: bool) void {
+    var dropped_reaction = false;
+    a.wacli_mutex.lockUncancelable(a.io);
+    if (a.wacli_queue_len >= a.wacli_queue.len) {
+        // Superseded refreshes are droppable; reactions are dropped only as a
+        // last resort: the victim's pending count drops to zero, so the
+        // checkSync timer restarts live sync within a second either way.
+        // Scan from the back so the oldest droppable job is evicted; index 0
+        // holds the newest (urgent) job and must survive.
+        var victim: usize = a.wacli_queue_len - 1;
+        var index: usize = a.wacli_queue_len;
+        while (index > 0) {
+            index -= 1;
+            if (a.wacli_queue[index].kind != .reaction) {
+                victim = index;
+                break;
+            }
+        }
+        dropped_reaction = a.wacli_queue[victim].kind == .reaction;
+        a.wacli_pending[@intFromEnum(a.wacli_queue[victim].kind)] -= 1;
+        var shift = victim;
+        while (shift + 1 < a.wacli_queue_len) : (shift += 1) a.wacli_queue[shift] = a.wacli_queue[shift + 1];
+        a.wacli_queue_len -= 1;
+    }
+    if (urgent) {
+        var shift = a.wacli_queue_len;
+        while (shift > 0) : (shift -= 1) a.wacli_queue[shift] = a.wacli_queue[shift - 1];
+        a.wacli_queue[0] = job;
+    } else {
+        a.wacli_queue[a.wacli_queue_len] = job;
+    }
+    a.wacli_queue_len += 1;
+    a.wacli_pending[@intFromEnum(job.kind)] += 1;
+    a.wacli_cond.signal(a.io);
+    a.wacli_mutex.unlock(a.io);
+    if (dropped_reaction) setStatus(a, "Reaction queue is full; try again");
+    if (a.wacli_thread == null) wacliPumpSync(a);
+}
+
+// Fallback when the worker thread never started: run queued jobs inline on
+// the UI thread. Blocking, but the app stays functional.
+fn wacliPumpSync(a: *App) void {
+    while (true) {
+        a.wacli_mutex.lockUncancelable(a.io);
+        if (a.wacli_thread != null or a.wacli_queue_len == 0) {
+            a.wacli_mutex.unlock(a.io);
+            return;
+        }
+        const job = a.wacli_queue[0];
+        var shift: usize = 0;
+        while (shift + 1 < a.wacli_queue_len) : (shift += 1) a.wacli_queue[shift] = a.wacli_queue[shift + 1];
+        a.wacli_queue_len -= 1;
+        a.wacli_mutex.unlock(a.io);
+        wacliRunJob(a, job);
+    }
+}
+
+fn wacliShutdown(a: *App) void {
+    a.wacli_mutex.lockUncancelable(a.io);
+    a.wacli_quit = true;
+    a.wacli_cond.signal(a.io);
+    a.wacli_mutex.unlock(a.io);
+    if (a.wacli_thread) |thread| thread.join();
+    a.wacli_thread = null;
+    for (a.msg_cache[0..a.msg_cache_len]) |*entry| {
+        if (entry.data) |data| a.allocator.free(data);
+        entry.data = null;
+    }
+    a.msg_cache_len = 0;
+}
+
+fn wacliWorkerMain(a: *App) void {
+    while (true) {
+        a.wacli_mutex.lockUncancelable(a.io);
+        while (a.wacli_queue_len == 0 and !a.wacli_quit) a.wacli_cond.waitUncancelable(a.io, &a.wacli_mutex);
+        // Quit discards any remaining queued jobs: the window is going away
+        // and joining behind them would hang the close.
+        if (a.wacli_quit) {
+            a.wacli_mutex.unlock(a.io);
+            return;
+        }
+        const job = a.wacli_queue[0];
+        var shift: usize = 0;
+        while (shift + 1 < a.wacli_queue_len) : (shift += 1) a.wacli_queue[shift] = a.wacli_queue[shift + 1];
+        a.wacli_queue_len -= 1;
+        a.wacli_mutex.unlock(a.io);
+        wacliRunJob(a, job);
+    }
+}
+
+// ponytail: no hard timeout around the worker's wacli call, so a hung wacli
+// read stalls the queue and blocks shutdown; upgrade path is spawn plus a
+// WaitForSingleObject deadline with TerminateProcess.
+fn wacliRunJob(a: *App, job: WacliJob) void {
+    var argv: [max_wacli_args][]const u8 = undefined;
+    var count: usize = 0;
+    while (count < job.arg_count) : (count += 1) argv[count] = job.args[count].slice();
+    const result = a.allocator.create(WacliResult) catch {
+        wacliPendingSub(a, job.kind);
+        return;
+    };
+    result.* = .{ .kind = job.kind, .gen = job.gen, .jid = job.jid, .msg_id = job.msg_id, .extra = job.extra };
+    const run = std.process.run(a.allocator, a.io, .{
+        .argv = argv[0..count],
         .stdout_limit = .limited(8 * 1024 * 1024),
         .stderr_limit = .limited(256 * 1024),
         .create_no_window = true,
-    });
+    }) catch {
+        wacliPost(a, result);
+        return;
+    };
     defer {
-        a.allocator.free(result.stdout);
-        a.allocator.free(result.stderr);
+        a.allocator.free(run.stdout);
+        a.allocator.free(run.stderr);
     }
-    const exit_ok = switch (result.term) {
+    result.ok = switch (run.term) {
         .exited => |code| code == 0,
         else => false,
     };
-    if (!exit_ok) return error.WacliFailed;
-    return std.json.parseFromSlice(std.json.Value, a.allocator, result.stdout, .{});
+    if (result.ok) {
+        result.data = a.allocator.dupe(u8, run.stdout) catch blk: {
+            result.ok = false;
+            break :blk &.{};
+        };
+    }
+    wacliPost(a, result);
 }
 
-fn runWacliExclusive(a: *App, argv: []const []const u8) !std.json.Parsed(std.json.Value) {
-    stopSync(a);
-    defer if (a.media_child == null) startSync(a);
-    return runWacli(a, argv);
+fn wacliPost(a: *App, result: *WacliResult) void {
+    const hwnd = a.hwnd orelse {
+        wacliDiscard(a, result);
+        return;
+    };
+    if (win.PostMessageW(hwnd, wm_wacli_done, 0, @bitCast(@intFromPtr(result))) == 0) wacliDiscard(a, result);
+}
+
+// Terminal path for a result the UI will never see: free it and release its
+// pending slot so a lost result cannot wedge live sync or a refresh.
+fn wacliDiscard(a: *App, result: *WacliResult) void {
+    const kind = result.kind;
+    if (result.data.len > 0) a.allocator.free(result.data);
+    a.allocator.destroy(result);
+    wacliPendingSub(a, kind);
+}
+
+fn msgCacheGet(a: *App, jid: []const u8) ?[]const u8 {
+    for (a.msg_cache[0..a.msg_cache_len]) |*entry| {
+        if (std.mem.eql(u8, entry.jid.slice(), jid)) return entry.data;
+    }
+    return null;
+}
+
+fn msgCacheStore(a: *App, jid: []const u8, data: []const u8) void {
+    if (data.len == 0 or data.len > msg_cache_max_bytes) return;
+    const copy = a.allocator.dupe(u8, data) catch return;
+    var slot: ?usize = null;
+    for (a.msg_cache[0..a.msg_cache_len], 0..) |*entry, index| {
+        if (std.mem.eql(u8, entry.jid.slice(), jid)) {
+            slot = index;
+            break;
+        }
+    }
+    if (slot == null and a.msg_cache_len < a.msg_cache.len) {
+        a.msg_cache_len += 1;
+        slot = a.msg_cache_len - 1;
+    }
+    if (slot == null) {
+        if (a.msg_cache[0].data) |old| a.allocator.free(old);
+        var shift: usize = 0;
+        while (shift + 1 < a.msg_cache_len) : (shift += 1) a.msg_cache[shift] = a.msg_cache[shift + 1];
+        // The shift copied the last slot's pointer into len-2; clear it here
+        // so the reuse below cannot free the same pointer twice.
+        a.msg_cache[a.msg_cache_len - 1].data = null;
+        slot = a.msg_cache_len - 1;
+    }
+    const entry = &a.msg_cache[slot.?];
+    if (entry.data) |old| a.allocator.free(old);
+    entry.jid.set(jid);
+    entry.data = copy;
 }
 
 fn timestampPart(timestamp: []const u8, start: usize, length: usize) ?u16 {
@@ -667,8 +897,14 @@ fn groupName(a: *const App, jid: []const u8) ?[]const u8 {
 }
 
 fn refreshGroups(a: *App) void {
-    const args = [_][]const u8{ a.wacli_path, "--json", "--read-only", "groups", "list", "--limit", "1000" };
-    var parsed = runWacli(a, &args) catch return;
+    if (wacliPendingGet(a, .groups) > 0) return;
+    var job = WacliJob{ .kind = .groups };
+    wacliJobArgs(&job, &.{ a.wacli_path, "--json", "--read-only", "groups", "list", "--limit", "1000" });
+    wacliEnqueue(a, job, false);
+}
+
+fn applyGroups(a: *App, raw: []const u8) void {
+    var parsed = std.json.parseFromSlice(std.json.Value, a.allocator, raw, .{}) catch return;
     defer parsed.deinit();
     const root = switch (parsed.value) {
         .object => |object| object,
@@ -696,34 +932,46 @@ fn refreshGroups(a: *App) void {
 }
 
 fn refreshChats(a: *App) void {
+    const flags: u8 = (if (a.unread_only) @as(u8, 1) else 0) | (if (a.show_archived) @as(u8, 2) else 0);
+    // Skip only while an identical job is already queued; a queued job built
+    // with different archive/unread flags is superseded by an urgent re-read.
+    if (wacliPendingGet(a, .chats) > 0 and a.chats_pending_flags == flags) return;
+    var job = WacliJob{ .kind = .chats };
+    wacliJobArgs(&job, &.{
+        a.wacli_path,                                           "--json", "--read-only", "chats", "list", "--limit", "250",
+        if (a.show_archived) "--archived" else "--no-archived",
+    });
+    if (a.unread_only) {
+        // One extra slot; the base list leaves room for it.
+        job.args[job.arg_count].set("--unread");
+        job.arg_count += 1;
+    }
+    a.chats_gen += 1;
+    job.gen = a.chats_gen;
+    wacliEnqueue(a, job, wacliPendingGet(a, .chats) > 0);
+    a.chats_pending_flags = flags;
+}
+
+fn applyChats(a: *App, raw: []const u8) void {
     var query_wide: [256]u16 = [_]u16{0} ** 256;
     const query_len = if (a.search) |search| @as(usize, @intCast(win.GetWindowTextW(search, &query_wide, query_wide.len))) else 0;
     const query_utf8 = if (query_len > 0) std.unicode.utf16LeToUtf8Alloc(a.allocator, query_wide[0..query_len]) catch null else null;
     defer if (query_utf8) |query| a.allocator.free(query);
 
-    var args: [12][]const u8 = undefined;
-    var count: usize = 0;
-    args[count] = a.wacli_path;
-    count += 1;
-    args[count] = "--json";
-    count += 1;
-    args[count] = "--read-only";
-    count += 1;
-    args[count] = "chats";
-    count += 1;
-    args[count] = "list";
-    count += 1;
-    args[count] = "--limit";
-    count += 1;
-    args[count] = "250";
-    count += 1;
-    args[count] = if (a.show_archived) "--archived" else "--no-archived";
-    count += 1;
-    if (a.unread_only) {
-        args[count] = "--unread";
-        count += 1;
-    }
-
+    var parsed = std.json.parseFromSlice(std.json.Value, a.allocator, raw, .{}) catch {
+        setStatus(a, "Unable to read chats from wacli");
+        return;
+    };
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |o| o,
+        else => return,
+    };
+    const data_value = root.get("data") orelse return;
+    const data = switch (data_value) {
+        .array => |items| items,
+        else => return,
+    };
     var selected_jid: [192]u8 = [_]u8{0} ** 192;
     var selected_len: usize = 0;
     if (a.selected_chat < a.chat_count) {
@@ -747,21 +995,6 @@ fn refreshChats(a: *App) void {
             }
         }
     }
-
-    var parsed = runWacli(a, args[0..count]) catch {
-        setStatus(a, "Unable to read chats from wacli");
-        return;
-    };
-    defer parsed.deinit();
-    const root = switch (parsed.value) {
-        .object => |o| o,
-        else => return,
-    };
-    const data_value = root.get("data") orelse return;
-    const data = switch (data_value) {
-        .array => |items| items,
-        else => return,
-    };
     a.chat_count = 0;
     for (data.items) |item| {
         if (a.chat_count >= max_chats) break;
@@ -2141,14 +2374,25 @@ fn refreshMessages(a: *App) void {
     const chat = &a.chats[a.selected_chat];
     const chat_changed = !std.mem.eql(u8, a.displayed_jid.slice(), chat.jid.slice());
     if (chat_changed) stopAudio(a);
-    const args = [_][]const u8{
+    // Instant first paint: render the chat's last known response from the
+    // cache while the fresh read runs in the worker. Only the fresh result
+    // (final) runs mark-as-read.
+    if (msgCacheGet(a, chat.jid.slice())) |cached| applyMessageData(a, cached, false);
+    a.messages_gen += 1;
+    var job = WacliJob{ .kind = .messages, .gen = a.messages_gen };
+    job.jid.set(chat.jid.slice());
+    wacliJobArgs(&job, &.{
         a.wacli_path, "--json", "--read-only", "messages", "list", "--chat", chat.jid.slice(), "--limit", "80",
-    };
-    var parsed = runWacli(a, &args) catch {
-        setStatus(a, "Unable to read messages from wacli");
-        return;
-    };
+    });
+    wacliEnqueue(a, job, true);
+}
+
+fn applyMessageData(a: *App, raw: []const u8, final: bool) void {
+    var parsed = std.json.parseFromSlice(std.json.Value, a.allocator, raw, .{}) catch return;
     defer parsed.deinit();
+    if (a.chat_count == 0 or a.selected_chat >= a.chat_count) return;
+    const chat = &a.chats[a.selected_chat];
+    const chat_changed = !std.mem.eql(u8, a.displayed_jid.slice(), chat.jid.slice());
     const root = switch (parsed.value) {
         .object => |o| o,
         else => return,
@@ -2229,9 +2473,11 @@ fn refreshMessages(a: *App) void {
     // every time background refreshes redrew the conversation.
     if (chat_changed) a.scroll_y = 0;
     a.displayed_jid.set(chat.jid.slice());
-    a.displayed_timestamp.set(chat.timestamp.slice());
+    // Only a fresh result marks the view current: a cached paint must keep
+    // the old timestamp so a later store change still triggers a real read.
+    if (final) a.displayed_timestamp.set(chat.timestamp.slice());
     if (a.canvas) |canvas| _ = win.InvalidateRect(canvas, null, win.TRUE);
-    markChatRead(a);
+    if (final) markChatRead(a);
 }
 
 fn startSync(a: *App) void {
@@ -2240,7 +2486,8 @@ fn startSync(a: *App) void {
     // sync once the last job finishes.
     if (a.sync_child != null or a.read_child != null or a.pending_read_count > 0 or
         a.media_child != null or a.send_child != null or a.pending_send_count > 0 or
-        a.archive_child != null or a.pending_archive_count > 0 or avatarBusy(a)) return;
+        a.archive_child != null or a.pending_archive_count > 0 or avatarBusy(a) or
+        wacliPendingGet(a, .reaction) > 0) return;
     const child = std.process.spawn(a.io, .{
         .argv = &.{ a.wacli_path, "--events", "sync", "--follow", "--max-reconnect", "0", "--stale-threshold", "1m", "--refresh-contacts", "--refresh-groups", "--download-media" },
         .stdin = .ignore,
@@ -2748,14 +2995,33 @@ fn reactToSelected(a: *App, command: u16) void {
         count += 1;
     }
     setStatus(a, if (emoji.len == 0) "Removing reaction..." else "Adding reaction...");
-    var parsed = runWacliExclusive(a, args[0..count]) catch {
+    // Pause live sync on the UI thread before the worker spawns the write;
+    // the worker cannot touch the sync child itself.
+    stopSync(a);
+    var job = WacliJob{ .kind = .reaction };
+    job.jid.set(chat.jid.slice());
+    job.msg_id.set(message.id.slice());
+    job.extra.set(emoji);
+    wacliJobArgs(&job, args[0..count]);
+    // FIFO, not urgent: two quick reactions (add then remove) must reach the
+    // server in the order the user made them.
+    wacliEnqueue(a, job, false);
+}
+
+fn applyReaction(a: *App, result: *WacliResult) void {
+    defer if (a.media_child == null) startSync(a);
+    if (!result.ok) {
         setStatus(a, "Reaction failed");
         return;
-    };
-    parsed.deinit();
-    message.reaction.set(a.allocator, emoji);
+    }
+    for (a.messages[0..a.message_count]) |*message| {
+        if (std.mem.eql(u8, message.id.slice(), result.msg_id.slice())) {
+            message.reaction.set(a.allocator, result.extra.slice());
+            break;
+        }
+    }
     if (a.canvas) |canvas| _ = win.InvalidateRect(canvas, null, win.TRUE);
-    setStatus(a, if (emoji.len == 0) "Reaction removed" else "Reaction sent");
+    setStatus(a, if (result.extra.len == 0) "Reaction removed" else "Reaction sent");
 }
 
 fn insertEmoji(a: *App, emoji: []const u8) void {
@@ -4499,6 +4765,39 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
             }
             return 0;
         },
+        wm_wacli_done => {
+            const result: *WacliResult = @ptrFromInt(@as(usize, @bitCast(lparam)));
+            defer {
+                if (result.data.len > 0) a.allocator.free(result.data);
+                a.allocator.destroy(result);
+            }
+            wacliPendingSub(a, result.kind);
+            switch (result.kind) {
+                .groups => if (result.ok) applyGroups(a, result.data),
+                .chats => {
+                    if (!result.ok) {
+                        setStatus(a, "Unable to read chats from wacli");
+                    } else if (result.gen == a.chats_gen) {
+                        // A queued job with older archive/unread flags must
+                        // not repaint over a newer one.
+                        applyChats(a, result.data);
+                    }
+                },
+                .messages => {
+                    if (!result.ok) {
+                        setStatus(a, "Unable to read messages from wacli");
+                    } else if (a.selected_chat < a.chat_count and
+                        std.mem.eql(u8, a.chats[a.selected_chat].jid.slice(), result.jid.slice()) and
+                        result.gen == a.messages_gen)
+                    {
+                        applyMessageData(a, result.data, true);
+                        msgCacheStore(a, result.jid.slice(), result.data);
+                    }
+                },
+                .reaction => applyReaction(a, result),
+            }
+            return 0;
+        },
         win.WM_CREATE => {
             a.hwnd = hwnd;
             a.brush_bg = win.CreateSolidBrush(color_bg);
@@ -4525,6 +4824,10 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
             _ = win.SetTimer(hwnd, timer_refresh, 1000, null);
             _ = win.SetTimer(hwnd, timer_animation, 120, null);
             _ = win.SetTimer(hwnd, timer_update_check, update_check_interval_ms, null);
+            if (a.wacli_thread == null) {
+                a.wacli_thread = std.Thread.spawn(.{ .stack_size = 1024 * 1024 }, wacliWorkerMain, .{a}) catch null;
+            }
+            if (a.wacli_thread == null) setStatus(a, "Background reader failed to start");
             refreshGroups(a);
             refreshChats(a);
             refreshMessages(a);
@@ -4738,6 +5041,7 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
             return 0;
         },
         win.WM_DESTROY => {
+            wacliShutdown(a);
             closePlayer(a);
             _ = win.KillTimer(hwnd, timer_refresh);
             _ = win.KillTimer(hwnd, timer_search);
