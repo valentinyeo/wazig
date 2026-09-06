@@ -98,6 +98,11 @@ const command_next_chat = 2035;
 const command_prev_chat = 2036;
 const command_send = 2037;
 const command_emoji = 2027;
+const command_accounts = 2038;
+const command_accounts_reconnect = 2039;
+const command_accounts_add = 2040;
+const command_accounts_remove = 2041;
+const command_accounts_remove_confirm = 2042;
 const reaction_like = 3001;
 const reaction_love = 3002;
 const reaction_laugh = 3003;
@@ -107,6 +112,7 @@ const reaction_thanks = 3006;
 const reaction_remove = 3007;
 const emoji_picker = @import("emoji_picker.zig");
 const emoji_draw = @import("emoji_draw.zig");
+const accounts = @import("accounts.zig");
 
 const color_bg = rgb(11, 20, 26);
 const color_panel = rgb(17, 27, 33);
@@ -405,6 +411,13 @@ const App = struct {
     font_emoji: ?win.HFONT = null,
     font_underline: ?win.HFONT = null,
     palette_links_mode: bool = false,
+    palette_accounts_mode: bool = false,
+    accounts_confirm_remove: bool = false,
+    // True after the WhatsApp data folder was moved aside: keeps checkSync
+    // from re-spawning a sync child against a store that no longer exists.
+    accounts_maintenance: bool = false,
+    last_refresh_unix: i64 = 0,
+    wacli_dir: Utf8Text(259) = .{},
     font_scale: i32 = 80,
     brush_bg: ?win.HBRUSH = null,
     brush_panel: ?win.HBRUSH = null,
@@ -1167,6 +1180,7 @@ fn applyChats(a: *App, raw: []const u8) void {
         }
     }
     a.chat_count = 0;
+    a.last_refresh_unix = nowUnixSeconds();
     for (data.items) |item| {
         if (a.chat_count >= max_chats) break;
         const object = switch (item) {
@@ -3194,6 +3208,11 @@ fn startSync(a: *App) void {
     // Hold off while any write job is pending: they pause live sync and
     // serialize on the store lock, so don't fight them. checkSync restarts
     // sync once the last job finishes.
+    if (a.accounts_maintenance) {
+        // Pairing (re)creates the store; sync resumes automatically then.
+        if (!whatsappStorePresent(a)) return;
+        a.accounts_maintenance = false;
+    }
     if (a.sync_child != null or a.read_child != null or a.pending_read_count > 0 or
         mediaBusy(a) or a.send_child != null or a.pending_send_count > 0 or
         a.archive_child != null or a.pending_archive_count > 0 or avatarBusy(a) or
@@ -4249,6 +4268,7 @@ fn buildPaletteItems(a: *App) void {
     appendPalette(a, "Remove reaction", "", reaction_remove);
     appendPalette(a, "Refresh", "R", command_refresh);
     appendPalette(a, "Restart live sync", "S", command_sync);
+    appendPalette(a, "Manage accounts", "", command_accounts);
     if (a.tg_auth == .ready) {
         appendPalette(a, "Log out of Telegram", "", command_telegram_logout);
     } else {
@@ -4349,6 +4369,7 @@ fn paletteMove(a: *App, delta: i32) void {
 }
 
 fn closePalette(a: *App) void {
+    a.accounts_confirm_remove = false;
     if (a.palette) |palette| {
         _ = win.DestroyWindow(palette);
     }
@@ -4370,6 +4391,7 @@ fn paletteActivate(a: *App) void {
     }
     const command = item.command;
     closePalette(a);
+    if (command == 0) return;
     runCommand(a, command);
 }
 
@@ -4379,6 +4401,7 @@ fn openPalette(a: *App) void {
         return;
     }
     a.palette_links_mode = false;
+    a.palette_accounts_mode = false;
     buildPaletteItems(a);
     showPaletteWindow(a);
 }
@@ -4389,6 +4412,7 @@ fn openLinkPalette(a: *App) void {
         return;
     }
     a.palette_links_mode = true;
+    a.palette_accounts_mode = false;
     buildLinkPaletteItems(a);
     if (a.palette_item_count == 0) {
         a.palette_links_mode = false;
@@ -4419,6 +4443,125 @@ fn buildLinkPaletteItems(a: *App) void {
             item.command = 0;
             a.palette_item_count += 1;
         }
+    }
+}
+
+fn whatsappStorePresent(a: *App) bool {
+    var db_buf: [280]u8 = undefined;
+    const db = std.fmt.bufPrint(&db_buf, "{s}\\wacli.db", .{a.wacli_dir.slice()}) catch return false;
+    const db_wide = std.unicode.utf8ToUtf16LeAllocZ(a.allocator, db) catch return false;
+    defer a.allocator.free(db_wide);
+    return win.GetFileAttributesW(db_wide.ptr) != win.INVALID_FILE_ATTRIBUTES;
+}
+
+fn openAccountsPalette(a: *App) void {
+    if (a.palette != null) {
+        closePalette(a);
+        return;
+    }
+    a.palette_links_mode = false;
+    a.palette_accounts_mode = true;
+    buildAccountsItems(a);
+    showPaletteWindow(a);
+}
+
+fn buildAccountsItems(a: *App) void {
+    a.palette_item_count = 0;
+    var line_buf: [128]u8 = undefined;
+    appendPalette(a, accounts.whatsappLabel(&line_buf, a.sync_child != null, a.last_refresh_unix), "", 0);
+    const store_present = whatsappStorePresent(a);
+    if (!store_present) {
+        appendPalette(a, "Add WhatsApp account (opens the pairing window)", "", command_accounts_add);
+    } else {
+        appendPalette(a, "Reconnect WhatsApp", "", command_accounts_reconnect);
+        if (a.accounts_confirm_remove) {
+            appendPalette(a, "Confirm: remove the WhatsApp account from this PC", "", command_accounts_remove_confirm);
+        } else {
+            appendPalette(a, "Remove WhatsApp account...", "", command_accounts_remove);
+        }
+    }
+    appendPalette(a, accounts.telegramLabel(a.tg_auth), "", 0);
+    if (a.tg_auth == .ready) {
+        appendPalette(a, "Log out of Telegram", "", command_telegram_logout);
+    } else {
+        appendPalette(a, "Add Telegram account", "", command_telegram_login);
+    }
+}
+
+// Removal moves the WhatsApp data folder aside instead of deleting it: one
+// rename either happens or not, and renaming it back undoes the removal.
+fn removeWhatsAppAccount(a: *App) void {
+    // Every wacli child holds a store lock; a folder rename would fail on it.
+    if (mediaBusy(a) or a.send_child != null or a.pending_send_count > 0 or
+        a.read_child != null or a.pending_read_count > 0 or
+        a.archive_child != null or a.pending_archive_count > 0 or avatarBusy(a) or
+        wacliPendingGet(a, .chats) > 0 or wacliPendingGet(a, .groups) > 0 or
+        wacliPendingGet(a, .messages) > 0 or wacliPendingGet(a, .reaction) > 0)
+    {
+        setStatus(a, "Wait for pending tasks to finish, then remove again");
+        return;
+    }
+    if (a.wacli_dir.len == 0) {
+        setStatus(a, "Could not locate the WhatsApp data folder");
+        return;
+    }
+    stopSync(a);
+    const dir_wide = utf8ToWide(a.allocator, a.wacli_dir.slice()) catch {
+        setStatus(a, "Could not locate the WhatsApp data folder");
+        return;
+    };
+    defer a.allocator.free(dir_wide);
+    var target_buf: [300]u8 = undefined;
+    const target = std.fmt.bufPrint(&target_buf, "{s}.old-{d}", .{ a.wacli_dir.slice(), nowUnixSeconds() }) catch {
+        setStatus(a, "Could not locate the WhatsApp data folder");
+        return;
+    };
+    const target_wide = utf8ToWide(a.allocator, target) catch {
+        setStatus(a, "Could not locate the WhatsApp data folder");
+        return;
+    };
+    defer a.allocator.free(target_wide);
+    const moved = win.MoveFileExW(dir_wide.ptr, target_wide.ptr, win.MOVEFILE_WRITE_THROUGH) != 0;
+    if (!moved) {
+        // stopSync is asynchronous: the wacli child may still hold the
+        // folder for a moment. Retrying is safe; nothing was changed.
+        setStatus(a, "WhatsApp is still closing - try Remove again in a few seconds");
+        return;
+    }
+    // Keep auto-reconnect off: the store is gone until pairing runs again.
+    a.accounts_maintenance = true;
+    a.chat_count = 0;
+    a.selected_chat = 0;
+    a.selected_message = null;
+    a.scroll_y = 0;
+    a.max_scroll = 0;
+    a.message_count = 0;
+    a.last_refresh_unix = 0;
+    if (a.canvas) |canvas| _ = win.InvalidateRect(canvas, null, win.TRUE);
+    // The data folder is renamed, not deleted, so removal can be undone by
+    // renaming it back; deleting it is a manual step.
+    setStatus(a, "WhatsApp signed out - its data was kept as a backup folder; pair again with Add account");
+}
+
+fn addWhatsAppAccount(a: *App) void {
+    const exe_wide = utf8ToWide(a.allocator, a.wacli_path) catch {
+        setStatus(a, "Could not open the pairing window");
+        return;
+    };
+    defer a.allocator.free(exe_wide);
+    var startup: win.STARTUPINFOW = std.mem.zeroes(win.STARTUPINFOW);
+    startup.cb = @sizeOf(win.STARTUPINFOW);
+    var process: win.PROCESS_INFORMATION = std.mem.zeroes(win.PROCESS_INFORMATION);
+    const create_new_console: win.DWORD = 0x00000010;
+    if (win.CreateProcessW(exe_wide.ptr, null, null, null, win.FALSE, create_new_console, null, null, &startup, &process) != 0) {
+        _ = win.CloseHandle(process.hProcess);
+        _ = win.CloseHandle(process.hThread);
+        // Gate sync off from here until pairing recreates the store:
+        // startSync clears the flag once wacli.db exists again.
+        a.accounts_maintenance = true;
+        setStatus(a, "Pairing window opened - scan the QR code there, then restart Messages");
+    } else {
+        setStatus(a, "Could not open the pairing window");
     }
 }
 
@@ -4453,7 +4596,8 @@ fn showPaletteWindow(a: *App) void {
     setFont(a.palette_edit, a.font);
     setFont(a.palette_list, a.font);
     if (a.palette_edit) |edit| {
-        _ = win.SendMessageW(edit, win.EM_SETCUEBANNER, 1, @bitCast(@intFromPtr(lit("Type a command"))));
+        const cue = if (a.palette_accounts_mode) lit("Accounts") else lit("Type a command");
+        _ = win.SendMessageW(edit, win.EM_SETCUEBANNER, 1, @bitCast(@intFromPtr(cue)));
     }
     if (a.palette_list) |list| _ = win.SendMessageW(list, win.LB_SETITEMHEIGHT, 0, palette_row_height);
     paletteFilter(a);
@@ -4707,6 +4851,20 @@ fn runCommand(a: *App, command: u16) void {
             setStatus(a, "Jumped to latest message");
         },
         command_links => openLinkPalette(a),
+        command_accounts => openAccountsPalette(a),
+        command_accounts_reconnect => {
+            stopSync(a);
+            startSync(a);
+        },
+        command_accounts_add => addWhatsAppAccount(a),
+        command_accounts_remove => {
+            a.accounts_confirm_remove = true;
+            openAccountsPalette(a);
+        },
+        command_accounts_remove_confirm => {
+            a.accounts_confirm_remove = false;
+            removeWhatsAppAccount(a);
+        },
         command_next_chat => {
             selectChat(a, 1, true);
             focusCompose(a);
@@ -6675,6 +6833,9 @@ pub fn main(init: std.process.Init) !void {
     defer init.gpa.free(avatar_dir);
     const store_watch_path = try createStoreWatchPath(init, init.gpa);
     defer init.gpa.free(store_watch_path);
+    // store_watch_path is <home>\.wacli\wacli.db-wal; the parent is the
+    // WhatsApp data folder that account removal moves aside.
+    const wacli_dir = std.fs.path.dirname(store_watch_path) orelse return error.MissingUserProfile;
     const deepgram_key = init.environ_map.get("DEEPGRAM_API_KEY") orelse "";
     var openrouter_key = init.environ_map.get("OPENROUTER_API_KEY") orelse "";
     if (openrouter_key.len == 0) {
@@ -6690,6 +6851,7 @@ pub fn main(init: std.process.Init) !void {
     }
     if (openrouter_model.len == 0) openrouter_model = "openai/gpt-5.6-luna";
     var app = App{ .allocator = init.gpa, .io = init.io, .instance = instance, .wacli_path = wacli_path, .avatar_dir = avatar_dir, .deepgram_configured = deepgram_key.len > 0, .deepgram_key = deepgram_key, .openrouter_key = openrouter_key, .openrouter_model = openrouter_model, .openrouter_configured = openrouter_key.len > 0, .dictation_language = loadDictationLanguage(), .font_scale = loadFontScale() };
+    app.wacli_dir.set(wacli_dir);
     loadEmojiRecents(&app);
     if (init.environ_map.get("LOCALAPPDATA")) |local| {
         if (std.fs.path.join(init.gpa, &.{ local, "Messages", "telegram" })) |telegram_dir| {
