@@ -2,6 +2,7 @@ const std = @import("std");
 const audio = @import("audio.zig");
 const avatar = @import("avatar.zig");
 const dictation = @import("dictation.zig");
+const played = @import("played.zig");
 
 const win = @cImport({
     @cDefine("WIN32_LEAN_AND_MEAN", "1");
@@ -293,6 +294,8 @@ const App = struct {
     audio_playing_id: Utf8Text(191) = .{},
     audio_position_ms: i64 = 0,
     audio_duration_ms: i64 = 0,
+    played_set: played.Set = .{},
+    played_path: []u8 = &.{},
     media_child: ?std.process.Child = null,
     send_child: ?std.process.Child = null,
     pending_sends: [max_pending_sends]PendingSend = [_]PendingSend{.{}} ** max_pending_sends,
@@ -732,6 +735,39 @@ fn isAudio(message: *const Message) bool {
     return std.ascii.eqlIgnoreCase(message.media_type.slice(), "audio");
 }
 
+fn findPlayedPath(init: std.process.Init, allocator: std.mem.Allocator) []u8 {
+    const local = init.environ_map.get("LOCALAPPDATA") orelse return &.{};
+    const dir = std.fs.path.join(allocator, &.{ local, "Messages" }) catch return &.{};
+    std.Io.Dir.createDirPath(.cwd(), init.io, dir) catch {};
+    const path = std.fs.path.join(allocator, &.{ dir, "played.txt" }) catch {
+        allocator.free(dir);
+        return &.{};
+    };
+    allocator.free(dir);
+    return path;
+}
+
+fn loadPlayed(a: *App) void {
+    if (a.played_path.len == 0) return;
+    const contents = std.Io.Dir.readFileAlloc(.cwd(), a.io, a.played_path, a.allocator, .limited(128 * 1024)) catch return;
+    defer a.allocator.free(contents);
+    a.played_set.load(contents);
+}
+
+fn markPlayed(a: *App, id: []const u8) void {
+    if (a.played_path.len == 0) return;
+    var line_buffer: [40]u8 = undefined;
+    const line = a.played_set.mark(id, &line_buffer) orelse return;
+    var contents = std.ArrayList(u8).empty;
+    defer contents.deinit(a.allocator);
+    if (std.Io.Dir.readFileAlloc(.cwd(), a.io, a.played_path, a.allocator, .limited(128 * 1024))) |existing| {
+        defer a.allocator.free(existing);
+        contents.appendSlice(a.allocator, existing) catch return;
+    } else |_| {}
+    contents.appendSlice(a.allocator, line) catch return;
+    std.Io.Dir.writeFile(.cwd(), a.io, .{ .sub_path = a.played_path, .data = contents.items }) catch return;
+}
+
 fn ensureAudioPlayer(a: *App) ?*audio.Player {
     if (a.audio_player) |player| return player;
     a.audio_player = audio.Player.create(a.allocator, a.io) catch null;
@@ -760,6 +796,7 @@ fn startAudioPlayback(a: *App, message: *Message) void {
     a.audio_state = .playing;
     a.audio_position_ms = 0;
     a.audio_duration_ms = 0;
+    markPlayed(a, message.id.slice());
     setStatus(a, "Playing voice message...");
 }
 
@@ -3250,6 +3287,12 @@ fn drawCanvas(hwnd: win.HWND, a: *App) void {
                     _ = win.DeleteObject(filled_brush);
                 }
                 _ = win.DeleteObject(track_brush);
+                if (!active and a.played_set.wasPlayed(message.id.slice())) {
+                    _ = win.SelectObject(hdc, @ptrCast(a.font_small.?));
+                    _ = win.SetTextColor(hdc, color_muted);
+                    var played_rect = win.RECT{ .left = right - 60, .top = strip_top, .right = right - 10, .bottom = strip_top + 42 };
+                    _ = win.DrawTextW(hdc, lit("✓ played"), -1, &played_rect, win.DT_RIGHT | win.DT_SINGLELINE | win.DT_VCENTER);
+                }
                 if (active and a.audio_duration_ms > 0) {
                     var time_buffer: [24]u8 = undefined;
                     var position_buffer: [16]u8 = undefined;
@@ -3933,6 +3976,8 @@ pub fn main(init: std.process.Init) !void {
     }
     if (openrouter_model.len == 0) openrouter_model = "openai/gpt-5.6-luna";
     var app = App{ .allocator = init.gpa, .io = init.io, .instance = instance, .wacli_path = wacli_path, .avatar_dir = avatar_dir, .deepgram_configured = deepgram_key.len > 0, .deepgram_key = deepgram_key, .openrouter_key = openrouter_key, .openrouter_model = openrouter_model, .openrouter_configured = openrouter_key.len > 0, .dictation_language = loadDictationLanguage(), .font_scale = loadFontScale() };
+    app.played_path = findPlayedPath(init, init.gpa);
+    loadPlayed(&app);
     app.store_watch_path.set(init.gpa, store_watch_path);
     app_ptr = &app;
     defer app_ptr = null;

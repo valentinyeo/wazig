@@ -38,7 +38,7 @@ pub fn build(b: *std.Build) void {
 
     // Tests live in Windows-free modules so they run on any host.
     const test_step = b.step("test", "Run unit tests");
-    for ([_][]const u8{ "src/emoji_picker.zig", "src/update.zig" }) |test_root| {
+    for ([_][]const u8{ "src/emoji_picker.zig", "src/update.zig", "src/played.zig" }) |test_root| {
         const tests = b.addTest(.{
             .root_module = b.createModule(.{
                 .root_source_file = b.path(test_root),
