@@ -13,15 +13,15 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-      - uses: mlugg/setup-zig@v2
+      # Third-party action in the release pipeline: pinned to a full commit SHA.
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: 0.16.0
       - name: Check tag shape
         run: |
-          case "${GITHUB_REF_NAME}" in
-            v[0-9]*.[0-9]*.[0-9]*) ;;
-            *) echo "tag ${GITHUB_REF_NAME} is not vX.Y.Z" >&2; exit 1 ;;
-          esac
+          if ! [[ "${GITHUB_REF_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "tag ${GITHUB_REF_NAME} is not vX.Y.Z" >&2; exit 1
+          fi
       - name: Build
         run: zig build -Dtarget=x86_64-windows-gnu --release=small -Dversion="${GITHUB_REF_NAME#v}"
       - name: Package zip
@@ -107,6 +107,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           # Re-run safe: first create publishes with assets attached (atomic);
-          # on a re-run create fails because the release exists, so clobber-upload instead.
-          gh release create "${GITHUB_REF_NAME}" Messages-*.zip Messages-*.msi SHA256SUMS.txt --repo "${GITHUB_REPOSITORY}" --verify-tag --generate-notes \
-            || gh release upload "${GITHUB_REF_NAME}" Messages-*.zip Messages-*.msi SHA256SUMS.txt --repo "${GITHUB_REPOSITORY}" --clobber
+          # a re-run finds the release already there and clobber-uploads instead.
+          if gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release upload "${GITHUB_REF_NAME}" Messages-*.zip Messages-*.msi SHA256SUMS.txt --repo "${GITHUB_REPOSITORY}" --clobber
+          else
+            gh release create "${GITHUB_REF_NAME}" Messages-*.zip Messages-*.msi SHA256SUMS.txt --repo "${GITHUB_REPOSITORY}" --verify-tag --generate-notes
+          fi
