@@ -247,6 +247,7 @@ const App = struct {
     palette: ?win.HWND = null,
     palette_edit: ?win.HWND = null,
     palette_list: ?win.HWND = null,
+    tooltips: ?win.HWND = null,
     palette_items: [max_palette_items]PaletteItem = [_]PaletteItem{.{}} ** max_palette_items,
     palette_item_count: usize = 0,
     palette_matches: [max_palette_items]usize = [_]usize{0} ** max_palette_items,
@@ -363,6 +364,45 @@ fn setFont(hwnd: ?win.HWND, font: ?win.HFONT) void {
     if (hwnd) |window| {
         _ = win.SendMessageW(window, win.WM_SETFONT, if (font) |value| @intFromPtr(value) else 0, 1);
     }
+}
+
+fn addTooltip(tt: win.HWND, tool: ?win.HWND, text: [*:0]const u16) void {
+    const target = tool orelse return;
+    var info = win.TOOLINFOW{
+        .cbSize = @sizeOf(win.TOOLINFOW),
+        .uFlags = win.TTF_IDISHWND | win.TTF_SUBCLASS,
+        .hwnd = win.GetParent(target),
+        .uId = @intFromPtr(target),
+        .lpszText = @constCast(text),
+    };
+    _ = win.SendMessageW(tt, win.TTM_ADDTOOLW, 0, @as(win.LPARAM, @bitCast(@intFromPtr(&info))));
+}
+
+fn createTooltips(a: *App, hwnd: win.HWND) void {
+    const tt = win.CreateWindowExW(
+        win.WS_EX_TOPMOST,
+        lit("tooltips_class32"),
+        null,
+        win.WS_POPUP | win.TTS_NOPREFIX,
+        0,
+        0,
+        0,
+        0,
+        hwnd,
+        null,
+        a.instance,
+        null,
+    ) orelse return;
+    a.tooltips = tt;
+    // TTM_SETMAXWIDTH (WM_USER + 24); not exposed by the commctrl.h import
+    _ = win.SendMessageW(tt, 0x400 + 24, 0, 300);
+    addTooltip(tt, a.search, lit("Search chats  Ctrl+F or /"));
+    addTooltip(tt, a.chats_hwnd, lit("Chats  ↑/↓ or J/K move · Enter to compose"));
+    addTooltip(tt, a.canvas, lit("Messages  Alt+J/K pick · Ctrl+T transcript · Ctrl+P voice · Ctrl+R react"));
+    addTooltip(tt, a.compose, lit("Message box  Enter sends · Shift+Enter new line"));
+    addTooltip(tt, a.dictate, lit("Dictate  Ctrl+D"));
+    addTooltip(tt, a.send, lit("Send message  Enter"));
+    addTooltip(tt, a.emoji_btn, lit("Emoji menu"));
 }
 
 fn loadRegistryString(allocator: std.mem.Allocator, name: [*:0]const u16) ?[]const u8 {
@@ -3600,6 +3640,7 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
             a.emoji_btn = win.CreateWindowExW(0, lit("BUTTON"), lit("😊"), win.WS_CHILD | win.WS_VISIBLE | win.WS_TABSTOP | win.BS_PUSHBUTTON, 0, 0, 0, 0, hwnd, controlId(id_emoji), a.instance, null);
             a.status = win.CreateWindowExW(0, lit("STATIC"), lit("Loading..."), win.WS_CHILD | win.WS_VISIBLE | win.SS_LEFT, 0, 0, 0, 0, hwnd, controlId(id_status), a.instance, null);
             recreateFonts(a);
+            createTooltips(a, hwnd);
             if (a.search) |search| _ = win.SendMessageW(search, win.EM_SETCUEBANNER, 1, @bitCast(@intFromPtr(lit("Search chats  Ctrl+F"))));
             if (a.chats_hwnd) |list| _ = win.SendMessageW(list, win.LB_SETITEMHEIGHT, 0, 64);
             _ = win.SetTimer(hwnd, timer_refresh, 1000, null);
