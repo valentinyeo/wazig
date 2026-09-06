@@ -40,7 +40,12 @@ jobs:
           mkdir -p "$P" /tmp/tdlib-install
           git clone --depth 1 --branch v1.3.1 https://github.com/madler/zlib.git /tmp/zlibsrc
           (cd /tmp/zlibsrc && CC=x86_64-w64-mingw32-gcc ./configure --static --prefix="$P" && make -j$(nproc) install)
-          git clone --depth 1 --branch openssl-3.3.2 https://github.com/openssl/openssl.git /tmp/opensslsrc
+          # Integrity: this tarball is statically linked into the shipped binary; pin the
+          # sha256 published on the official openssl-3.3.2 GitHub release.
+          echo '2e8a40b01979afe8be0bbfb3de5dc1c6709fedb46d6c89c10da114ab5fc3d281  /tmp/openssl.tar.gz' > /tmp/openssl.sha256
+          curl -fsSL --retry 3 --connect-timeout 30 --max-time 600 -o /tmp/openssl.tar.gz https://github.com/openssl/openssl/releases/download/openssl-3.3.2/openssl-3.3.2.tar.gz
+          sha256sum -c /tmp/openssl.sha256
+          mkdir -p /tmp/opensslsrc && tar -C /tmp/opensslsrc --strip-components=1 -xzf /tmp/openssl.tar.gz
           (cd /tmp/opensslsrc && ./Configure mingw64 no-asm no-shared no-tests no-docs --libdir=lib --prefix="$P" --cross-compile-prefix=x86_64-w64-mingw32- && make -j1 -s install_sw)
           cp -n "$P/lib64"/*.a "$P/lib/" 2>/dev/null || true
           git clone https://github.com/tdlib/td.git /tmp/tdsrc
