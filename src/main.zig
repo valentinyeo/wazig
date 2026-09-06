@@ -793,9 +793,11 @@ fn refreshChats(a: *App) void {
             }
             if (restore_top >= 0) {
                 const clamped = @min(restore_top, @as(i32, @intCast(a.chat_count)) - 1);
+                // Selection first: LB_SETCURSEL scrolls to the selection, and
+                // the top-index restore below must have the final say.
+                _ = win.SendMessageW(list, win.LB_SETCURSEL, a.selected_chat, 0);
                 _ = win.SendMessageW(list, win.LB_SETTOPINDEX, @intCast(clamped), 0);
-            }
-            _ = win.SendMessageW(list, win.LB_SETCURSEL, a.selected_chat, 0);
+            } else _ = win.SendMessageW(list, win.LB_SETCURSEL, a.selected_chat, 0);
         }
         _ = win.SendMessageW(list, win.WM_SETREDRAW, 1, 0);
         _ = win.InvalidateRect(list, null, win.TRUE);
