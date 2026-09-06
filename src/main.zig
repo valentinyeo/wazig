@@ -2567,7 +2567,7 @@ fn handleCanvasClick(a: *App, hwnd: win.HWND, x: i32, y: i32) void {
                 downloadMedia(a, index, false);
             } else if (isAudio(item)) {
                 handleAudioClick(a, item, x);
-            } else if (isVideo(item)) {
+            } else if (std.ascii.eqlIgnoreCase(item.media_type.slice(), "video")) {
                 playVideoInline(a, item);
             } else if (!isGif(item)) {
                 // GIFs already animate in place; popping them out to
@@ -3214,7 +3214,7 @@ fn runCommand(a: *App, command: u16) void {
             };
             if (selected >= a.message_count) return;
             const message = &a.messages[selected];
-            if (!isVideo(message)) {
+            if (!std.ascii.eqlIgnoreCase(message.media_type.slice(), "video")) {
                 setStatus(a, "Select a video first");
                 return;
             }
