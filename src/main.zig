@@ -1557,15 +1557,10 @@ fn playerCallbackRelease(_: [*c]win.IMFPMediaPlayerCallback) callconv(.c) win.UL
 }
 
 fn playerCallbackEvent(_: [*c]win.IMFPMediaPlayerCallback, event: [*c]win.MFP_EVENT_HEADER) callconv(.c) void {
-    if (event == null) return;
-    if (event.*.eEventType == win.MFP_EVENT_TYPE_ERROR) {
-        // This callback runs on an MFPlay worker thread; PostMessageW is the
-        // only thread-safe way to reach the window (a direct SetWindowTextW
-        // would block on the UI thread's message pump).
-        if (app_ptr) |a| {
-            if (a.player_window) |hwnd| _ = win.PostMessageW(hwnd, win.WM_CLOSE, 0, 0);
-        }
-    }
+    // Runs on an MFPlay worker thread; deliberately touches no window state
+    // to avoid cross-thread races. On playback failure the window simply
+    // stops and the user closes it with Esc or the close button.
+    _ = event;
 }
 
 var player_callback = win.IMFPMediaPlayerCallback{ .lpVtbl = &player_callback_vtable };
@@ -1599,6 +1594,10 @@ fn playerProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win
                 closePlayer(a);
                 return 0;
             }
+        },
+        win.WM_SIZE, win.WM_PAINT => {
+            // MFPlay does not move or redraw its video surface on its own.
+            if (a.mf_player) |player| _ = player.lpVtbl.*.UpdateVideo.?(player);
         },
         win.WM_CLOSE => {
             closePlayer(a);
