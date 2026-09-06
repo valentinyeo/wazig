@@ -98,6 +98,8 @@ pub fn build(b: *std.Build) void {
         "winhttp",
         "urlmon",
         "msimg32",
+        "d2d1",
+        "dwrite",
     }) |library| {
         exe.root_module.linkSystemLibrary(library, .{});
     }
