@@ -1558,6 +1558,7 @@ fn checkMarkRead(a: *App) void {
         // write job is running.
         startNextSend(a);
         startNextArchive(a);
+        drainMediaDownloads(a);
         startSync(a);
         refreshChats(a);
         setStatus(a, if (code == 0) "Chat marked as read" else "Mark as read failed");
@@ -2313,12 +2314,12 @@ fn isDownloadableMedia(message: *const Message) bool {
         std.ascii.eqlIgnoreCase(message.media_type.slice(), "document");
 }
 
-fn autoDownloadNextMedia(a: *App) void {
+fn autoDownloadNextMedia(a: *App) bool {
     // Slots full: the next finished download re-enters here from the timer.
-    if (freeMediaSlot(a) == null) return;
+    if (freeMediaSlot(a) == null) return false;
     // Failure cooldown: give transient store-lock or network failures time
     // to clear before trying again.
-    if (win.GetTickCount64() < a.media_retry_after_ms) return;
+    if (win.GetTickCount64() < a.media_retry_after_ms) return false;
     // Newest first: the media the user is looking at arrives first.
     var index = a.message_count;
     while (index > 0) {
@@ -2335,8 +2336,18 @@ fn autoDownloadNextMedia(a: *App) void {
         // click bypasses this, so a lost file is still recoverable.
         if (mediaWasFetched(a, a.chats[a.selected_chat].jid.slice(), message.id.slice())) continue;
         downloadMedia(a, index, true);
-        return;
+        return true;
     }
+    return false;
+}
+
+// One stopSync/startSync per media burst, not per wave of downloads: refill
+// the freed slots from the chat's own missing-media scan first; startSync
+// skips itself while any slot is still busy, so live sync only comes back
+// once the burst has nothing left to download.
+fn drainMediaDownloads(a: *App) void {
+    retryPendingDownload(a);
+    while (freeMediaSlot(a) != null and autoDownloadNextMedia(a)) {}
 }
 
 fn ensureAvatarSession(a: *App) ?*avatar.Session {
@@ -2728,6 +2739,7 @@ fn checkMediaDownload(a: *App) void {
     // worker (never the UI thread); its --read-only query may wait on the
     // store lock behind live downloads, which is fine for a worker call.
     if (finished_ok + finished_failed > 0) {
+        drainMediaDownloads(a);
         startSync(a);
         refreshMessages(a);
         if (a.audio_chain_waiting and chain_slot_done) {
@@ -3182,7 +3194,10 @@ fn startNextSend(a: *App) void {
     }) catch {
         removeFirstPendingSend(a);
         setStatus(a, "Could not start queued send");
-        if (a.pending_send_count > 0) startNextSend(a) else startSync(a);
+        if (a.pending_send_count > 0) startNextSend(a) else {
+            drainMediaDownloads(a);
+            startSync(a);
+        }
         return;
     };
     a.send_child = child;
@@ -3202,6 +3217,7 @@ fn checkSend(a: *App) void {
         if (a.pending_send_count > 0) {
             startNextSend(a);
         } else {
+            drainMediaDownloads(a);
             startSync(a);
             refreshChats(a);
             refreshMessages(a);
@@ -3756,6 +3772,7 @@ fn checkArchive(a: *App) void {
         if (a.pending_archive_count > 0) {
             startNextArchive(a);
         } else {
+            drainMediaDownloads(a);
             startSync(a);
             refreshChats(a);
             refreshMessages(a);
@@ -5668,7 +5685,7 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
                 // attachments older than the cutoff, so without this it
                 // could never start.
                 retryPendingDownload(a);
-                autoDownloadNextMedia(a);
+                _ = autoDownloadNextMedia(a);
                 requestAvatar(a, a.selected_chat);
             } else if (wparam == timer_search) {
                 _ = win.KillTimer(hwnd, timer_search);
