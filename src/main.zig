@@ -373,6 +373,8 @@ const App = struct {
     send: ?win.HWND = null,
     emoji_btn: ?win.HWND = null,
     dictate: ?win.HWND = null,
+    btn_hover: [3]bool = .{ false, false, false },
+    btn_prev_proc: [3]usize = .{ 0, 0, 0 },
     tooltips: ?win.HWND = null,
     status: ?win.HWND = null,
     palette: ?win.HWND = null,
@@ -533,6 +535,69 @@ fn controlId(id: usize) win.HMENU {
 fn winHandle(comptime Handle: type, value: usize) Handle {
     @setRuntimeSafety(false);
     return @ptrFromInt(value);
+}
+
+fn composerButtonProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.LPARAM) callconv(.winapi) win.LRESULT {
+    const a = app_ptr orelse return win.DefWindowProcW(hwnd, message, wparam, lparam);
+    const index: usize = @intCast(@as(usize, @bitCast(win.GetWindowLongPtrW(hwnd, win.GWLP_USERDATA))) - 1);
+    switch (message) {
+        win.WM_MOUSEMOVE => {
+            if (!a.btn_hover[index]) {
+                a.btn_hover[index] = true;
+                _ = win.InvalidateRect(hwnd, null, win.TRUE);
+            }
+            var track = win.TRACKMOUSEEVENT{ .cbSize = @sizeOf(win.TRACKMOUSEEVENT), .dwFlags = win.TME_LEAVE, .hwndTrack = hwnd, .dwHoverTime = 0 };
+            _ = win.TrackMouseEvent(&track);
+        },
+        win.WM_MOUSELEAVE => {
+            a.btn_hover[index] = false;
+            _ = win.InvalidateRect(hwnd, null, win.TRUE);
+        },
+        win.WM_SETFOCUS, win.WM_KILLFOCUS => {
+            _ = win.InvalidateRect(hwnd, null, win.TRUE);
+        },
+        else => {},
+    }
+    const prev = a.btn_prev_proc[index];
+    return win.CallWindowProcW(@ptrFromInt(prev), hwnd, message, wparam, lparam);
+}
+
+fn subclassComposerButton(a: *App, hwnd: ?win.HWND, index: usize) void {
+    const window = hwnd orelse return;
+    _ = win.SetWindowLongPtrW(window, win.GWLP_USERDATA, @intCast(index + 1));
+    const prev = win.SetWindowLongPtrW(window, win.GWLP_WNDPROC, @intCast(@intFromPtr(&composerButtonProc)));
+    a.btn_prev_proc[index] = @bitCast(prev);
+}
+
+fn drawComposerButton(a: *App, item: *win.DRAWITEMSTRUCT) void {
+    const index: usize = if (item.CtlID == id_dictate) 0 else if (item.CtlID == id_send) 1 else 2;
+    const pressed = (item.itemState & win.ODS_SELECTED) != 0;
+    const focused = (item.itemState & win.ODS_FOCUS) != 0;
+    const dictating = a.last_dictation_state == .recording or a.last_dictation_state == .transcribing;
+    // The strip behind the buttons is the main-window background; paint it so
+    // the rounded corners don't leave square artifacts.
+    _ = win.FillRect(item.hDC, &item.rcItem, a.brush_bg.?);
+    const face: win.COLORREF = if (pressed or (index == 0 and dictating)) color_outgoing else if (a.btn_hover[index]) color_selected else color_raised;
+    const radius: i32 = 10;
+    const rgn = win.CreateRoundRectRgn(item.rcItem.left, item.rcItem.top, item.rcItem.right + 1, item.rcItem.bottom + 1, radius, radius) orelse return;
+    defer _ = win.DeleteObject(rgn);
+    const brush = win.CreateSolidBrush(face) orelse return;
+    defer _ = win.DeleteObject(brush);
+    _ = win.FillRgn(item.hDC, rgn, brush);
+    if (focused) {
+        const accent = win.CreateSolidBrush(color_accent) orelse return;
+        defer _ = win.DeleteObject(accent);
+        _ = win.FrameRgn(item.hDC, rgn, accent, 1, 1);
+    }
+    var text_buffer: [32]u16 = undefined;
+    const text_len = win.GetWindowTextW(item.hwndItem, &text_buffer, text_buffer.len);
+    if (text_len > 0) {
+        _ = win.SetBkMode(item.hDC, win.TRANSPARENT);
+        _ = win.SetTextColor(item.hDC, if (index == 0 and dictating and !pressed) color_accent else color_text);
+        _ = win.SelectObject(item.hDC, @ptrCast(if (index == 2) a.font_emoji.? else a.font_bold.?));
+        var label_rect = item.rcItem;
+        _ = win.DrawTextW(item.hDC, &text_buffer, text_len, &label_rect, win.DT_CENTER | win.DT_SINGLELINE | win.DT_VCENTER);
+    }
 }
 
 fn setFont(hwnd: ?win.HWND, font: ?win.HFONT) void {
@@ -5491,9 +5556,12 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
             a.chats_hwnd = win.CreateWindowExW(0, lit("LISTBOX"), null, win.WS_CHILD | win.WS_VISIBLE | win.WS_TABSTOP | win.LBS_NOTIFY | win.LBS_OWNERDRAWFIXED | win.LBS_NOINTEGRALHEIGHT, 0, 0, 0, 0, hwnd, controlId(id_chats), a.instance, null);
             a.canvas = win.CreateWindowExW(0, lit("WacliMessageCanvas"), null, win.WS_CHILD | win.WS_VISIBLE | win.WS_TABSTOP, 0, 0, 0, 0, hwnd, controlId(id_canvas), a.instance, null);
             a.compose = win.CreateWindowExW(0, lit("EDIT"), null, win.WS_CHILD | win.WS_VISIBLE | win.WS_TABSTOP | win.ES_MULTILINE | win.ES_AUTOVSCROLL, 0, 0, 0, 0, hwnd, controlId(id_compose), a.instance, null);
-            a.dictate = win.CreateWindowExW(0, lit("BUTTON"), lit("Dictate"), win.WS_CHILD | win.WS_VISIBLE | win.WS_TABSTOP | win.BS_PUSHBUTTON, 0, 0, 0, 0, hwnd, controlId(id_dictate), a.instance, null);
-            a.send = win.CreateWindowExW(0, lit("BUTTON"), lit("Send"), win.WS_CHILD | win.WS_VISIBLE | win.WS_TABSTOP | win.BS_PUSHBUTTON, 0, 0, 0, 0, hwnd, controlId(id_send), a.instance, null);
-            a.emoji_btn = win.CreateWindowExW(0, lit("BUTTON"), lit("😊"), win.WS_CHILD | win.WS_VISIBLE | win.WS_TABSTOP | win.BS_PUSHBUTTON, 0, 0, 0, 0, hwnd, controlId(id_emoji), a.instance, null);
+            a.dictate = win.CreateWindowExW(0, lit("BUTTON"), lit("Dictate"), win.WS_CHILD | win.WS_VISIBLE | win.WS_TABSTOP | win.BS_OWNERDRAW, 0, 0, 0, 0, hwnd, controlId(id_dictate), a.instance, null);
+            a.send = win.CreateWindowExW(0, lit("BUTTON"), lit("Send"), win.WS_CHILD | win.WS_VISIBLE | win.WS_TABSTOP | win.BS_OWNERDRAW, 0, 0, 0, 0, hwnd, controlId(id_send), a.instance, null);
+            a.emoji_btn = win.CreateWindowExW(0, lit("BUTTON"), lit("😊"), win.WS_CHILD | win.WS_VISIBLE | win.WS_TABSTOP | win.BS_OWNERDRAW, 0, 0, 0, 0, hwnd, controlId(id_emoji), a.instance, null);
+            subclassComposerButton(a, a.dictate, 0);
+            subclassComposerButton(a, a.send, 1);
+            subclassComposerButton(a, a.emoji_btn, 2);
             a.status = win.CreateWindowExW(0, lit("STATIC"), lit("Loading..."), win.WS_CHILD | win.WS_VISIBLE | win.SS_LEFT, 0, 0, 0, 0, hwnd, controlId(id_status), a.instance, null);
             createTooltips(a, hwnd);
             recreateFonts(a);
@@ -5630,7 +5698,11 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
         },
         win.WM_DRAWITEM => {
             const item: *win.DRAWITEMSTRUCT = winHandle(*win.DRAWITEMSTRUCT, @as(usize, @bitCast(lparam)));
-            if (item.CtlID == id_chats) drawChat(a, item);
+            if (item.CtlID == id_chats) {
+                drawChat(a, item);
+            } else if (item.CtlID == id_dictate or item.CtlID == id_send or item.CtlID == id_emoji) {
+                drawComposerButton(a, item);
+            }
             return 1;
         },
         win.WM_COMMAND => {
