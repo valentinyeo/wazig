@@ -21,7 +21,14 @@ pub fn ageDays(timestamp: []const u8, now_unix: i64) ?i64 {
     const year = std.fmt.parseInt(i64, timestamp[0..4], 10) catch return null;
     const month = std.fmt.parseInt(i64, timestamp[5..7], 10) catch return null;
     const day = std.fmt.parseInt(i64, timestamp[8..10], 10) catch return null;
-    if (month < 1 or month > 12 or day < 1 or day > 31 or year <= 0) return null;
+    if (timestamp[4] != '-' or timestamp[7] != '-') return null;
+    if (month < 1 or month > 12 or year <= 0) return null;
+    const day_limit: i64 = switch (month) {
+        1, 3, 5, 7, 8, 10, 12 => 31,
+        4, 6, 9, 11 => 30,
+        else => if (@mod(year, 4) == 0 and (@mod(year, 100) != 0 or @mod(year, 400) == 0)) 29 else 28,
+    };
+    if (day < 1 or day > day_limit) return null;
     return @divTrunc(now_unix, 86400) - daysFromCivil(year, month, day);
 }
 
@@ -41,6 +48,10 @@ test "ageDays handles the epoch, leap years, and malformed input" {
     try std.testing.expectEqual(@as(?i64, null), ageDays("", 0));
     try std.testing.expectEqual(@as(?i64, null), ageDays("not-a-date", 0));
     try std.testing.expectEqual(@as(?i64, null), ageDays("2026-13-01T00:00:00", 0));
+    try std.testing.expectEqual(@as(?i64, null), ageDays("2026-02-30T00:00:00", 0));
+    try std.testing.expectEqual(@as(?i64, null), ageDays("2026/01/01T00:00:00", 0));
+    try std.testing.expectEqual(@as(?i64, null), ageDays("2026-02-29T00:00:00", 0)); // 2026 is not a leap year
+    try std.testing.expectEqual(@as(?i64, 0), ageDays("2024-02-29T00:00:00", 1709164800));
 }
 
 test "withinDays applies the cutoff and keeps unparseable timestamps" {
