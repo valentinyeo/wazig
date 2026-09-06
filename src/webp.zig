@@ -41,6 +41,9 @@ pub fn firstAnimationFrame(data: []const u8) ?[]const u8 {
             }
             return null;
         }
+        // Guard the advance: a hostile size value must not overflow a 32-bit
+        // usize; chunks larger than the buffer are invalid.
+        if (size > data.len - offset - 8) return null;
         offset += 8 + size + (size & 1);
     }
     return null;
