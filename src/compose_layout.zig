@@ -15,13 +15,13 @@ pub const Composer = struct {
     strip_height: i32,
 };
 
-/// The dragged height is a floor; content grows above it up to
-/// cap = max(default_max_height, dragged), and everything is clamped so the
-/// message pane keeps at least canvas_min_height.
 /// Extra vertical band reserved above the edit while a pasted image waits
 /// to be sent (WAZI-37).
 pub const preview_band: i32 = 54;
 
+/// The dragged height is a floor; content grows above it up to
+/// cap = max(default_max_height, dragged), and everything is clamped so the
+/// message pane keeps at least canvas_min_height.
 pub fn compute(dragged: i32, content_height: i32, client_height: i32, preview: bool) Composer {
     const band: i32 = if (preview) preview_band else 0;
     const cap: i32 = @max(default_max_height, dragged);

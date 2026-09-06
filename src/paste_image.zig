@@ -46,6 +46,12 @@ pub fn dibToBitmap(allocator: std.mem.Allocator, dib: []const u8) ?Bitmap {
     else if (bpp <= 8) @as(usize, 1) << @intCast(bpp) else 0;
     pixel_offset += palette_entries * 4;
 
+    // Bound the header-supplied dimensions before any multiplication: a
+    // malformed or hostile clipboard producer can claim sizes its payload
+    // can never satisfy, and the raw products can overflow usize.
+    if (width == 0 or height == 0) return null;
+    if (width > 1 << 15 or height > 1 << 15) return null;
+
     const stride: usize = ((@as(usize, @intCast(width)) * bpp + 31) / 32) * 4;
     if (bpp != 32 and bpp != 24) return null;
     const w: usize = @intCast(width);
