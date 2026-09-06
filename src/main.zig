@@ -4157,6 +4157,14 @@ fn bundledFilePath(comptime filename: []const u8) WideText(519) {
     return result;
 }
 
+// LoadImageW with the name argument passed as an integer (MAKEINTRESOURCE),
+// avoiding translate-c's aligned LPCWSTR pointer for resource ids.
+extern "user32" fn LoadImageW(instance: win.HINSTANCE, icon_name: usize, icon_type: u32, cx: i32, cy: i32, load_flags: u32) callconv(.c) win.HICON;
+
+fn LoadAppIcon(instance: win.HINSTANCE, cx: i32, cy: i32, flags: u32) win.HICON {
+    return LoadImageW(instance, 1, win.IMAGE_ICON, cx, cy, flags);
+}
+
 pub fn main(init: std.process.Init) !void {
     const instance = win.GetModuleHandleW(null) orelse return error.NoModuleHandle;
     const wacli_path = try findWacli(init, init.gpa);
@@ -4213,6 +4221,14 @@ pub fn main(init: std.process.Init) !void {
     _ = win.InitCommonControlsEx(&controls);
 
     const cursor = win.LoadCursorW(null, @ptrFromInt(32512));
+    // Resource id 1 in assets/app.rc; same icon serves the title bar and taskbar.
+    const icon_big = LoadAppIcon(instance, 0, 0, win.LR_DEFAULTSIZE | win.LR_SHARED);
+    const icon_small = LoadAppIcon(
+        instance,
+        win.GetSystemMetrics(win.SM_CXSMICON),
+        win.GetSystemMetrics(win.SM_CYSMICON),
+        win.LR_SHARED,
+    );
     var canvas_class = win.WNDCLASSEXW{
         .cbSize = @sizeOf(win.WNDCLASSEXW),
         .style = win.CS_HREDRAW | win.CS_VREDRAW,
@@ -4220,12 +4236,12 @@ pub fn main(init: std.process.Init) !void {
         .cbClsExtra = 0,
         .cbWndExtra = 0,
         .hInstance = instance,
-        .hIcon = null,
+        .hIcon = icon_big,
         .hCursor = cursor,
         .hbrBackground = null,
         .lpszMenuName = null,
         .lpszClassName = lit("WacliMessageCanvas"),
-        .hIconSm = null,
+        .hIconSm = icon_small,
     };
     if (win.RegisterClassExW(&canvas_class) == 0) return error.RegisterCanvasClassFailed;
 
@@ -4236,12 +4252,12 @@ pub fn main(init: std.process.Init) !void {
         .cbClsExtra = 0,
         .cbWndExtra = 0,
         .hInstance = instance,
-        .hIcon = null,
+        .hIcon = icon_big,
         .hCursor = cursor,
         .hbrBackground = null,
         .lpszMenuName = null,
         .lpszClassName = lit("MessagesZig"),
-        .hIconSm = null,
+        .hIconSm = icon_small,
     };
     if (win.RegisterClassExW(&main_class) == 0) return error.RegisterMainClassFailed;
 
@@ -4252,12 +4268,12 @@ pub fn main(init: std.process.Init) !void {
         .cbClsExtra = 0,
         .cbWndExtra = 0,
         .hInstance = instance,
-        .hIcon = null,
+        .hIcon = icon_big,
         .hCursor = cursor,
         .hbrBackground = null,
         .lpszMenuName = null,
         .lpszClassName = lit("MessagesPalette"),
-        .hIconSm = null,
+        .hIconSm = icon_small,
     };
     if (win.RegisterClassExW(&palette_class) == 0) return error.RegisterPaletteClassFailed;
 
