@@ -412,6 +412,7 @@ const App = struct {
     wacli_quit: bool = false,
     wacli_pending: [wacli_kind_count]u32 = [_]u32{0} ** wacli_kind_count,
     messages_gen: u64 = 0,
+    chats_gen: u64 = 0,
     chats_pending_flags: u8 = 0,
     msg_cache: [max_msg_cache]MsgCacheEntry = [_]MsgCacheEntry{.{}} ** max_msg_cache,
     msg_cache_len: usize = 0,
@@ -631,11 +632,16 @@ fn wacliJobArgs(job: *WacliJob, args: []const []const u8) void {
 fn wacliEnqueue(a: *App, job: WacliJob, urgent: bool) void {
     a.wacli_mutex.lockUncancelable(a.io);
     if (a.wacli_queue_len >= a.wacli_queue.len) {
-        // Superseded refreshes are droppable; reaction jobs never are.
+        // Superseded refreshes are droppable; reactions are dropped only as a
+        // last resort: the victim's pending count drops to zero, so the
+        // checkSync timer restarts live sync within a second either way.
         var victim: usize = 0;
         var index: usize = 0;
         while (index < a.wacli_queue_len) : (index += 1) {
-            if (a.wacli_queue[index].kind != .reaction) victim = index;
+            if (a.wacli_queue[index].kind != .reaction) {
+                victim = index;
+                break;
+            }
         }
         a.wacli_pending[@intFromEnum(a.wacli_queue[victim].kind)] -= 1;
         var shift = victim;
@@ -755,6 +761,9 @@ fn msgCacheStore(a: *App, jid: []const u8, data: []const u8) void {
         if (a.msg_cache[0].data) |old| a.allocator.free(old);
         var shift: usize = 0;
         while (shift + 1 < a.msg_cache_len) : (shift += 1) a.msg_cache[shift] = a.msg_cache[shift + 1];
+        // The shift copied the last slot's pointer into len-2; clear it here
+        // so the reuse below cannot free the same pointer twice.
+        a.msg_cache[a.msg_cache_len - 1].data = null;
         slot = a.msg_cache_len - 1;
     }
     const entry = &a.msg_cache[slot.?];
@@ -872,6 +881,8 @@ fn refreshChats(a: *App) void {
         job.args[job.arg_count].set("--unread");
         job.arg_count += 1;
     }
+    a.chats_gen += 1;
+    job.gen = a.chats_gen;
     wacliEnqueue(a, job, a.wacli_pending[chats_kind] > 0);
     a.chats_pending_flags = flags;
 }
@@ -4489,7 +4500,13 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
             switch (result.kind) {
                 .groups => if (result.ok) applyGroups(a, result.data),
                 .chats => {
-                    if (result.ok) applyChats(a, result.data) else setStatus(a, "Unable to read chats from wacli");
+                    if (!result.ok) {
+                        setStatus(a, "Unable to read chats from wacli");
+                    } else if (result.gen == a.chats_gen) {
+                        // A queued job with older archive/unread flags must
+                        // not repaint over a newer one.
+                        applyChats(a, result.data);
+                    }
                 },
                 .messages => {
                     if (!result.ok) {
