@@ -7,6 +7,7 @@ const played = @import("played.zig");
 const compose_layout = @import("compose_layout.zig");
 const media_age = @import("media_age.zig");
 const webp_detect = @import("webp.zig");
+const paste_image = @import("paste_image.zig");
 const scrollbar = @import("scrollbar.zig");
 
 const webp = @cImport({
@@ -208,6 +209,20 @@ const PendingSend = struct {
     text: Utf8Text(4095) = .{},
     reply_to: Utf8Text(191) = .{},
     reply_sender: Utf8Text(191) = .{},
+    // Paste-to-send (WAZI-37): when set, the queued send is
+    // `wacli send file --file <path>` with `text` as the caption.
+    file: Utf8Text(519) = .{},
+};
+
+// An image staged from the clipboard (WAZI-37): a PNG copy written to the
+// paste folder plus a small preview bitmap shown above the composer. Bound
+// to the chat JID it was pasted in so it can never send to the wrong chat.
+const StagedImage = struct {
+    jid: Utf8Text(191) = .{},
+    path: Utf8Text(519) = .{},
+    preview: ?win.HBITMAP = null,
+    preview_width: i32 = 0,
+    preview_height: i32 = 0,
 };
 
 const LinkSpan = struct {
@@ -478,6 +493,7 @@ const App = struct {
     send_child: ?std.process.Child = null,
     pending_sends: [max_pending_sends]PendingSend = [_]PendingSend{.{}} ** max_pending_sends,
     pending_send_count: usize = 0,
+    staged_image: StagedImage = .{},
     media_attempts: [512]u64 = [_]u64{0} ** 512,
     media_attempt_count: usize = 0,
     // After any failed download, auto-scanning pauses for 30s so a
@@ -3270,23 +3286,44 @@ fn setStatus(a: *App, text: []const u8) void {
 }
 
 fn removeFirstPendingSend(a: *App) void {
+    // Paste-to-send files live in the paste folder and are deleted once the
+    // queued send (or its spawn failure) finishes with them.
     if (a.pending_send_count == 0) return;
+    if (a.pending_sends[0].file.len > 0) deleteFileUtf8(a.pending_sends[0].file.slice());
     var index: usize = 1;
     while (index < a.pending_send_count) : (index += 1) {
         a.pending_sends[index - 1] = a.pending_sends[index];
     }
     a.pending_send_count -= 1;
+    a.pending_sends[a.pending_send_count] = .{};
 }
 
 fn startNextSend(a: *App) void {
     if (a.send_child != null or a.read_child != null or a.pending_send_count == 0) return;
     stopSync(a);
     const pending = &a.pending_sends[0];
-    var args: [14][]const u8 = undefined;
+    const is_file = pending.file.len > 0;
+    var args: [18][]const u8 = undefined;
     var count: usize = 0;
-    for ([_][]const u8{ a.wacli_path, "--json", "--lock-wait", "10s", "send", "text", "--to", pending.jid.slice(), "--message", pending.text.slice() }) |argument| {
+    args[count] = a.wacli_path;
+    count += 1;
+    for ([_][]const u8{ "--json", "--lock-wait", "10s", "send", if (is_file) "file" else "text", "--to", pending.jid.slice() }) |argument| {
         args[count] = argument;
         count += 1;
+    }
+    if (is_file) {
+        args[count] = "--file";
+        args[count + 1] = pending.file.slice();
+        count += 2;
+        if (pending.text.len > 0) {
+            args[count] = "--caption";
+            args[count + 1] = pending.text.slice();
+            count += 2;
+        }
+    } else {
+        args[count] = "--message";
+        args[count + 1] = pending.text.slice();
+        count += 2;
     }
     if (pending.reply_to.len > 0) {
         args[count] = "--reply-to";
@@ -3339,6 +3376,292 @@ fn checkSend(a: *App) void {
     }
 }
 
+fn deleteFileUtf8(path_utf8: []const u8) void {
+    const wide = std.unicode.utf8ToUtf16LeAllocZ(std.heap.page_allocator, path_utf8) catch return;
+    defer std.heap.page_allocator.free(wide);
+    _ = win.DeleteFileW(wide.ptr);
+}
+
+fn discardStagedImage(a: *App) void {
+    const path = a.staged_image.path;
+    releaseStagedImage(a);
+    if (path.len > 0) deleteFileUtf8(path.slice());
+    // Reclaim the preview band everywhere the staged image can go away,
+    // not just the Esc path.
+    layout(a, a.compose_client_width, a.compose_client_height);
+    if (a.hwnd) |hwnd| _ = win.InvalidateRect(hwnd, null, win.TRUE);
+}
+
+fn releaseStagedImage(a: *App) void {
+    if (a.staged_image.preview) |bitmap| _ = win.DeleteObject(bitmap);
+    a.staged_image = .{};
+}
+
+fn pasteDirectory(a: *App) ?[]u8 {
+    // avatar_dir is <LOCALAPPDATA>/Messages/avatars; staged pastes live in a
+    // sibling folder so the 14-day media-cache policy can evict them later.
+    const parent = std.fs.path.dirname(a.avatar_dir) orelse return null;
+    const dir = std.fs.path.join(a.allocator, &.{ parent, "paste" }) catch return null;
+    const cwd = std.Io.Dir.cwd();
+    cwd.createDirPath(a.io, dir) catch {};
+    return dir;
+}
+
+fn makePreviewBitmap(a: *App, path_wide: [*:0]const u16) ?win.HBITMAP {
+    if (a.wic_factory == null) return null;
+    var decoder: [*c]win.IWICBitmapDecoder = null;
+    if (a.wic_factory.*.lpVtbl.*.CreateDecoderFromFilename.?(a.wic_factory, path_wide, null, win.GENERIC_READ, win.WICDecodeMetadataCacheOnLoad, &decoder) < 0 or decoder == null) return null;
+    defer _ = decoder.*.lpVtbl.*.Release.?(decoder);
+    var frame: [*c]win.IWICBitmapFrameDecode = null;
+    if (decoder.*.lpVtbl.*.GetFrame.?(decoder, 0, &frame) < 0 or frame == null) return null;
+    defer _ = frame.*.lpVtbl.*.Release.?(frame);
+    var source_width: win.UINT = 0;
+    var source_height: win.UINT = 0;
+    if (frame.*.lpVtbl.*.GetSize.?(@ptrCast(frame), &source_width, &source_height) < 0 or source_width == 0 or source_height == 0) return null;
+    var converter: [*c]win.IWICFormatConverter = null;
+    if (a.wic_factory.*.lpVtbl.*.CreateFormatConverter.?(a.wic_factory, &converter) < 0 or converter == null) return null;
+    defer _ = converter.*.lpVtbl.*.Release.?(converter);
+    if (converter.*.lpVtbl.*.Initialize.?(converter, @ptrCast(frame), &win.GUID_WICPixelFormat32bppBGR, win.WICBitmapDitherTypeNone, null, 0, win.WICBitmapPaletteTypeCustom) < 0) return null;
+    var source: *win.IWICBitmapSource = @ptrCast(converter);
+    var scaler: [*c]win.IWICBitmapScaler = null;
+    const fit = webp_detect.fitBox(source_width, source_height, 44, 44);
+    if (fit.width < source_width or fit.height < source_height) {
+        if (a.wic_factory.*.lpVtbl.*.CreateBitmapScaler.?(a.wic_factory, &scaler) < 0 or scaler == null) return null;
+        if (scaler.*.lpVtbl.*.Initialize.?(scaler, source, fit.width, fit.height, win.WICBitmapInterpolationModeFant) < 0) {
+            _ = scaler.*.lpVtbl.*.Release.?(scaler);
+            return null;
+        }
+        source = @ptrCast(scaler);
+    }
+    defer {
+        if (scaler) |scaled| _ = scaled.*.lpVtbl.*.Release.?(scaled);
+    }
+    var info = std.mem.zeroes(win.BITMAPINFO);
+    info.bmiHeader.biSize = @sizeOf(win.BITMAPINFOHEADER);
+    info.bmiHeader.biWidth = @intCast(fit.width);
+    info.bmiHeader.biHeight = -@as(i32, @intCast(fit.height));
+    info.bmiHeader.biPlanes = 1;
+    info.bmiHeader.biBitCount = 32;
+    info.bmiHeader.biCompression = win.BI_RGB;
+    var bits: ?*anyopaque = null;
+    const bitmap = win.CreateDIBSection(null, &info, win.DIB_RGB_COLORS, &bits, null, 0) orelse return null;
+    if (bits == null) {
+        _ = win.DeleteObject(bitmap);
+        return null;
+    }
+    if (source.*.lpVtbl.*.CopyPixels.?(source, null, fit.width * 4, fit.width * 4 * fit.height, @ptrCast(bits.?)) < 0) {
+        _ = win.DeleteObject(bitmap);
+        return null;
+    }
+    return bitmap;
+}
+
+// Encode top-down 32bpp BGRA rows as a PNG file via WIC (screenshots arrive
+// as raw DIB pixels, and wacli wants a real image file to upload).
+fn writePngFile(a: *App, path_wide: [*:0]const u16, width: u32, height: u32, pixels: []const u8) bool {
+    var stream: [*c]win.IWICStream = null;
+    if (a.wic_factory.*.lpVtbl.*.CreateStream.?(a.wic_factory, &stream) < 0 or stream == null) return false;
+    defer _ = stream.*.lpVtbl.*.Release.?(stream);
+    if (stream.*.lpVtbl.*.InitializeFromFilename.?(stream, path_wide, win.GENERIC_WRITE | win.STGM_CREATE) < 0) return false;
+    var encoder: [*c]win.IWICBitmapEncoder = null;
+    if (a.wic_factory.*.lpVtbl.*.CreateEncoder.?(a.wic_factory, &win.GUID_ContainerFormatPng, null, &encoder) < 0 or encoder == null) return false;
+    defer _ = encoder.*.lpVtbl.*.Release.?(encoder);
+    if (encoder.*.lpVtbl.*.Initialize.?(encoder, @ptrCast(stream), win.WICBitmapEncoderNoCache) < 0) return false;
+    var frame: [*c]win.IWICBitmapFrameEncode = null;
+    if (encoder.*.lpVtbl.*.CreateNewFrame.?(encoder, &frame, null) < 0 or frame == null) return false;
+    defer _ = frame.*.lpVtbl.*.Release.?(frame);
+    if (frame.*.lpVtbl.*.Initialize.?(frame, null) < 0) return false;
+    if (frame.*.lpVtbl.*.SetSize.?(frame, width, height) < 0) return false;
+    var format = win.GUID_WICPixelFormat32bppBGR;
+    if (frame.*.lpVtbl.*.SetPixelFormat.?(frame, &format) < 0 or
+        !std.mem.eql(u8, std.mem.asBytes(&format), std.mem.asBytes(&win.GUID_WICPixelFormat32bppBGR))) return false;
+    if (frame.*.lpVtbl.*.WritePixels.?(frame, height, @intCast(width * 4), @intCast(pixels.len), @constCast(pixels.ptr)) < 0) return false;
+    if (frame.*.lpVtbl.*.Commit.?(frame) < 0) return false;
+    return encoder.*.lpVtbl.*.Commit.?(encoder) >= 0;
+}
+
+fn clipboardDibPixels(a: *App, handle: win.HANDLE) ?paste_image.Bitmap {
+    const size = win.GlobalSize(handle);
+    if (size == 0) return null;
+    const locked = win.GlobalLock(handle) orelse return null;
+    defer _ = win.GlobalUnlock(handle);
+    const bytes: [*]const u8 = @ptrCast(locked);
+    return paste_image.dibToBitmap(a.allocator, bytes[0..size]);
+}
+
+// Reserve an exclusive staging path so a concurrent instance or a retry can
+// never overwrite an image another queued send is still uploading.
+fn stageNewPath(a: *App, buffer: []u8, extension: []const u8) ?usize {
+    var dir_buffer: [520]u8 = undefined;
+    const dir = pasteDirectory(a) orelse return null;
+    defer a.allocator.free(dir);
+    const tick = win.GetTickCount64();
+    var attempt: u32 = 0;
+    while (attempt < 10) : (attempt += 1) {
+        const name = std.fmt.bufPrint(&dir_buffer, "paste-{d}-{d}.{s}", .{ tick, attempt, extension }) catch return null;
+        const full = std.fmt.bufPrint(buffer, "{s}\\{s}", .{ dir, name }) catch return null;
+        const file = std.Io.Dir.cwd().createFile(a.io, full, .{ .exclusive = true }) catch continue;
+        file.close(a.io);
+        return full.len;
+    }
+    return null;
+}
+
+// Stage the clipboard image for the currently selected chat. Returns true
+// when the paste keypress was consumed (an image was staged, or the
+// clipboard holds an image we deliberately reject); false lets the edit
+// control do its normal text paste.
+fn stageImageFromClipboard(a: *App) bool {
+    if (a.compose == null or a.wic_factory == null or a.chat_count == 0 or a.selected_chat >= a.chat_count) return false;
+    if (win.IsClipboardFormatAvailable(win.CF_DIB) == 0 and win.IsClipboardFormatAvailable(win.CF_BITMAP) == 0 and win.IsClipboardFormatAvailable(win.CF_HDROP) == 0) return false;
+    // Many apps publish an image next to CF_UNICODETEXT (Excel, Word);
+    // with text on the clipboard the edit control's normal paste wins.
+    if (win.IsClipboardFormatAvailable(win.CF_UNICODETEXT) != 0 or win.IsClipboardFormatAvailable(win.CF_TEXT) != 0) return false;
+    if (selectedChatIsTelegram(a)) {
+        setStatus(a, "Sending pasted images is not available for Telegram chats");
+        return true;
+    }
+    if (win.OpenClipboard(a.hwnd orelse null) == 0) return false;
+    // The clipboard is a system-wide exclusive resource: copy the payload
+    // out, close it, then do the slow file I/O and encoding.
+    var path_buffer: [520]u8 = undefined;
+    var path_len: usize = 0;
+    var pixels: ?paste_image.Bitmap = null;
+    var source_name: ?[]u8 = null;
+
+    {
+        defer _ = win.CloseClipboard();
+        if (win.GetClipboardData(win.CF_HDROP)) |hdrop| {
+            // A copied file: reuse the original bytes, but only for formats
+            // wacli uploads as images.
+            var name_buffer: [520]u16 = undefined;
+            const chars = win.DragQueryFileW(@ptrCast(@alignCast(hdrop)), 0, &name_buffer, name_buffer.len);
+            source_name = std.unicode.utf16LeToUtf8Alloc(a.allocator, name_buffer[0..chars]) catch {
+                setStatus(a, "Clipboard holds no image to paste");
+                return true;
+            };
+        } else if (win.GetClipboardData(win.CF_DIB)) |handle| {
+            pixels = clipboardDibPixels(a, handle) orelse {
+                setStatus(a, "Clipboard holds no image to paste");
+                return true;
+            };
+        } else if (win.GetClipboardData(win.CF_BITMAP)) |handle| {
+            // A bare HBITMAP without a DIB: ask GDI for top-down 32bpp rows.
+            var bitmap_header: win.BITMAP = undefined;
+            if (win.GetObjectW(handle, @sizeOf(win.BITMAP), &bitmap_header) == 0 or bitmap_header.bmWidth <= 0 or bitmap_header.bmHeight <= 0) {
+                setStatus(a, "Clipboard holds no image to paste");
+                return true;
+            }
+            const w: u32 = @intCast(bitmap_header.bmWidth);
+            const h: u32 = @intCast(bitmap_header.bmHeight);
+            var info = std.mem.zeroes(win.BITMAPINFO);
+            info.bmiHeader.biSize = @sizeOf(win.BITMAPINFOHEADER);
+            info.bmiHeader.biWidth = @intCast(w);
+            info.bmiHeader.biHeight = -@as(i32, @intCast(h));
+            info.bmiHeader.biPlanes = 1;
+            info.bmiHeader.biBitCount = 32;
+            info.bmiHeader.biCompression = win.BI_RGB;
+            const buffer = a.allocator.alloc(u8, w * h * 4) catch {
+                setStatus(a, "Could not stage the pasted image");
+                return true;
+            };
+            const screen_dc = win.GetDC(null);
+            const rows = win.GetDIBits(screen_dc, @ptrCast(@alignCast(handle)), 0, h, buffer.ptr, &info, win.DIB_RGB_COLORS);
+            if (screen_dc != null) _ = win.ReleaseDC(null, screen_dc);
+            if (rows != h) {
+                a.allocator.free(buffer);
+                setStatus(a, "Clipboard holds no image to paste");
+                return true;
+            }
+            var offset: usize = 0;
+            while (offset < buffer.len) : (offset += 4) buffer[offset + 3] = 255;
+            pixels = .{ .width = w, .height = h, .pixels = buffer };
+        } else {
+            setStatus(a, "Clipboard holds no image to paste");
+            return true;
+        }
+    }
+
+    // A copied file: stage it outside the clipboard (see the block above).
+    if (source_name) |name_len| {
+        defer a.allocator.free(name_len);
+        var extension: []const u8 = "";
+        const file_extension = std.fs.path.extension(name_len);
+        for ([_][]const u8{ "png", "jpg", "jpeg" }) |ext| {
+            if (file_extension.len == ext.len + 1 and std.ascii.eqlIgnoreCase(file_extension[1..], ext)) extension = ext;
+        }
+        if (extension.len == 0) {
+            setStatus(a, "Only PNG and JPEG files can be pasted as images");
+            return true;
+        }
+        path_len = stageNewPath(a, &path_buffer, extension) orelse {
+            setStatus(a, "Could not stage the pasted image");
+            return true;
+        };
+        const data = readFileWin(a.allocator, name_len, 32 * 1024 * 1024) orelse {
+            deleteFileUtf8(path_buffer[0..path_len]);
+            path_len = 0;
+            setStatus(a, "Could not read the copied image file");
+            return true;
+        };
+        defer a.allocator.free(data);
+        std.Io.Dir.cwd().writeFile(a.io, .{ .sub_path = path_buffer[0..path_len], .data = data }) catch {
+            deleteFileUtf8(path_buffer[0..path_len]);
+            path_len = 0;
+            setStatus(a, "Could not stage the pasted image");
+            return true;
+        };
+    }
+
+    // Encode DIB pixels to a staged PNG (the HDROP path already has a file).
+    if (pixels) |bitmap| {
+        defer a.allocator.free(bitmap.pixels);
+        path_len = stageNewPath(a, &path_buffer, "png") orelse {
+            setStatus(a, "Could not stage the pasted image");
+            return true;
+        };
+        const wide = std.unicode.utf8ToUtf16LeAllocZ(a.allocator, path_buffer[0..path_len]) catch {
+            deleteFileUtf8(path_buffer[0..path_len]);
+            setStatus(a, "Could not stage the pasted image");
+            return true;
+        };
+        defer a.allocator.free(wide);
+        if (!writePngFile(a, wide.ptr, bitmap.width, bitmap.height, bitmap.pixels)) {
+            deleteFileUtf8(path_buffer[0..path_len]);
+            setStatus(a, "Could not stage the pasted image");
+            return true;
+        }
+    }
+
+    if (path_len == 0) return true;
+    const staged_wide = std.unicode.utf8ToUtf16LeAllocZ(a.allocator, path_buffer[0..path_len]) catch {
+        deleteFileUtf8(path_buffer[0..path_len]);
+        setStatus(a, "Could not stage the pasted image");
+        return true;
+    };
+    defer a.allocator.free(staged_wide);
+    const preview = makePreviewBitmap(a, staged_wide.ptr) orelse {
+        deleteFileUtf8(path_buffer[0..path_len]);
+        setStatus(a, "Could not preview the pasted image");
+        return true;
+    };
+    // Everything succeeded: only now replace any earlier staged image.
+    discardStagedImage(a);
+    a.staged_image.path.set(path_buffer[0..path_len]);
+    a.staged_image.jid.set(a.chats[a.selected_chat].jid.slice());
+    a.staged_image.preview = preview;
+    var bitmap: win.BITMAP = undefined;
+    if (win.GetObjectW(preview, @sizeOf(win.BITMAP), &bitmap) != 0) {
+        a.staged_image.preview_width = bitmap.bmWidth;
+        a.staged_image.preview_height = bitmap.bmHeight;
+    }
+    layout(a, a.compose_client_width, a.compose_client_height);
+    if (a.hwnd) |hwnd| _ = win.InvalidateRect(hwnd, null, win.TRUE);
+    setStatus(a, "Image ready... Enter sends, Esc discards");
+    focusCompose(a);
+    return true;
+}
+
 fn sendMessage(a: *App) void {
     if (a.compose == null or a.chat_count == 0 or a.selected_chat >= a.chat_count) return;
     if (a.pending_send_count >= max_pending_sends) {
@@ -3347,9 +3670,42 @@ fn sendMessage(a: *App) void {
     }
     var wide_buffer: [4096]u16 = [_]u16{0} ** 4096;
     const length: usize = @intCast(win.GetWindowTextW(a.compose.?, &wide_buffer, wide_buffer.len));
-    if (length == 0) return;
+    if (length == 0 and a.staged_image.path.len == 0) return;
+    // A staged paste (WAZI-37) sends the image, with any typed text as the
+    // caption. The JID guard keeps it from ever landing in another chat if
+    // selection state and the staged image ever disagree.
+    var staged_file: []const u8 = "";
+    if (a.staged_image.path.len > 0) {
+        if (std.mem.eql(u8, a.staged_image.jid.slice(), a.chats[a.selected_chat].jid.slice())) {
+            staged_file = a.staged_image.path.slice();
+        } else discardStagedImage(a);
+    }
+    if (length == 0 and staged_file.len == 0) return;
     const text = std.unicode.utf16LeToUtf8Alloc(a.allocator, wide_buffer[0..length]) catch return;
     defer a.allocator.free(text);
+    if (staged_file.len > 0) {
+        const path_copy = a.allocator.dupe(u8, staged_file) catch return;
+        defer a.allocator.free(path_copy);
+        const caption_copy = a.allocator.dupe(u8, text) catch return;
+        defer a.allocator.free(caption_copy);
+        // File deletion transfers to the send queue (removeFirstPendingSend)
+        // once wacli has finished with it; only the preview is dropped here.
+        releaseStagedImage(a);
+        const pending = &a.pending_sends[a.pending_send_count];
+        pending.jid.set(a.chats[a.selected_chat].jid.slice());
+        pending.text.set(caption_copy);
+        pending.file.set(path_copy);
+        pending.reply_to.set(a.reply_to.slice());
+        pending.reply_sender.set(a.reply_sender.slice());
+        clearReply(a);
+        a.pending_send_count += 1;
+        a.user_viewed = true;
+        _ = win.SetWindowTextW(a.compose.?, lit(""));
+        layout(a, a.compose_client_width, a.compose_client_height);
+        if (a.hwnd) |main_hwnd| _ = win.InvalidateRect(main_hwnd, null, win.TRUE);
+        startNextSend(a);
+        return;
+    }
 
     if (selectedChatIsTelegram(a)) {
         if (tgSelectedChatIsGroup(a)) {
@@ -3373,6 +3729,7 @@ fn sendMessage(a: *App) void {
     pending.text.set(text);
     pending.reply_to.set(a.reply_to.slice());
     pending.reply_sender.set(a.reply_sender.slice());
+    pending.file = .{};
     clearReply(a);
     a.pending_send_count += 1;
     a.user_viewed = true;
@@ -3502,6 +3859,7 @@ fn selectChat(a: *App, delta: i32, wrap: bool) void {
     } else {
         next = std.math.clamp(next, 0, count - 1);
     }
+    if (next != a.selected_chat) discardStagedImage(a);
     a.selected_chat = @intCast(next);
     a.user_viewed = true;
     if (a.chats_hwnd) |list| {
@@ -4908,12 +5266,12 @@ fn layout(a: *App, width: i32, height: i32) void {
     const header_height: i32 = 0;
     const search_height: i32 = 48;
     const status_height: i32 = 26;
-    var sizes = compose_layout.compute(a.compose_dragged, composerContentHeight(a), height);
+    var sizes = compose_layout.compute(a.compose_dragged, composerContentHeight(a), height, a.staged_image.path.len > 0);
     // The wrap count depends on the edit's width, so measure once more after
     // sizing (the themed strip keeps that width constant across heights).
     if (a.compose) |hwnd| {
         _ = win.MoveWindow(hwnd, left_width + 14, height - 11 - sizes.edit_height, width - left_width - 258 - scrollbar_width, sizes.edit_height, win.TRUE);
-        sizes = compose_layout.compute(a.compose_dragged, composerContentHeight(a), height);
+        sizes = compose_layout.compute(a.compose_dragged, composerContentHeight(a), height, a.staged_image.path.len > 0);
         _ = win.MoveWindow(hwnd, left_width + 14, height - 11 - sizes.edit_height, width - left_width - 258 - scrollbar_width, sizes.edit_height, win.TRUE);
     }
     a.compose_strip_top = height - sizes.strip_height;
@@ -6158,6 +6516,25 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
                 var grip = win.RECT{ .left = cx - 22, .top = a.compose_strip_top + 4, .right = cx + 22, .bottom = a.compose_strip_top + 6 };
                 _ = win.FillRect(hdc, &grip, a.brush_panel.?);
             }
+            // Paste preview (WAZI-37): the staged image thumbnail sits in the
+            // band the strip reserves above the edit while it waits to send.
+            if (a.staged_image.preview) |preview| {
+                var preview_rect = win.RECT{
+                    .left = left_width + 13,
+                    .top = a.compose_strip_top + 10,
+                    .right = left_width + 14 + a.staged_image.preview_width,
+                    .bottom = a.compose_strip_top + 11 + a.staged_image.preview_height,
+                };
+                _ = win.FillRect(hdc, &preview_rect, a.brush_bg.?);
+                const memory_dc = win.CreateCompatibleDC(hdc);
+                if (memory_dc != null) {
+                    const previous = win.SelectObject(memory_dc, @ptrCast(preview));
+                    _ = win.BitBlt(hdc, preview_rect.left + 1, preview_rect.top + 1, a.staged_image.preview_width, a.staged_image.preview_height, memory_dc, 0, 0, win.SRCCOPY);
+                    _ = win.SelectObject(memory_dc, previous);
+                    _ = win.DeleteDC(memory_dc);
+                }
+                _ = win.FrameRect(hdc, &preview_rect, a.brush_muted.?);
+            }
             if (a.chats_hwnd) |list| drawScrollbar(hdc, stripRightOf(list, hwnd), listboxScrollInfo(list), a.brush_muted.?);
             if (a.compose) |edit| drawScrollbar(hdc, stripRightOf(edit, hwnd), composeScrollInfo(a, edit), a.brush_muted.?);
             _ = win.EndPaint(hwnd, &paint);
@@ -6260,6 +6637,7 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
             if (id == id_chats and notification == win.LBN_SELCHANGE) {
                 const selected = win.SendMessageW(a.chats_hwnd.?, win.LB_GETCURSEL, 0, 0);
                 if (selected >= 0) {
+                    discardStagedImage(a);
                     a.selected_chat = @intCast(selected);
                     a.user_viewed = true;
                     refreshMessages(a);
@@ -6610,6 +6988,9 @@ fn handleKeyboard(a: *App, message: *const win.MSG) bool {
     }
     if (a.compose) |compose| {
         if (focus == compose) {
+            // Ctrl+V with an image on the clipboard stages a paste-to-send
+            // (WAZI-37); without an image the edit control pastes text as usual.
+            if (control and key == 'V' and stageImageFromClipboard(a)) return true;
             if (key == win.VK_RETURN and !shift) {
                 sendMessage(a);
                 return true;
@@ -6618,6 +6999,13 @@ fn handleKeyboard(a: *App, message: *const win.MSG) bool {
                 if (a.reply_to.len > 0) {
                     clearReply(a);
                     setStatus(a, "Reply cancelled");
+                    return true;
+                }
+                if (a.staged_image.path.len > 0) {
+                    discardStagedImage(a);
+                    layout(a, a.compose_client_width, a.compose_client_height);
+                    if (a.hwnd) |main_hwnd| _ = win.InvalidateRect(main_hwnd, null, win.TRUE);
+                    setStatus(a, "Pasted image discarded");
                     return true;
                 }
                 if (a.chats_hwnd) |list| _ = win.SetFocus(list);
