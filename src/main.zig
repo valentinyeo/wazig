@@ -3176,7 +3176,12 @@ fn drawCanvas(hwnd: win.HWND, a: *App) void {
     _ = win.SetBkMode(hdc, win.TRANSPARENT);
     const available_width = client.right - client.left;
     const bubble_width = std.math.clamp(@divTrunc(available_width * 7, 10), 280, 620);
-    const chat_jid = if (a.displayed_jid.len > 0) a.displayed_jid.slice() else if (a.chat_count > 0) a.chats[a.selected_chat].jid.slice() else "";
+    const chat_jid = if (a.displayed_jid.len > 0)
+        a.displayed_jid.slice()
+    else if (a.chat_count > 0 and a.selected_chat < a.chat_count)
+        a.chats[a.selected_chat].jid.slice()
+    else
+        "";
     const in_group = std.mem.endsWith(u8, chat_jid, "@g.us");
     var total_height: i32 = 18;
     for (a.messages[0..a.message_count]) |*message| total_height += measureMessage(hdc, a, message, bubble_width) + 8;
