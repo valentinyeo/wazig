@@ -491,6 +491,8 @@ const App = struct {
     displayed_timestamp: Utf8Text(47) = .{},
     played_set: played.Set = .{},
     played_path: []u8 = &.{},
+    media_fetched: played.Set = .{},
+    media_fetched_path: []u8 = &.{},
     // The wacli worker thread shares allocator and io with the UI thread:
     // safe because start.zig provides c_allocator and std.Io.Threaded, both
     // thread-safe. wacli_pending is only touched under wacli_mutex.
@@ -2328,6 +2330,10 @@ fn autoDownloadNextMedia(a: *App) void {
         // LocalPath (kept across restarts) already holds anything fetched.
         if (!media_age.withinDays(message.timestamp.slice(), nowUnixSeconds(), media_cache_days)) continue;
         if (mediaAttempted(a, message.id.slice())) continue;
+        // The persistent fetched index: anything downloaded before (even in
+        // an earlier session) is never re-checked or re-downloaded. A manual
+        // click bypasses this, so a lost file is still recoverable.
+        if (mediaWasFetched(a, a.chats[a.selected_chat].jid.slice(), message.id.slice())) continue;
         downloadMedia(a, index, true);
         return;
     }
@@ -2705,6 +2711,7 @@ fn checkMediaDownload(a: *App) void {
             if (code == 0) {
                 markMediaAttempted(a, slot.id.slice());
                 clearMediaFailure(a, slot.id.slice());
+                markMediaFetched(a, slot.jid.slice(), slot.id.slice());
             } else {
                 noteMediaFailure(a, slot.id.slice());
             }
@@ -5996,12 +6003,12 @@ fn jumpToLatestMessage(a: *App) void {
     if (a.canvas) |canvas| _ = win.InvalidateRect(canvas, null, win.TRUE);
 }
 
-fn findPlayedPath(init: std.process.Init, allocator: std.mem.Allocator) []u8 {
+fn hashStorePath(init: std.process.Init, allocator: std.mem.Allocator, filename: []const u8) []u8 {
     const local = init.environ_map.get("LOCALAPPDATA") orelse return &.{};
     const dir = std.fs.path.join(allocator, &.{ local, "Messages" }) catch return &.{};
     const cwd = std.Io.Dir.cwd();
     cwd.createDirPath(init.io, dir) catch {};
-    const path = std.fs.path.join(allocator, &.{ dir, "played.txt" }) catch {
+    const path = std.fs.path.join(allocator, &.{ dir, filename }) catch {
         allocator.free(dir);
         return &.{};
     };
@@ -6009,9 +6016,19 @@ fn findPlayedPath(init: std.process.Init, allocator: std.mem.Allocator) []u8 {
     return path;
 }
 
-fn loadPlayed(a: *App) void {
-    if (a.played_path.len == 0) return;
-    const wide = std.unicode.utf8ToUtf16LeAllocZ(a.allocator, a.played_path) catch return;
+fn findPlayedPath(init: std.process.Init, allocator: std.mem.Allocator) []u8 {
+    return hashStorePath(init, allocator, "played.txt");
+}
+
+// Persistent index of media ids whose file was fetched, so a chat's media is
+// never re-checked or re-downloaded after a restart.
+fn findMediaFetchedPath(init: std.process.Init, allocator: std.mem.Allocator) []u8 {
+    return hashStorePath(init, allocator, "media-fetched.txt");
+}
+
+fn loadHashSet(a: *App, path: []const u8, set: *played.Set) void {
+    if (path.len == 0) return;
+    const wide = std.unicode.utf8ToUtf16LeAllocZ(a.allocator, path) catch return;
     defer a.allocator.free(wide);
     // Read only the tail of the append-only store: the newest entries are
     // at the end and the read is capped to keep startup bounded.
@@ -6032,14 +6049,11 @@ fn loadPlayed(a: *App) void {
         if (got == 0) break;
         total += got;
     }
-    a.played_set.load(buffer[0..total]);
+    set.load(buffer[0..total]);
 }
 
-fn markPlayed(a: *App, id: []const u8) void {
-    if (a.played_path.len == 0) return;
-    var line_buffer: [40]u8 = undefined;
-    const line = a.played_set.mark(id, &line_buffer) orelse return;
-    const wide = std.unicode.utf8ToUtf16LeAllocZ(a.allocator, a.played_path) catch return;
+fn appendHashLine(a: *App, path: []const u8, line: []const u8) void {
+    const wide = std.unicode.utf8ToUtf16LeAllocZ(a.allocator, path) catch return;
     defer a.allocator.free(wide);
     // True append: a crash mid-write can never truncate existing history.
     const handle = win.CreateFileW(wide.ptr, win.FILE_APPEND_DATA, win.FILE_SHARE_READ, null, win.OPEN_ALWAYS, win.FILE_ATTRIBUTE_NORMAL, null);
@@ -6047,6 +6061,30 @@ fn markPlayed(a: *App, id: []const u8) void {
     defer _ = win.CloseHandle(handle);
     var written: win.DWORD = 0;
     _ = win.WriteFile(handle, line.ptr, @intCast(line.len), &written, null);
+}
+
+fn loadPlayed(a: *App) void {
+    loadHashSet(a, a.played_path, &a.played_set);
+}
+
+fn markPlayed(a: *App, id: []const u8) void {
+    if (a.played_path.len == 0) return;
+    var line_buffer: [40]u8 = undefined;
+    const line = a.played_set.mark(id, &line_buffer) orelse return;
+    appendHashLine(a, a.played_path, line);
+}
+
+// Record a finished download so the auto scan never touches it again, even
+// across restarts. Keyed by (chat jid, message id).
+fn markMediaFetched(a: *App, chat_jid: []const u8, message_id: []const u8) void {
+    if (a.media_fetched_path.len == 0 or message_id.len == 0) return;
+    var line_buffer: [40]u8 = undefined;
+    const line = a.media_fetched.markRaw(played.Set.pairKey(chat_jid, message_id), &line_buffer) orelse return;
+    appendHashLine(a, a.media_fetched_path, line);
+}
+
+fn mediaWasFetched(a: *const App, chat_jid: []const u8, message_id: []const u8) bool {
+    return a.media_fetched.wasPlayedRaw(played.Set.pairKey(chat_jid, message_id));
 }
 
 fn findWacli(init: std.process.Init, allocator: std.mem.Allocator) ![]u8 {
@@ -6146,6 +6184,8 @@ pub fn main(init: std.process.Init) !void {
     }
     app.played_path = findPlayedPath(init, init.gpa);
     loadPlayed(&app);
+    app.media_fetched_path = findMediaFetchedPath(init, init.gpa);
+    loadHashSet(&app, app.media_fetched_path, &app.media_fetched);
     app.store_watch_path.set(init.gpa, store_watch_path);
     app_ptr = &app;
     defer app_ptr = null;
