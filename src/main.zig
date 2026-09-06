@@ -779,6 +779,15 @@ fn checkMarkRead(a: *App) void {
         _ = child.wait(a.io) catch {};
         a.read_child = null;
         removeFirstPendingRead(a);
+        // Drain the queue back-to-back before restarting live sync, which
+        // stays suspended while reads are pending.
+        if (a.pending_read_count > 0) {
+            startNextMarkRead(a);
+            return;
+        }
+        // Release any sends or archives that queued up while the store was
+        // held, then bring live sync back. startSync skips itself while a
+        // write job is running.
         startNextSend(a);
         startNextArchive(a);
         startSync(a);
