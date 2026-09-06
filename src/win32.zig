@@ -1,5 +1,7 @@
-//! Single shared Win32 cImport: every module must use this one so that
-//! handle and COM types are identical across files.
+//! Shared Win32 cImport: modules that exchange Win32/COM types (main.zig,
+//! emoji_draw.zig) must use this one so handle and COM types are identical
+//! across files. Standalone modules (audio.zig, avatar.zig, dictation.zig)
+//! still keep private cImports until they are migrated.
 pub const c = @cImport({
     @cDefine("WIN32_LEAN_AND_MEAN", "1");
     @cDefine("NOMINMAX", "1");
