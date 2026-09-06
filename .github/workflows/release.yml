@@ -62,8 +62,9 @@ jobs:
           # was unreadable. /L*V keeps a full log to diagnose any real failure.
           & msiexec /i $msi /qn /norestart /L*V install.log | Out-Null
           $code = $LASTEXITCODE
-          if ($code -ne 0) {
-            Get-Content install.log -Tail 40
+          # 3010 = success with reboot required; no reboot is actually needed here.
+          if ($code -ne 0 -and $code -ne 3010) {
+            Get-Content install.log -Tail 40 -ErrorAction SilentlyContinue
             throw "msiexec install failed: $code"
           }
       - name: Verify install
@@ -80,7 +81,7 @@ jobs:
           $msi = (Get-ChildItem Messages-*.msi).FullName
           & msiexec /x $msi /qn /norestart | Out-Null
           $code = $LASTEXITCODE
-          if ($code -ne 0) { throw "msiexec uninstall failed: $code" }
+          if ($code -ne 0 -and $code -ne 3010) { throw "msiexec uninstall failed: $code" }
           if (Test-Path "$env:LOCALAPPDATA\Programs\Messages\Messages.exe") { throw "exe left behind after uninstall" }
           if (Test-Path "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Messages.lnk") { throw "shortcut left behind after uninstall" }
 
