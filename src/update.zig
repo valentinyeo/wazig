@@ -77,13 +77,14 @@ pub fn pickAsset(
     json_text: []const u8,
     parsed: *std.json.Parsed(std.json.Value),
 ) !?Asset {
+    // `parsed` stays valid on both the asset and no-asset paths; the caller
+    // deinits it exactly once (nothing to clean up on a parse error).
     parsed.* = try std.json.parseFromSlice(std.json.Value, allocator, json_text, .{});
-    if (findAsset(parsed.value)) |asset| return asset;
-    parsed.deinit(); // Nothing worth keeping: hand back a deinitialized parse.
-    return null;
+    return findAsset(parsed.value);
 }
 
 fn findAsset(root: std.json.Value) ?Asset {
+    var matched: ?Asset = null;
     if (root != .object) return null;
     const obj = root.object;
     if (flagTrue(obj.get("draft")) or flagTrue(obj.get("prerelease"))) return null;
@@ -103,22 +104,21 @@ fn findAsset(root: std.json.Value) ?Asset {
         // No digest means no verification is possible: refuse the update.
         const digest = asset.get("digest") orelse continue;
         if (digest != .string) continue;
-        var size: u64 = 0;
-        if (asset.get("size")) |size_value| {
-            if (size_value != .integer) continue;
-            if (size_value.integer < 0) continue;
-            size = @intCast(size_value.integer);
-        }
-        return .{
+        // Refuse what we cannot cross-check, same as a missing digest.
+        const size_value = asset.get("size") orelse continue;
+        if (size_value != .integer) continue;
+        if (size_value.integer < 0) continue;
+        if (matched != null) return null; // ambiguous release: refuse rather than guess
+        matched = .{
             // Strings live inside the caller's `parsed`; it stays alive while the asset is used.
             .tag = tag,
             .version = version,
             .url = url.string,
-            .size = size,
+            .size = @intCast(size_value.integer),
             .digest = digest.string,
         };
     }
-    return null;
+    return matched;
 }
 
 test parseVersion {
@@ -200,6 +200,7 @@ test pickAsset {
     ;
     var parsed2: std.json.Parsed(std.json.Value) = undefined;
     try std.testing.expectEqual(@as(?Asset, null), try pickAsset(std.testing.allocator, draft, &parsed2));
+    parsed2.deinit();
 
     // Asset without a digest must be refused, not trusted.
     const no_digest =
@@ -218,11 +219,58 @@ test pickAsset {
     ;
     var parsed3: std.json.Parsed(std.json.Value) = undefined;
     try std.testing.expectEqual(@as(?Asset, null), try pickAsset(std.testing.allocator, no_digest, &parsed3));
+    parsed3.deinit();
 
     var parsed4: std.json.Parsed(std.json.Value) = undefined;
     try std.testing.expectError(error.SyntaxError, pickAsset(std.testing.allocator, "not json", &parsed4));
     var parsed5: std.json.Parsed(std.json.Value) = undefined;
     try std.testing.expectEqual(@as(?Asset, null), try pickAsset(std.testing.allocator, "{}", &parsed5));
+    parsed5.deinit();
+
+    // Asset without a size must be refused: nothing to cross-check.
+    const no_size =
+        \\{
+        \\  "tag_name": "v0.2.0",
+        \\  "draft": false,
+        \\  "prerelease": false,
+        \\  "assets": [
+        \\    {
+        \\      "name": "Messages-windows-x86_64.zip",
+        \\      "browser_download_url": "https://github.com/valentinyeo/wazig/releases/download/v0.2.0/Messages-windows-x86_64.zip",
+        \\      "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        \\    }
+        \\  ]
+        \\}
+    ;
+    var parsed6: std.json.Parsed(std.json.Value) = undefined;
+    try std.testing.expectEqual(@as(?Asset, null), try pickAsset(std.testing.allocator, no_size, &parsed6));
+    parsed6.deinit();
+
+    // Two matching assets is an ambiguous release: refuse rather than guess.
+    const two_assets =
+        \\{
+        \\  "tag_name": "v0.2.0",
+        \\  "draft": false,
+        \\  "prerelease": false,
+        \\  "assets": [
+        \\    {
+        \\      "name": "Messages-windows-x86_64.zip",
+        \\      "browser_download_url": "https://github.com/valentinyeo/wazig/releases/download/v0.2.0/Messages-windows-x86_64.zip",
+        \\      "size": 12345,
+        \\      "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        \\    },
+        \\    {
+        \\      "name": "Messages-hotfix.zip",
+        \\      "browser_download_url": "https://github.com/valentinyeo/wazig/releases/download/v0.2.0/Messages-hotfix.zip",
+        \\      "size": 234,
+        \\      "digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        \\    }
+        \\  ]
+        \\}
+    ;
+    var parsed7: std.json.Parsed(std.json.Value) = undefined;
+try std.testing.expectEqual(@as(?Asset, null), try pickAsset(std.testing.allocator, two_assets, &parsed7));
+    parsed7.deinit();
 }
 
 test isZipAssetName {

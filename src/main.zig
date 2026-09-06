@@ -4133,10 +4133,13 @@ fn httpGetUrl(allocator: std.mem.Allocator, url_wide: []const u16, headers: [*:0
     components.dwStructSize = @sizeOf(win.URL_COMPONENTSW);
     var host_buf: [256]u16 = undefined;
     var path_buf: [2048]u16 = undefined;
+    var extra_buf: [512]u16 = undefined;
     components.lpszHostName = &host_buf;
     components.dwHostNameLength = host_buf.len;
     components.lpszUrlPath = &path_buf;
     components.dwUrlPathLength = path_buf.len;
+    components.lpszExtraInfo = &extra_buf;
+    components.dwExtraInfoLength = extra_buf.len;
     if (win.WinHttpCrackUrl(url_wide.ptr, @intCast(url_wide.len), 0, &components) == 0) return error.UpdateBadUrl;
     if (components.nScheme != win.INTERNET_SCHEME_HTTPS) return error.UpdateBadUrl;
     if (components.dwHostNameLength == 0 or components.dwHostNameLength >= host_buf.len) return error.UpdateBadUrl;
@@ -4150,12 +4153,16 @@ fn httpGetUrl(allocator: std.mem.Allocator, url_wide: []const u16, headers: [*:0
     }
     if (!host_allowed) return error.UpdateBadUrl;
     if (components.dwUrlPathLength >= path_buf.len) return error.UpdateBadUrl;
+    if (components.dwUrlPathLength + components.dwExtraInfoLength >= path_buf.len) return error.UpdateBadUrl;
     host_buf[components.dwHostNameLength] = 0;
-    path_buf[components.dwUrlPathLength] = 0;
+    // Keep query/fragment with the path; crackUrl otherwise discards them.
+    std.mem.copyForwards(u16, path_buf[components.dwUrlPathLength..], extra_buf[0..components.dwExtraInfoLength]);
+    const path_total = components.dwUrlPathLength + components.dwExtraInfoLength;
+    path_buf[path_total] = 0;
     return httpGet(
         allocator,
         host_buf[0..components.dwHostNameLength :0].ptr,
-        path_buf[0..components.dwUrlPathLength :0].ptr,
+        path_buf[0..path_total :0].ptr,
         headers,
         max_bytes,
     );
@@ -4168,7 +4175,9 @@ fn performUpdate(io: std.Io) !UpdateOutcome {
     // One updater at a time across every running copy of the app.
     const mutex = win.CreateMutexW(null, win.FALSE, lit("Local\\MessagesUpdateMutex")) orelse return error.UpdateMutexFailed;
     defer _ = win.CloseHandle(mutex);
-    if (win.WaitForSingleObject(mutex, 0) != win.WAIT_OBJECT_0) return .none;
+    // WAIT_ABANDONED still grants ownership (the previous holder died); treat it as acquired.
+    const wait_result = win.WaitForSingleObject(mutex, 0);
+    if (wait_result != win.WAIT_OBJECT_0 and wait_result != 0x80) return .none;
     defer _ = win.ReleaseMutex(mutex);
 
     var exe_wide_buf: [519]u16 = undefined;
@@ -4193,8 +4202,9 @@ fn performUpdate(io: std.Io) !UpdateOutcome {
     defer root.close(io);
 
     // A .old backup left by a completed earlier swap is safe to drop now.
+    const exe_name = std.fs.path.basename(exe_path);
     {
-        const exe_old = try std.fmt.allocPrint(allocator, "{s}\\Messages.exe.old", .{exe_dir});
+        const exe_old = try std.fmt.allocPrint(allocator, "{s}\\{s}.old", .{ exe_dir, exe_name });
         defer allocator.free(exe_old);
         const exe_old_wide = try utf8ToWide(allocator, exe_old);
         defer allocator.free(exe_old_wide);
@@ -4207,8 +4217,9 @@ fn performUpdate(io: std.Io) !UpdateOutcome {
     defer allocator.free(json);
 
     var parsed: std.json.Parsed(std.json.Value) = undefined;
-    const asset = (try update.pickAsset(allocator, json, &parsed)) orelse return .none;
+    const maybe_asset = try update.pickAsset(allocator, json, &parsed);
     defer parsed.deinit();
+    const asset = maybe_asset orelse return .none;
     if (!update.isNewer(asset.tag, current)) return .none;
 
     const asset_url = try utf8ToWide(allocator, asset.url);
@@ -4258,13 +4269,16 @@ fn performUpdate(io: std.Io) !UpdateOutcome {
     }
 
     const inner_root = if (diagnostics.root_dir.len > 0) diagnostics.root_dir else "";
-    const new_exe_rel = try std.fmt.allocPrint(allocator, "{s}/Messages.exe", .{inner_root});
+    const new_exe_rel = if (inner_root.len > 0)
+        try std.fmt.allocPrint(allocator, "{s}/{s}", .{ inner_root, exe_name })
+    else
+        try allocator.dupe(u8, exe_name);
     defer allocator.free(new_exe_rel);
     _ = try stage.statFile(io, new_exe_rel, .{});
 
     // Swap: rename the running exe aside (always allowed on Windows), copy the
     // new files in, and roll the rename back if any copy fails.
-    const exe_old = try std.fmt.allocPrint(allocator, "{s}\\Messages.exe.old", .{exe_dir});
+    const exe_old = try std.fmt.allocPrint(allocator, "{s}\\{s}.old", .{ exe_dir, exe_name });
     defer allocator.free(exe_old);
     const exe_old_wide = try utf8ToWide(allocator, exe_old);
     defer allocator.free(exe_old_wide);
@@ -4277,16 +4291,29 @@ fn performUpdate(io: std.Io) !UpdateOutcome {
         _ = win.DeleteFileW(exe_old_wide.ptr); // best effort; a leftover is removed on next start
         return .installed;
     }
-    // Rollback: restore the old executable over the partially copied install.
+    // Rollback: restore the old executable (the install files are untouched
+    // thanks to the two-phase copy).
     _ = win.MoveFileExW(exe_old_wide.ptr, exe_wide.ptr, win.MOVEFILE_REPLACE_EXISTING);
     return error.UpdateCopyFailed;
 }
 
 /// Copies every staged file (below `inner_root` inside `stage_path`) into
-/// `exe_dir`. Returns false when any copy fails; files copied before the
-/// failure stay in place but the caller restores the renamed backup over the
-/// main executable.
+/// `exe_dir`. Copies go to temporary names and are renamed into place only
+/// after every copy succeeded, so a failure leaves the existing files intact;
+/// the caller additionally restores the renamed backup of the executable.
 fn installStagedFiles(io: std.Io, allocator: std.mem.Allocator, stage: std.Io.Dir, stage_path: []const u8, inner_root: []const u8, exe_dir: []const u8) bool {
+    const Pending = struct { temp: [:0]u16, dest: [:0]u16 };
+    // Two-phase install: copy every file to "<dest>.new", then rename them into
+    // place only after all copies succeeded, so a failed copy never leaves a
+    // mixed-version install behind.
+    var pending: std.ArrayList(Pending) = .empty;
+    defer {
+        for (pending.items) |p| {
+            allocator.free(p.temp);
+            allocator.free(p.dest);
+        }
+        pending.deinit(allocator);
+    }
     var walker = stage.walk(allocator) catch return false;
     defer walker.deinit();
     while (walker.next(io) catch return false) |entry| {
@@ -4295,15 +4322,19 @@ fn installStagedFiles(io: std.Io, allocator: std.mem.Allocator, stage: std.Io.Di
             entry.path[inner_root.len + 1 ..]
         else
             entry.path;
+        // Normalize separators first so the traversal guard sees both spellings.
+        var relative_buf: [512]u8 = undefined;
+        if (relative.len >= relative_buf.len) return false;
+        for (relative, 0..) |c, i| relative_buf[i] = if (c == '\\') '/' else c;
+        const normalized = relative_buf[0..relative.len];
         // Never install anything that escapes the application directory.
-        var components = std.mem.splitScalar(u8, relative, '/');
+        var components = std.mem.splitScalar(u8, normalized, '/');
         while (components.next()) |component| {
             if (std.mem.eql(u8, component, "..")) return false;
         }
         var windows_relative_buf: [512]u8 = undefined;
-        if (relative.len >= windows_relative_buf.len) return false;
-        for (relative, 0..) |c, i| windows_relative_buf[i] = if (c == '/') '\\' else c;
-        const windows_relative = windows_relative_buf[0..relative.len];
+        for (normalized, 0..) |c, i| windows_relative_buf[i] = if (c == '/') '\\' else c;
+        const windows_relative = windows_relative_buf[0..normalized.len];
         const destination = std.fmt.allocPrint(allocator, "{s}\\{s}", .{ exe_dir, windows_relative }) catch return false;
         defer allocator.free(destination);
         if (std.fs.path.dirname(destination)) |parent| {
@@ -4325,8 +4356,20 @@ fn installStagedFiles(io: std.Io, allocator: std.mem.Allocator, stage: std.Io.Di
         const source_wide = utf8ToWide(allocator, source) catch return false;
         defer allocator.free(source_wide);
         const destination_wide = utf8ToWide(allocator, destination) catch return false;
-        defer allocator.free(destination_wide);
-        if (win.CopyFileW(source_wide.ptr, destination_wide.ptr, win.FALSE) == 0) return false;
+        const temp = std.fmt.allocPrint(allocator, "{s}.new", .{destination}) catch return false;
+        defer allocator.free(temp);
+        const temp_wide = utf8ToWide(allocator, temp) catch return false;
+        if (win.CopyFileW(source_wide.ptr, temp_wide.ptr, win.FALSE) == 0) return false;
+        pending.append(allocator, .{ .temp = temp_wide, .dest = destination_wide }) catch return false;
+    }
+    for (pending.items) |p| {
+        if (win.MoveFileExW(p.temp.ptr, p.dest.ptr, win.MOVEFILE_REPLACE_EXISTING) == 0) {
+            // Best-effort cleanup of the not-yet-renamed temps.
+            for (pending.items) |q| {
+                if (q.temp.ptr != p.temp.ptr) _ = win.DeleteFileW(q.temp.ptr);
+            }
+            return false;
+        }
     }
     return true;
 }
