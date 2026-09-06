@@ -7,6 +7,23 @@ pub fn isWebPBytes(data: []const u8) bool {
     return data.len >= 12 and std.mem.eql(u8, data[0..4], "RIFF") and std.mem.eql(u8, data[8..12], "WEBP");
 }
 
+// Target box shared by all media decode paths: fit within max_w x max_h,
+// preserving aspect, never smaller than 1 pixel. Static images, WebP
+// stickers and GIF frames all render inside this box.
+pub const FitBox = struct { width: u32, height: u32 };
+
+pub fn fitBox(source_width: u32, source_height: u32, max_width: u32, max_height: u32) FitBox {
+    if (source_width == 0 or source_height == 0) return .{ .width = 1, .height = 1 };
+    var width: u32 = @min(source_width, max_width);
+    var height: u64 = @as(u64, source_height) * width / source_width;
+    if (height > max_height) {
+        height = max_height;
+        width = @intCast(@max(1, @as(u64, source_width) * max_height / source_height));
+    }
+    if (height == 0) height = 1;
+    return .{ .width = width, .height = @intCast(height) };
+}
+
 fn chunkSizeAt(data: []const u8, offset: usize) ?usize {
     if (offset + 8 > data.len) return null;
     const size = std.mem.readInt(u32, data[offset + 4 ..][0..4], .little);
@@ -82,4 +99,14 @@ test "firstAnimationFrame extracts the VP8 payload of the first ANMF chunk" {
     @memcpy(alpha[74..78], "bits");
     try std.testing.expectEqualSlices(u8, "bits", firstAnimationFrame(&alpha).?);
     try std.testing.expect(firstAnimationFrame("RIFFshort") == null);
+}
+
+test "fitBox fits within the box preserving aspect" {
+    // The media display box is 420 x 250.
+    try std.testing.expectEqual(FitBox{ .width = 420, .height = 250 }, fitBox(2100, 1250, 420, 250));
+    try std.testing.expectEqual(FitBox{ .width = 168, .height = 250 }, fitBox(840, 1250, 420, 250));
+    try std.testing.expectEqual(FitBox{ .width = 420, .height = 200 }, fitBox(2100, 1000, 420, 250));
+    try std.testing.expectEqual(FitBox{ .width = 40, .height = 25 }, fitBox(40, 25, 420, 250));
+    try std.testing.expectEqual(FitBox{ .width = 1, .height = 1 }, fitBox(0, 0, 420, 250));
+    try std.testing.expectEqual(FitBox{ .width = 1, .height = 250 }, fitBox(1, 10000, 420, 250));
 }
