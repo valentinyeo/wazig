@@ -3951,8 +3951,9 @@ fn drawScrollbar(hdc: win.HDC, strip: win.RECT, info: ScrollInfo, brush: win.HBR
     const t = trackOf(strip);
     const geom = scrollbar.thumbGeom(t.top, t.h, info.total, info.page, info.top, scrollbar_min_thumb) orelse return;
     const width = strip.right - strip.left - 2;
-    // Fully-rounded pill: corner square equals the thumb width.
-    const rgn = win.CreateRoundRectRgn(strip.left + 1, geom.top, strip.right - 1 + 1, geom.top + geom.height + 1, width, width) orelse return;
+    // Fully-rounded pill: corner square equals the thumb width. GDI regions
+    // exclude the right and bottom edges, hence the un-adjusted coordinates.
+    const rgn = win.CreateRoundRectRgn(strip.left + 1, geom.top, strip.right - 1, geom.top + geom.height, width, width) orelse return;
     defer _ = win.DeleteObject(rgn);
     _ = win.FillRgn(hdc, rgn, brush);
 }
@@ -4436,6 +4437,10 @@ fn canvasProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win
             handleCanvasClick(a, hwnd, x, y);
             return 0;
         },
+        win.WM_CAPTURECHANGED => {
+            a.sb_drag = .none;
+            return 0;
+        },
         win.WM_RBUTTONUP => {
             const x: i32 = @as(i16, @bitCast(loword(@as(usize, @bitCast(lparam)))));
             const y: i32 = @as(i16, @bitCast(hiword(@as(usize, @bitCast(lparam)))));
@@ -4627,6 +4632,7 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
         },
         win.WM_CAPTURECHANGED => {
             a.compose_dragging = false;
+            a.sb_drag = .none;
             return 0;
         },
         win.WM_DRAWITEM => {
