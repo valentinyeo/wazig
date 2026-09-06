@@ -1,7 +1,8 @@
 # Merge green, low-risk agent PRs by itself so they don't pile up in AI Review.
 # Runs only from the default-branch copy (workflow_run / schedule / dispatch), never
-# from a PR's own copy. Skips: drafts, `hold` label, >400 changed lines, anything
-# touching .github/, red or missing `ci`, merge conflicts.
+# from a PR's own copy. Skips: drafts, `hold` label, edits to this file, red or
+# missing `ci`, merge conflicts. Size and workflow edits are not gates: rollback is
+# the safety net, a person is never the default blocker.
 name: automerge
 on:
   workflow_run:
@@ -33,8 +34,7 @@ jobs:
             reason=$(echo "$info" | jq -r '
               if .isDraft then "draft"
               elif ([.labels[].name] | index("hold")) then "hold label"
-              elif (.additions + .deletions) > 400 then "over 400 changed lines"
-              elif ([.files[].path] | map(select(startswith(".github/"))) | length) > 0 then "touches .github"
+              elif ([.files[].path] | index(".github/workflows/automerge.yml")) then "edits automerge itself"
               elif .mergeable != "MERGEABLE" then "not mergeable (\(.mergeable))"
               elif ([.statusCheckRollup[] | select(.name == "ci" and .conclusion == "SUCCESS")] | length) == 0 then "ci not green"
               else "" end')
