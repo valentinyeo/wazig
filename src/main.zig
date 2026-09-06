@@ -2445,14 +2445,14 @@ fn scrollToSelectedMessage(a: *App) void {
     _ = win.GetClientRect(canvas, &client);
     const bubble_width = std.math.clamp(@divTrunc((client.right - client.left) * 7, 10), 280, 620);
     var total_height: i32 = 18;
-    for (a.messages[0..a.message_count], 0..) |*message, index| total_height += measureMessage(hdc, a, message, bubble_width, showSenderName(a, index)) + 8;
+    for (a.messages[0..a.message_count], 0..) |*message, index| total_height += measureMessage(hdc, a, message, bubble_width, showSenderName(a, index)) + messageGap(a, index);
     a.max_scroll = @max(0, total_height - (client.bottom - client.top));
     var y = client.bottom - 14 + a.scroll_y;
     var index = a.message_count;
     while (index > 0) {
         index -= 1;
         const height = measureMessage(hdc, a, &a.messages[index], bubble_width, showSenderName(a, index));
-        y -= height + 8;
+        y -= height + messageGap(a, index);
         if (index != selected) continue;
         if (y < client.top + 8) a.scroll_y += client.top + 8 - y;
         if (y + height > client.bottom - 8) a.scroll_y -= y + height - (client.bottom - 8);
@@ -3694,10 +3694,15 @@ fn showSenderName(a: *App, index: usize) bool {
     return !std.mem.eql(u16, message.sender.slice(), previous.sender.slice());
 }
 
+// Nearly zero gap inside a same-sender run; normal gap when a new sender starts.
+fn messageGap(a: *App, index: usize) i32 {
+    return if (showSenderName(a, index)) 8 else 2;
+}
+
 fn measureMessage(hdc: win.HDC, a: *App, message: *const Message, width: i32, show_sender: bool) i32 {
     _ = win.SelectObject(hdc, @ptrCast(a.font.?));
-    const header_height: i32 = if (show_sender) 42 else 22;
-    var height = wrapMixedSink(hdc, a, if (message.text.len > 0) message.text.ptr() else lit(" "), if (message.text.len > 0) @intCast(message.text.len) else 1, width - 28, false, 0, 0, message) + header_height;
+    const header_height: i32 = if (show_sender) 34 else 12;
+    var height = wrapMixedSink(hdc, a, if (message.text.len > 0) message.text.ptr() else lit(" "), if (message.text.len > 0) @intCast(message.text.len) else 1, width - 24, false, 0, 0, message) + header_height;
     if (message.bitmap_height > 0) {
         height += message.bitmap_height + 8;
     } else if (message.media_type.len > 0) height += 54;
@@ -3705,10 +3710,10 @@ fn measureMessage(hdc: win.HDC, a: *App, message: *const Message, width: i32, sh
     if (message.transcript.len > 0) {
         _ = win.SelectObject(hdc, @ptrCast(a.font.?));
         const shown: c_int = if (message.transcript_expanded) @intCast(message.transcript.len) else @intCast(@min(message.transcript.len, 400));
-        height += transcriptRender(hdc, a, message, shown, width - 28, false, 0, 0) + 22;
+        height += transcriptRender(hdc, a, message, shown, width - 24, false, 0, 0) + 22;
     }
     if (message.reaction.len > 0) height += 18;
-    const min_height: i32 = if (show_sender) 58 else 38;
+    const min_height: i32 = if (show_sender) 48 else 30;
     return @max(height, min_height);
 }
 
@@ -3808,7 +3813,7 @@ fn drawCanvas(hwnd: win.HWND, a: *App) void {
         "";
     const in_group = std.mem.endsWith(u8, chat_jid, "@g.us");
     var total_height: i32 = 18;
-    for (a.messages[0..a.message_count], 0..) |*message, index| total_height += measureMessage(hdc, a, message, bubble_width, showSenderName(a, index)) + 8;
+    for (a.messages[0..a.message_count], 0..) |*message, index| total_height += measureMessage(hdc, a, message, bubble_width, showSenderName(a, index)) + messageGap(a, index);
     a.max_scroll = @max(0, total_height - (client.bottom - client.top));
     a.scroll_y = std.math.clamp(a.scroll_y, 0, a.max_scroll);
     var y = client.bottom - 14 + a.scroll_y;
@@ -3822,7 +3827,7 @@ fn drawCanvas(hwnd: win.HWND, a: *App) void {
         message.word_count = 0;
         const show_sender = showSenderName(a, index);
         const estimated_height = measureMessage(hdc, a, message, bubble_width, show_sender);
-        y -= estimated_height + 8;
+        y -= estimated_height + messageGap(a, index);
         if (y > client.bottom or y + estimated_height < client.top) continue;
         ensureBitmap(a, message);
         const height = measureMessage(hdc, a, message, bubble_width, show_sender);
@@ -3842,21 +3847,21 @@ fn drawCanvas(hwnd: win.HWND, a: *App) void {
         if (selection_pen) |pen| _ = win.DeleteObject(pen);
         _ = win.DeleteObject(brush);
 
-        var text_top = y + 8;
+        var text_top = y + 6;
         if (show_sender) {
             _ = win.SelectObject(hdc, @ptrCast(a.font_bold.?));
             _ = win.SetTextColor(hdc, if (message.from_me) color_text else rgb(83, 189, 235));
-            var sender_rect = win.RECT{ .left = left + 12, .top = y + 8, .right = right - 52, .bottom = y + 28 };
+            var sender_rect = win.RECT{ .left = left + 12, .top = y + 6, .right = right - 52, .bottom = y + 26 };
             const sender_text = message.sender.slice();
             if (containsEmoji(sender_text)) {
                 const line_h = textLineHeight(hdc, a.font_bold.?);
-                _ = drawMixedLine(hdc, a.font_bold.?, a.font_emoji orelse a.font_bold.?, sender_text, left + 12, y + 8 + @divTrunc(20 - line_h, 2));
+                _ = drawMixedLine(hdc, a.font_bold.?, a.font_emoji orelse a.font_bold.?, sender_text, left + 12, y + 6 + @divTrunc(20 - line_h, 2));
             } else {
                 _ = win.DrawTextW(hdc, message.sender.ptr(), @intCast(message.sender.len), &sender_rect, win.DT_LEFT | win.DT_SINGLELINE | win.DT_END_ELLIPSIS);
             }
-            text_top = y + 28;
+            text_top = y + 26;
         }
-        if (show_sender and in_group and !message.from_me and message.sender.len > 0) drawSenderAvatar(hdc, a, left - 38, y + 8, message);
+        if (show_sender and in_group and !message.from_me and message.sender.len > 0) drawSenderAvatar(hdc, a, left - 38, y + 6, message);
         if (message.bitmap) |bitmap| {
             const image_left = left + @divTrunc(bubble_width - message.bitmap_width, 2);
             const image_top = text_top + 4;
