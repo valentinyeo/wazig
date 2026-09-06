@@ -779,15 +779,13 @@ fn checkMarkRead(a: *App) void {
         _ = child.wait(a.io) catch {};
         a.read_child = null;
         removeFirstPendingRead(a);
-        retryPendingDownload(a);
-        // Release any sends or archives that queued up while the store was
-        // held, then bring live sync back. startSync skips itself while a
-        // write job is running.
         startNextSend(a);
         startNextArchive(a);
         startSync(a);
         refreshChats(a);
         setStatus(a, if (code == 0) "Chat marked as read" else "Mark as read failed");
+        // After the status above so a queued download's own message shows.
+        retryPendingDownload(a);
     } else startNextMarkRead(a);
 }
 
@@ -1229,15 +1227,13 @@ fn downloadMedia(a: *App, message_index: usize, automatic: bool) void {
     const message = &a.messages[message_index];
     if (message.media_type.len == 0 or message.id.len == 0) return;
     if (a.media_child != null or a.read_child != null or a.pending_read_count > 0) {
-        if (!automatic and message.id.len > 0) {
+        if (!automatic) {
             // Reads have no queue a click can join, so remember the request
             // and start it once the mark-read job finishes.
             a.pending_download_jid.set(a.chats[a.selected_chat].jid.slice());
             a.pending_download_id.set(message.id.slice());
             setStatus(a, "Attachment download queued");
-            return;
         }
-        if (!automatic) setStatus(a, "Waiting for the current download to finish");
         return;
     }
     setStatus(a, if (automatic) "Downloading media..." else "Downloading attachment...");
