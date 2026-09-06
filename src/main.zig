@@ -3252,6 +3252,10 @@ fn paletteProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: wi
             }
             return win.DefWindowProcW(hwnd, message, wparam, lparam);
         },
+        win.WM_CAPTURECHANGED => {
+            a.sb_drag = .none;
+            return 0;
+        },
         win.WM_ACTIVATE => {
             if (loword(wparam) == win.WA_INACTIVE) {
                 if (a.palette_ever_active) _ = win.DestroyWindow(hwnd);
@@ -4439,6 +4443,7 @@ fn canvasProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win
         },
         win.WM_CAPTURECHANGED => {
             a.sb_drag = .none;
+            a.text_dragging = false;
             return 0;
         },
         win.WM_RBUTTONUP => {
