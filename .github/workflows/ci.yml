@@ -47,7 +47,7 @@ jobs:
 
   # Builds TDLib for Windows once and links the Telegram-enabled binary.
   # The install dir is cached, so the expensive C++ build runs only when the
-  # pinned TDLib commit or the script changes.
+  # pinned TDLib commit or this script changes.
   tdlib:
     name: tdlib
     runs-on: ubuntu-latest
