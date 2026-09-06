@@ -10,20 +10,75 @@ jobs:
   build:
     name: build
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
       - name: Check tag shape
+        env:
+          TDLIB_COMMIT: d1085f9cebc5a62379991ae1652673954f229c1f
         run: |
           case "${GITHUB_REF_NAME}" in
             v[0-9]*.[0-9]*.[0-9]*) ;;
             *) echo "tag ${GITHUB_REF_NAME} is not vX.Y.Z" >&2; exit 1 ;;
           esac
+      - name: Install toolchain
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq g++-mingw-w64-x86-64 gperf php-cli cmake ninja-build
+      - name: Restore TDLib
+        id: tdcache
+        uses: actions/cache@v4
+        with:
+          path: /tmp/tdlib-install
+          key: tdlib-${{ env.TDLIB_COMMIT }}-${{ hashFiles('.github/workflows/release.yml') }}
+      - name: Build TDLib
+        if: steps.tdcache.outputs.cache-hit != 'true'
+        run: |
+          P=/tmp/tdbuild-prefix
+          mkdir -p "$P" /tmp/tdlib-install
+          git clone --depth 1 --branch v1.3.1 https://github.com/madler/zlib.git /tmp/zlibsrc
+          (cd /tmp/zlibsrc && CC=x86_64-w64-mingw32-gcc ./configure --static --prefix="$P" && make -j$(nproc) install)
+          git clone --depth 1 --branch openssl-3.3.2 https://github.com/openssl/openssl.git /tmp/opensslsrc
+          (cd /tmp/opensslsrc && ./Configure mingw64 no-shared no-tests no-docs --libdir=lib --prefix="$P" --cross-compile-prefix=x86_64-w64-mingw32- && make -j$(nproc) -s install_sw && cp -n "$P/lib64"/*.a "$P/lib/" 2>/dev/null || true)
+          git clone https://github.com/tdlib/td.git /tmp/tdsrc
+          (cd /tmp/tdsrc && git checkout "$TDLIB_COMMIT")
+          # Stage 1: build TDLib's host generators natively; they write the
+          # generated sources into the shared source tree.
+          cmake -S /tmp/tdsrc -B /tmp/tdsrc/build-host -DCMAKE_BUILD_TYPE=Release -DTD_ENABLE_JNI=OFF
+          cmake --build /tmp/tdsrc/build-host --target prepare_cross_compiling -j$(nproc)
+          # Stage 2: cross-compile TDLib itself for Windows.
+          cmake -S /tmp/tdsrc -B /tmp/tdsrc/build -G Ninja \
+            -DCMAKE_SYSTEM_NAME=Windows \
+            -DCMAKE_CXX_COMPILER=x86_64-w64-mingw32-g++ \
+            -DCMAKE_C_COMPILER=x86_64-w64-mingw32-gcc \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DOPENSSL_ROOT_DIR="$P" \
+            -DZLIB_INCLUDE_DIR="$P/include" \
+            -DZLIB_LIBRARY="$P/lib/libz.a" \
+            -DTD_ENABLE_JNI=OFF \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON
+          cmake --build /tmp/tdsrc/build --target tdjson_static -j$(nproc)
+          mkdir -p /tmp/tdlib-install/lib /tmp/tdlib-install/include/td
+          find /tmp/tdsrc/build -name '*.a' -exec cp {} /tmp/tdlib-install/lib/ \;
+          cp "$P"/lib/libcrypto.a "$P"/lib/libssl.a "$P"/lib/libz.a /tmp/tdlib-install/lib/
+          for m in tdactor tdclient tdcore tdnet tdutils tddb tdmtproto tde2e; do cp -r /tmp/tdsrc/$m/td/. /tmp/tdlib-install/include/td/ 2>/dev/null || true; done
+          cp -r /tmp/tdsrc/td/. /tmp/tdlib-install/include/td/
+          cp -r /tmp/tdsrc/td/generate/auto/td/. /tmp/tdlib-install/include/td/
       - name: Build
-        run: zig build -Dtarget=x86_64-windows-gnu --release=small -Dversion="${GITHUB_REF_NAME#v}"
+        env:
+          TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+        run: |
+          if [ -z "$TELEGRAM_API_ID" ]; then
+            echo "Release builds require the TELEGRAM_API_ID and TELEGRAM_API_HASH secrets" >&2
+            exit 1
+          fi
+          zig build -Dtarget=x86_64-windows-gnu --release=small -Dversion="${GITHUB_REF_NAME#v}" \
+            -Dtdlib=/tmp/tdlib-install \
+            -Dtelegram-api-id="$TELEGRAM_API_ID" \
+            -Dtelegram-api-hash="$TELEGRAM_API_HASH"
       - name: Package zip
         run: |
           cd zig-out/bin

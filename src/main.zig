@@ -34,6 +34,9 @@ const win = @cImport({
 const build_info = @import("build_info");
 const app_version = build_info.version;
 const update = @import("update.zig");
+const tg = if (build_info.td_enabled) @import("telegram.zig") else @import("telegram_stub.zig");
+const tj = @import("telegram_json.zig");
+const transport = @import("transport.zig");
 
 const max_chats = 256;
 const max_groups = 1024;
@@ -47,6 +50,10 @@ const timer_animation = 3;
 const timer_chat_select = 4;
 const timer_update_check = 5;
 const timer_update_restart = 6;
+const timer_telegram = 7;
+// Telegram-specific commands live past the shared palette command block.
+const command_telegram_login = 2025;
+const command_telegram_logout = 2026;
 const wm_update_ready = win.WM_APP + 2;
 const wm_wacli_done = win.WM_APP + 3;
 const wacli_queue_size = 8;
@@ -172,12 +179,28 @@ const Chat = struct {
     unread: bool = false,
     pinned: bool = false,
     archived: bool = false,
+    provider: transport.Provider = .whatsapp,
 };
 
 const Group = struct {
     jid: Utf8Text(191) = .{},
     name: Utf8Text(255) = .{},
 };
+
+// Telegram chats the UI caches between refreshes; ids are the exact 64-bit
+// Telegram chat ids and every lookup is provider-qualified through provider
+// tags on Chat/Message.
+const max_tg_chats = 64;
+const TgChat = struct {
+    id: i64 = 0,
+    name: WideText(159) = .{},
+    kind: Utf8Text(31) = .{},
+    timestamp: Utf8Text(47) = .{},
+    unread_count: i32 = 0,
+    is_group: bool = false,
+};
+
+const TgLoginMode = enum { none, phone, code, password };
 
 const PendingSend = struct {
     jid: Utf8Text(191) = .{},
@@ -251,6 +274,7 @@ const Message = struct {
     link_count: usize = 0,
     word_rects: [256]WordSpan = [_]WordSpan{.{}} ** 256,
     word_count: usize = 0,
+    tg_file_id: i32 = 0,
     transcript_expanded: bool = false,
     toggle_hit: win.RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 },
     media_hit: win.RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 },
@@ -383,6 +407,12 @@ const App = struct {
     sb_palette_total: i32 = -1,
     chats: [max_chats]Chat = [_]Chat{.{}} ** max_chats,
     chat_count: usize = 0,
+    telegram: ?*tg.Client = null,
+    tg_chats: [max_tg_chats]TgChat = [_]TgChat{.{}} ** max_tg_chats,
+    tg_chat_count: usize = 0,
+    tg_login: TgLoginMode = .none,
+    tg_auth: tj.AuthState = .unknown,
+    tg_dirty: bool = false,
     groups: [max_groups]Group = [_]Group{.{}} ** max_groups,
     group_count: usize = 0,
     messages: [max_messages]Message = [_]Message{.{}} ** max_messages,
@@ -1065,6 +1095,7 @@ fn applyChats(a: *App, raw: []const u8) void {
         a.chats[a.chat_count] = chat;
         a.chat_count += 1;
     }
+    if (!a.show_archived) appendTelegramChats(a, query_utf8);
     var i: usize = 1;
     while (i < a.chat_count) : (i += 1) {
         var j = i;
@@ -1134,9 +1165,309 @@ fn applyChats(a: *App, raw: []const u8) void {
     }
 }
 
+// --------------------------------------------------------------- Telegram
+
+fn tgChatIdString(buffer: *[24]u8, chat_id: i64) []const u8 {
+    return std.fmt.bufPrint(buffer, "{d}", .{chat_id}) catch "";
+}
+
+fn selectedChatIsTelegram(a: *const App) bool {
+    return a.selected_chat < a.chat_count and a.chats[a.selected_chat].provider == .telegram;
+}
+
+fn tgSelectedChatId(a: *const App) ?i64 {
+    if (!selectedChatIsTelegram(a)) return null;
+    return std.fmt.parseInt(i64, a.chats[a.selected_chat].jid.slice(), 10) catch null;
+}
+
+fn tgSelectedChatIsGroup(a: *App) bool {
+    const chat_id = tgSelectedChatId(a) orelse return false;
+    for (a.tg_chats[0..a.tg_chat_count]) |cached| {
+        if (cached.id == chat_id) return cached.is_group;
+    }
+    // Unknown chat: refuse the send rather than risk writing to a group.
+    return true;
+}
+
+fn upsertTgChat(a: *App, info: *tg.ChatInfo) void {
+    var index: usize = 0;
+    while (index < a.tg_chat_count) : (index += 1) {
+        if (a.tg_chats[index].id == info.id) break;
+    }
+    if (index == a.tg_chat_count) {
+        if (a.tg_chat_count >= max_tg_chats) return;
+        a.tg_chat_count += 1;
+        a.tg_chats[index] = .{ .id = info.id };
+    }
+    const cached = &a.tg_chats[index];
+    if (info.title.len > 0) cached.name.set(a.allocator, info.title);
+    cached.kind.set(if (info.is_group) "Telegram group" else "Telegram");
+    cached.unread_count = info.unread_count;
+    cached.is_group = info.is_group or info.is_channel;
+    if (info.last_date != 0) {
+        var buffer: [20]u8 = undefined;
+        cached.timestamp.set(tj.formatTimestamp(&buffer, info.last_date));
+    }
+}
+
+fn appendTelegramChats(a: *App, query_utf8: ?[]const u8) void {
+    if (a.telegram == null or a.tg_auth != .ready) return;
+    for (a.tg_chats[0..a.tg_chat_count]) |cached| {
+        if (a.chat_count >= max_chats) break;
+        const name_bytes = std.unicode.utf16LeToUtf8Alloc(a.allocator, cached.name.slice()) catch continue;
+        defer a.allocator.free(name_bytes);
+        if (query_utf8) |query| {
+            if (!containsIgnoreCase(name_bytes, query) and
+                !containsIgnoreCase(cached.timestamp.slice(), query)) continue;
+        }
+        var chat = Chat{};
+        var id_buffer: [24]u8 = undefined;
+        chat.jid.set(tgChatIdString(&id_buffer, cached.id));
+        chat.name.set(a.allocator, name_bytes);
+        chat.kind.set(a.allocator, cached.kind.slice());
+        chat.timestamp.set(cached.timestamp.slice());
+        chat.unread = cached.unread_count > 0;
+        chat.unread_count = cached.unread_count;
+        chat.provider = .telegram;
+        a.chats[a.chat_count] = chat;
+        a.chat_count += 1;
+    }
+}
+
+/// Drains parsed TDLib events and applies them to the UI. Runs on the timer
+/// tick, so nothing here may block.
+fn drainTelegram(a: *App) void {
+    const client = a.telegram orelse return;
+    while (client.poll()) |event_in| {
+        var event = event_in;
+        defer event.deinit(a.allocator);
+        switch (event) {
+            .auth => |auth| {
+                if (auth.state != .unknown) {
+                    a.tg_auth = auth.state;
+                    a.tg_dirty = true;
+                }
+                switch (auth.state) {
+                    .wait_phone => openTelegramLogin(a, .phone),
+                    .wait_code => openTelegramLogin(a, .code),
+                    .wait_password => openTelegramLogin(a, .password),
+                    .ready => {
+                        a.tg_login = .none;
+                        client.requestChats();
+                        setStatus(a, "Telegram connected");
+                    },
+                    .closed => {
+                        a.tg_login = .none;
+                        a.tg_chat_count = 0;
+                        refreshChats(a);
+                        setStatus(a, "Telegram disconnected");
+                    },
+                    else => {},
+                }
+                if (auth.error_text.len > 0) setStatus(a, auth.error_text);
+            },
+            .chat => |*info| {
+                upsertTgChat(a, info);
+                a.tg_dirty = true;
+            },
+            .message => |msg| {
+                if (tgSelectedChatId(a)) |selected_id| {
+                    if (msg.chat_id == selected_id) refreshMessages(a);
+                }
+            },
+            .history_done => {
+                if (selectedChatIsTelegram(a)) refreshMessages(a);
+            },
+            .deleted => {
+                if (selectedChatIsTelegram(a)) refreshMessages(a);
+            },
+            .file => |file_update| {
+                if (file_update.local_path.len > 0 and selectedChatIsTelegram(a)) refreshMessages(a);
+            },
+            .chats_synced => {
+                a.tg_dirty = true;
+                client.requestChats();
+            },
+            .chat_last_date => |last_message| {
+                var index: usize = 0;
+                while (index < a.tg_chat_count) : (index += 1) {
+                    if (a.tg_chats[index].id == last_message.chat_id) {
+                        a.tg_chats[index].timestamp.set(last_message.timestamp);
+                        a.tg_dirty = true;
+                        break;
+                    }
+                }
+            },
+            .user => {},
+            .conn, .ignored => {},
+        }
+    }
+    if (a.tg_dirty and !a.show_archived) {
+        a.tg_dirty = false;
+        refreshChats(a);
+    } else a.tg_dirty = false;
+}
+
+/// Auto-downloads media for the open Telegram chat: the product rule is all
+/// media downloads the moment a chat is opened, never a click to load.
+fn telegramAutoDownload(a: *App) void {
+    const client = a.telegram orelse return;
+    for (a.messages[0..a.message_count]) |*message| {
+        if (message.tg_file_id == 0 or message.local_path.len > 0) continue;
+        client.download(message.tg_file_id);
+    }
+}
+
+fn refreshTelegramMessages(a: *App) void {
+    const client = a.telegram orelse return;
+    const chat_id = tgSelectedChatId(a) orelse return;
+    const snapshot = client.historySnapshot(a.allocator, chat_id);
+    defer client.freeHistorySnapshot(a.allocator, snapshot);
+    var selected_id = Utf8Text(191){};
+    if (a.selected_message) |selected| {
+        if (selected < a.message_count) selected_id.set(a.messages[selected].id.slice());
+    }
+    clearMessages(a);
+    a.selected_message = null;
+    const take = @min(snapshot.len, max_messages);
+    var source_index = take;
+    while (source_index > 0) {
+        source_index -= 1;
+        const msg = &snapshot[source_index];
+        var message = Message{};
+        var id_buffer: [24]u8 = undefined;
+        message.id.set(tgChatIdString(&id_buffer, msg.id));
+        message.sender_jid.set(a.chats[a.selected_chat].jid.slice());
+        message.sender.set(a.allocator, if (msg.sender_name.len > 0) msg.sender_name else "Unknown");
+        message.from_me = msg.from_me;
+        message.text.set(a.allocator, tgDisplayText(msg));
+        message.mime_type.set(msg.mime);
+        message.local_path.set(a.allocator, msg.local_path);
+        message.tg_file_id = msg.file_id;
+        message.media_type.set(switch (msg.media_kind) {
+            .photo => "image",
+            .sticker => "sticker",
+            .voice => "audio",
+            .video => "video",
+            .document => "document",
+            else => "",
+        });
+        // ponytail: animated TGS/WebM stickers render as text placeholders;
+        // upgrade path: decode Lottie/WebM once a decoder is vendored.
+        if (msg.media_kind == .sticker and msg.animated_sticker) {
+            message.tg_file_id = 0;
+            message.text.set(a.allocator, "[Animated sticker]");
+        }
+        if (msg.duration_ms > 0) {
+            var duration_buffer: [24]u8 = undefined;
+            const duration = std.fmt.bufPrint(&duration_buffer, "[Voice message {d}s]", .{@divTrunc(msg.duration_ms, 1000)}) catch "[Voice message]";
+            if (message.text.len == 0) message.text.set(a.allocator, duration);
+        }
+        formatTime(&message.time, a.allocator, msg.timestamp);
+        a.messages[a.message_count] = message;
+        a.message_count += 1;
+        const stored = &a.messages[a.message_count - 1];
+        if (isAudio(stored) and stored.local_path.len > 0) loadTranscriptCache(a, stored);
+    }
+    if (selected_id.len > 0) {
+        for (a.messages[0..a.message_count], 0..) |*message, index| {
+            if (std.mem.eql(u8, selected_id.slice(), message.id.slice())) {
+                a.selected_message = index;
+                break;
+            }
+        }
+    }
+    a.scroll_y = 0;
+    a.displayed_jid.set(a.chats[a.selected_chat].jid.slice());
+    a.displayed_timestamp.set(a.chats[a.selected_chat].timestamp.slice());
+    if (a.canvas) |canvas| _ = win.InvalidateRect(canvas, null, win.TRUE);
+    telegramAutoDownload(a);
+    markChatRead(a);
+}
+
+fn tgDisplayText(msg: *const tg.Msg) []const u8 {
+    if (msg.text.len > 0) return msg.text;
+    return switch (msg.media_kind) {
+        .photo => "[Photo]",
+        .sticker => "[Sticker]",
+        .voice => "[Voice message]",
+        .video => "[Video]",
+        .document => "[Document]",
+        else => "",
+    };
+}
+
+fn openTelegramLogin(a: *App, mode: TgLoginMode) void {
+    a.tg_login = mode;
+    setStatus(a, switch (mode) {
+        .phone => "Telegram: type your phone number in the box and press Enter",
+        .code => "Telegram: type the login code and press Enter",
+        .password => "Telegram: type your 2FA password and press Enter",
+        .none => "Telegram",
+    });
+    if (a.palette == null) {
+        buildPaletteItems(a);
+        showPaletteWindow(a);
+    }
+    if (a.palette_edit) |edit| _ = win.SetFocus(edit);
+}
+
+fn handleTgLoginInput(a: *App) void {
+    const client = a.telegram orelse return;
+    var wide_buffer: [128]u16 = [_]u16{0} ** 128;
+    const length: usize = if (a.palette_edit) |edit|
+        @intCast(win.GetWindowTextW(edit, &wide_buffer, wide_buffer.len))
+    else
+        0;
+    if (length == 0) return;
+    const text = std.unicode.utf16LeToUtf8Alloc(a.allocator, wide_buffer[0..length]) catch return;
+    defer a.allocator.free(text);
+    const trimmed = std.mem.trim(u8, text, " ");
+    switch (a.tg_login) {
+        .phone => client.authPhone(trimmed),
+        .code => client.authCode(trimmed),
+        .password => client.authPassword(trimmed),
+        .none => return,
+    }
+    a.tg_login = .none;
+    closePalette(a);
+    setStatus(a, "Telegram: checking with Telegram...");
+}
+
+fn tdlibSmoke(io: std.Io) u8 {
+    // Headless init check for CI: create the client, expect the first
+    // authorization state within 20 seconds, then exit. No GUI, no login.
+    const client = tg.Client.create(std.heap.page_allocator, io, 1, "smoke", "tdlib-smoke") orelse return 1;
+    defer client.destroy();
+    var waited_ms: u32 = 0;
+    while (waited_ms < 20_000) {
+        if (client.poll()) |event_in| {
+            var event = event_in;
+            defer event.deinit(std.heap.page_allocator);
+            if (event == .auth) return 0;
+        }
+        io.sleep(std.Io.Duration.fromMilliseconds(100), .awake) catch return 1;
+        waited_ms += 100;
+    }
+    return 1;
+}
+
 fn markChatRead(a: *App) void {
     if (!a.user_viewed or a.selected_chat >= a.chat_count) return;
     const chat = &a.chats[a.selected_chat];
+    if (chat.provider == .telegram) {
+        // Telegram has no store lock: mark read directly on the client with
+        // the newest visible message id.
+        if (a.message_count > 0) {
+            const last = a.messages[a.message_count - 1];
+            const chat_id = tgSelectedChatId(a) orelse return;
+            const message_id = std.fmt.parseInt(i64, last.id.slice(), 10) catch return;
+            if (a.telegram) |client| client.markRead(chat_id, message_id);
+        }
+        chat.unread = false;
+        chat.unread_count = 0;
+        return;
+    }
     if (!chat.unread and chat.unread_count == 0) return;
     // Clear the badge once the request is queued or already in flight; if
     // the queue is full, keep the unread state so the next view retries.
@@ -2636,6 +2967,7 @@ fn refreshMessages(a: *App) void {
         return;
     }
     const chat = &a.chats[a.selected_chat];
+    if (chat.provider == .telegram) return refreshTelegramMessages(a);
     const chat_changed = !std.mem.eql(u8, a.displayed_jid.slice(), chat.jid.slice());
     if (chat_changed) stopAudio(a);
     // Instant first paint: render the chat's last known response from the
@@ -2882,6 +3214,23 @@ fn sendMessage(a: *App) void {
     if (length == 0) return;
     const text = std.unicode.utf16LeToUtf8Alloc(a.allocator, wide_buffer[0..length]) catch return;
     defer a.allocator.free(text);
+
+    if (selectedChatIsTelegram(a)) {
+        if (tgSelectedChatIsGroup(a)) {
+            setStatus(a, "Telegram groups are read-only in this version");
+            return;
+        }
+        const chat_id = tgSelectedChatId(a) orelse return;
+        const client = a.telegram orelse return;
+        // The client enforces the read-only rule as a second gate; TDLib
+        // echoes the sent message back as an update, which refreshes the view.
+        if (client.sendText(chat_id, text)) {
+            _ = win.SetWindowTextW(a.compose.?, lit(""));
+            focusCompose(a);
+            setStatus(a, "Sent");
+        } else setStatus(a, "Telegram refused the message");
+        return;
+    }
 
     const pending = &a.pending_sends[a.pending_send_count];
     pending.jid.set(a.chats[a.selected_chat].jid.slice());
@@ -3423,6 +3772,13 @@ fn removeSelectedChatOptimistically(a: *App) void {
 
 fn archiveSelectedChat(a: *App) void {
     if (a.chat_count == 0 or a.selected_chat >= a.chat_count) return;
+    if (selectedChatIsTelegram(a)) {
+        // ponytail: no archive call until the exact TDLib archive method is
+        // confirmed against the pinned scheme; upgrade path: add the verified
+        // toggle and route it through the transport interface.
+        setStatus(a, "Archiving is not available for Telegram chats yet");
+        return;
+    }
     if (a.pending_archive_count >= a.pending_archives.len) {
         setStatus(a, "Archive queue is full");
         return;
@@ -3473,6 +3829,11 @@ fn buildPaletteItems(a: *App) void {
     appendPalette(a, "Remove reaction", "", reaction_remove);
     appendPalette(a, "Refresh", "R", command_refresh);
     appendPalette(a, "Restart live sync", "S", command_sync);
+    if (a.tg_auth == .ready) {
+        appendPalette(a, "Log out of Telegram", "", command_telegram_logout);
+    } else {
+        appendPalette(a, "Add Telegram account", "", command_telegram_login);
+    }
     appendPalette(a, "Open video in external player", "", command_open_video_external);
     appendPalette(a, "Quit Messages", "Q", command_quit);
 }
@@ -3575,6 +3936,10 @@ fn closePalette(a: *App) void {
 }
 
 fn paletteActivate(a: *App) void {
+    if (a.tg_login != .none) {
+        handleTgLoginInput(a);
+        return;
+    }
     if (a.palette_selected >= a.palette_match_count) return;
     const item = &a.palette_items[a.palette_matches[a.palette_selected]];
     if (item.url.len > 0) {
@@ -3869,6 +4234,25 @@ fn runCommand(a: *App, command: u16) void {
         command_sync => {
             stopSync(a);
             startSync(a);
+        },
+        command_telegram_login => {
+            if (a.telegram == null) {
+                setStatus(a, "Telegram is not available in this build");
+                return;
+            }
+            if (a.tg_auth == .ready) {
+                setStatus(a, "Telegram is already connected");
+                return;
+            }
+            openTelegramLogin(a, switch (a.tg_auth) {
+                .wait_code => .code,
+                .wait_password => .password,
+                else => .phone,
+            });
+        },
+        command_telegram_logout => {
+            if (a.telegram) |client| client.logOut();
+            setStatus(a, "Logging out of Telegram...");
         },
         command_open_video_external => {
             const selected = a.selected_message orelse {
@@ -5098,6 +5482,7 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
             layout(a, rc_create.right, rc_create.bottom);
             _ = win.SetTimer(hwnd, timer_refresh, 1000, null);
             _ = win.SetTimer(hwnd, timer_animation, 120, null);
+            _ = win.SetTimer(hwnd, timer_telegram, 250, null);
             _ = win.SetTimer(hwnd, timer_update_check, update_check_interval_ms, null);
             if (a.wacli_thread == null) {
                 a.wacli_thread = std.Thread.spawn(.{ .stack_size = 1024 * 1024 }, wacliWorkerMain, .{a}) catch null;
@@ -5282,6 +5667,8 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
                 _ = win.KillTimer(hwnd, timer_search);
                 refreshChats(a);
                 refreshMessages(a);
+            } else if (wparam == timer_telegram) {
+                drainTelegram(a);
             } else if (wparam == timer_animation) {
                 advanceGifs(a);
                 updateAudioPlayback(a);
@@ -5720,6 +6107,14 @@ fn LoadAppIcon(instance: win.HINSTANCE, cx: i32, cy: i32, flags: u32) win.HICON 
 }
 
 pub fn main(init: std.process.Init) !void {
+    var argument_iterator = try init.minimal.args.iterateAllocator(init.gpa);
+    defer argument_iterator.deinit();
+    while (argument_iterator.next()) |argument| {
+        if (std.mem.eql(u8, argument, "--tdlib-smoke")) {
+            if (!tg.enabled) std.process.exit(2);
+            std.process.exit(tdlibSmoke(init.io));
+        }
+    }
     const instance = win.GetModuleHandleW(null) orelse return error.NoModuleHandle;
     const wacli_path = try findWacli(init, init.gpa);
     defer init.gpa.free(wacli_path);
@@ -5742,6 +6137,13 @@ pub fn main(init: std.process.Init) !void {
     }
     if (openrouter_model.len == 0) openrouter_model = "openai/gpt-5.6-luna";
     var app = App{ .allocator = init.gpa, .io = init.io, .instance = instance, .wacli_path = wacli_path, .avatar_dir = avatar_dir, .deepgram_configured = deepgram_key.len > 0, .deepgram_key = deepgram_key, .openrouter_key = openrouter_key, .openrouter_model = openrouter_model, .openrouter_configured = openrouter_key.len > 0, .dictation_language = loadDictationLanguage(), .font_scale = loadFontScale() };
+    if (init.environ_map.get("LOCALAPPDATA")) |local| {
+        if (std.fs.path.join(init.gpa, &.{ local, "Messages", "telegram" })) |telegram_dir| {
+            if (tg.Client.create(init.gpa, init.io, build_info.telegram_api_id, build_info.telegram_api_hash, telegram_dir)) |client| {
+                app.telegram = client;
+            }
+        } else |_| {}
+    }
     app.played_path = findPlayedPath(init, init.gpa);
     loadPlayed(&app);
     app.store_watch_path.set(init.gpa, store_watch_path);
