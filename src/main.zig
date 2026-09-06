@@ -803,15 +803,13 @@ fn retryPendingDownload(a: *App) void {
         a.pending_download_id.set("");
         return;
     }
-    const id = a.pending_download_id.slice();
+    var found: ?usize = null;
+    for (a.messages[0..a.message_count], 0..) |*message, index| {
+        if (std.mem.eql(u8, message.id.slice(), a.pending_download_id.slice())) found = index;
+    }
     a.pending_download_jid.set("");
     a.pending_download_id.set("");
-    for (a.messages[0..a.message_count], 0..) |*message, index| {
-        if (std.mem.eql(u8, message.id.slice(), id)) {
-            downloadMedia(a, index, false);
-            return;
-        }
-    }
+    if (found) |index| downloadMedia(a, index, false);
 }
 
 fn clearMessages(a: *App) void {
