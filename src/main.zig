@@ -6479,13 +6479,28 @@ fn performUpdate(io: std.Io) !UpdateOutcome {
     const root = try cwd.createDirPathOpen(io, update_root, .{});
     defer root.close(io);
 
-    // A .old backup left by a completed earlier swap is safe to drop now.
+    // Recover from an interrupted earlier swap: if the exe was renamed to .old
+    // and its replacement never landed, restore it so the folder always holds
+    // a runnable exe. A leftover .new is debris either way.
     const exe_name = std.fs.path.basename(exe_path);
     {
         const exe_old = try std.fmt.allocPrint(allocator, "{s}\\{s}.old", .{ exe_dir, exe_name });
         defer allocator.free(exe_old);
+        const exe_new = try std.fmt.allocPrint(allocator, "{s}\\{s}.new", .{ exe_dir, exe_name });
+        defer allocator.free(exe_new);
         const exe_old_wide = try utf8ToWide(allocator, exe_old);
         defer allocator.free(exe_old_wide);
+        const exe_new_wide = try utf8ToWide(allocator, exe_new);
+        defer allocator.free(exe_new_wide);
+        const exe_here_wide = try utf8ToWide(allocator, exe_path);
+        defer allocator.free(exe_here_wide);
+        if (win.GetFileAttributesW(exe_here_wide.ptr) == win.INVALID_FILE_ATTRIBUTES and
+            win.GetFileAttributesW(exe_old_wide.ptr) != win.INVALID_FILE_ATTRIBUTES)
+        {
+            _ = win.MoveFileExW(exe_old_wide.ptr, exe_here_wide.ptr, win.MOVEFILE_REPLACE_EXISTING);
+        }
+        _ = win.DeleteFileW(exe_new_wide.ptr);
+        // A .old backup left by a completed swap is safe to drop now.
         _ = win.DeleteFileW(exe_old_wide.ptr);
     }
 
@@ -6554,37 +6569,11 @@ fn performUpdate(io: std.Io) !UpdateOutcome {
     defer allocator.free(new_exe_rel);
     _ = try stage.statFile(io, new_exe_rel, .{});
 
-    // Swap: rename the running exe aside (always allowed on Windows), copy the
-    // new files in, and roll the rename back if any copy fails.
-    const exe_old = try std.fmt.allocPrint(allocator, "{s}\\{s}.old", .{ exe_dir, exe_name });
-    defer allocator.free(exe_old);
-    const exe_old_wide = try utf8ToWide(allocator, exe_old);
-    defer allocator.free(exe_old_wide);
-    const exe_wide = try utf8ToWide(allocator, exe_path);
-    defer allocator.free(exe_wide);
-    if (win.MoveFileExW(exe_wide.ptr, exe_old_wide.ptr, win.MOVEFILE_REPLACE_EXISTING) == 0) return error.UpdateSwapFailed;
-    const stage_path = try std.fmt.allocPrint(allocator, "{s}\\stage", .{update_root});
-    defer allocator.free(stage_path);
-    if (installStagedFiles(io, allocator, stage, stage_path, inner_root, exe_dir)) {
-        _ = win.DeleteFileW(exe_old_wide.ptr); // best effort; a leftover is removed on next start
-        return .installed;
-    }
-    // Rollback: restore the old executable (the install files are untouched
-    // thanks to the two-phase copy).
-    _ = win.MoveFileExW(exe_old_wide.ptr, exe_wide.ptr, win.MOVEFILE_REPLACE_EXISTING);
-    return error.UpdateCopyFailed;
-}
-
-/// Copies every staged file (below `inner_root` inside `stage_path`) into
-/// `exe_dir`. Copies go to temporary names and are renamed into place only
-/// after every copy succeeded, so a failure leaves the existing files intact;
-/// the caller additionally restores the renamed backup of the executable.
-fn installStagedFiles(io: std.Io, allocator: std.mem.Allocator, stage: std.Io.Dir, stage_path: []const u8, inner_root: []const u8, exe_dir: []const u8) bool {
-    const Pending = struct { temp: [:0]u16, dest: [:0]u16 };
-    // Two-phase install: copy every file to "<dest>.new", then rename them into
-    // place only after all copies succeeded, so a failed copy never leaves a
-    // mixed-version install behind.
-    var pending: std.ArrayList(Pending) = .empty;
+    // Copy every staged file to a temporary `.new` name beside its destination
+    // first. The running exe and all existing files stay untouched until every
+    // byte is in place, so a failed copy can never leave the folder without a
+    // runnable exe.
+    var pending: std.ArrayList(SwapPending) = .empty;
     defer {
         for (pending.items) |p| {
             allocator.free(p.temp);
@@ -6592,6 +6581,64 @@ fn installStagedFiles(io: std.Io, allocator: std.mem.Allocator, stage: std.Io.Di
         }
         pending.deinit(allocator);
     }
+    const stage_path = try std.fmt.allocPrint(allocator, "{s}\\stage", .{update_root});
+    defer allocator.free(stage_path);
+    if (!copyStagedFiles(io, allocator, stage, stage_path, inner_root, exe_dir, &pending)) return error.UpdateCopyFailed;
+
+    // Commit: rename the running exe aside (always allowed on Windows), then
+    // move the staged files into place. Both steps are atomic renames, so the
+    // window in which no runnable exe exists is two fast operations, and any
+    // failure rolls the old exe straight back.
+    const exe_old = try std.fmt.allocPrint(allocator, "{s}\\{s}.old", .{ exe_dir, exe_name });
+    defer allocator.free(exe_old);
+    const exe_old_wide = try utf8ToWide(allocator, exe_old);
+    defer allocator.free(exe_old_wide);
+    const exe_wide = try utf8ToWide(allocator, exe_path);
+    defer allocator.free(exe_wide);
+    if (win.MoveFileExW(exe_wide.ptr, exe_old_wide.ptr, win.MOVEFILE_REPLACE_EXISTING) == 0) return error.UpdateSwapFailed;
+    if (commitSwapRenames(pending.items)) {
+        _ = win.DeleteFileW(exe_old_wide.ptr); // best effort; a leftover is removed on next start
+        return .installed;
+    }
+    // Rollback: restore the old executable (the staged files are untouched
+    // thanks to the two-phase copy).
+    _ = win.MoveFileExW(exe_old_wide.ptr, exe_wide.ptr, win.MOVEFILE_REPLACE_EXISTING);
+    return error.UpdateCopyFailed;
+}
+
+/// One staged file waiting to be renamed from its temporary `.new` name to its
+/// final destination.
+const SwapPending = struct { temp: [:0]u16, dest: [:0]u16 };
+
+/// Moves every staged `.new` file onto its destination. Returns false on the
+/// first failure and deletes the not-yet-renamed temps so no debris is left.
+fn commitSwapRenames(pending: []SwapPending) bool {
+    for (pending) |p| {
+        if (win.MoveFileExW(p.temp.ptr, p.dest.ptr, win.MOVEFILE_REPLACE_EXISTING) == 0) {
+            for (pending) |q| {
+                if (q.temp.ptr != p.temp.ptr) _ = win.DeleteFileW(q.temp.ptr);
+            }
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Copies every staged file (below `inner_root` inside `stage_path`) to a
+/// temporary `<dest>.new` name in `exe_dir`, appending one entry per file to
+/// `pending`. Returns false on any failure (missing ancestors are created,
+/// archive entries may nest arbitrarily, and paths may not escape the
+/// application directory); the caller renames the staged files into place only
+/// after every copy succeeded.
+fn copyStagedFiles(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    stage: std.Io.Dir,
+    stage_path: []const u8,
+    inner_root: []const u8,
+    exe_dir: []const u8,
+    pending: *std.ArrayList(SwapPending),
+) bool {
     var walker = stage.walk(allocator) catch return false;
     defer walker.deinit();
     while (walker.next(io) catch return false) |entry| {
@@ -6639,15 +6686,6 @@ fn installStagedFiles(io: std.Io, allocator: std.mem.Allocator, stage: std.Io.Di
         const temp_wide = utf8ToWide(allocator, temp) catch return false;
         if (win.CopyFileW(source_wide.ptr, temp_wide.ptr, win.FALSE) == 0) return false;
         pending.append(allocator, .{ .temp = temp_wide, .dest = destination_wide }) catch return false;
-    }
-    for (pending.items) |p| {
-        if (win.MoveFileExW(p.temp.ptr, p.dest.ptr, win.MOVEFILE_REPLACE_EXISTING) == 0) {
-            // Best-effort cleanup of the not-yet-renamed temps.
-            for (pending.items) |q| {
-                if (q.temp.ptr != p.temp.ptr) _ = win.DeleteFileW(q.temp.ptr);
-            }
-            return false;
-        }
     }
     return true;
 }
