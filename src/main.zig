@@ -27,6 +27,7 @@ const max_chats = 256;
 const max_groups = 1024;
 const max_messages = 100;
 const max_pending_sends = 32;
+const max_pending_reads = 8;
 const max_avatars = 256;
 const timer_refresh = 1;
 const timer_search = 2;
@@ -294,6 +295,13 @@ const App = struct {
     audio_position_ms: i64 = 0,
     audio_duration_ms: i64 = 0,
     media_child: ?std.process.Child = null,
+    read_child: ?std.process.Child = null,
+    read_spawn_failures: u32 = 0,
+    read_started_ms: u64 = 0,
+    pending_reads: [max_pending_reads]Utf8Text(191) = [_]Utf8Text(191){.{}} ** max_pending_reads,
+    pending_read_count: usize = 0,
+    pending_download_jid: Utf8Text(191) = .{},
+    pending_download_id: Utf8Text(191) = .{},
     send_child: ?std.process.Child = null,
     pending_sends: [max_pending_sends]PendingSend = [_]PendingSend{.{}} ** max_pending_sends,
     pending_send_count: usize = 0,
@@ -661,6 +669,17 @@ fn refreshChats(a: *App) void {
             a.chats[j] = temporary;
         }
     }
+    // A mark-read write may still be queued or running: keep those chats
+    // shown as read until the write lands and the next refresh reflects it.
+    for (a.chats[0..a.chat_count]) |*chat| {
+        var queued: usize = 0;
+        while (queued < a.pending_read_count) : (queued += 1) {
+            if (std.mem.eql(u8, a.pending_reads[queued].slice(), chat.jid.slice())) {
+                chat.unread = false;
+                chat.unread_count = 0;
+            }
+        }
+    }
 
     a.selected_chat = 0;
     if (selected_len > 0) {
@@ -693,13 +712,119 @@ fn markChatRead(a: *App) void {
     if (!a.user_viewed or a.selected_chat >= a.chat_count) return;
     const chat = &a.chats[a.selected_chat];
     if (!chat.unread and chat.unread_count == 0) return;
-    chat.unread = false;
-    chat.unread_count = 0;
-    const args = [_][]const u8{ a.wacli_path, "--json", "--lock-wait", "10s", "chats", "mark-read", "--chat", chat.jid.slice() };
-    if (runWacliExclusive(a, &args)) |parsed| {
-        parsed.deinit();
-    } else |_| {}
-    refreshChats(a);
+    // Clear the badge once the request is queued or already in flight; if
+    // the queue is full, keep the unread state so the next view retries.
+    var already_queued = false;
+    var index: usize = 0;
+    while (index < a.pending_read_count) : (index += 1) {
+        if (std.mem.eql(u8, a.pending_reads[index].slice(), chat.jid.slice())) already_queued = true;
+    }
+    if (already_queued or a.pending_read_count < a.pending_reads.len) {
+        if (!already_queued) {
+            a.pending_reads[a.pending_read_count].set(chat.jid.slice());
+            a.pending_read_count += 1;
+        }
+        chat.unread = false;
+        chat.unread_count = 0;
+        if (a.chats_hwnd) |list| _ = win.InvalidateRect(list, null, win.TRUE);
+    }
+    startNextMarkRead(a);
+}
+
+fn removeFirstPendingRead(a: *App) void {
+    if (a.pending_read_count == 0) return;
+    var index: usize = 1;
+    while (index < a.pending_read_count) : (index += 1) a.pending_reads[index - 1] = a.pending_reads[index];
+    a.pending_read_count -= 1;
+}
+
+// The mark-read write used to run on the UI thread with the sync child
+// stopped, so opening any unread chat froze the window for as long as the
+// store lock took. Run it as a background job like sends and archives.
+fn startNextMarkRead(a: *App) void {
+    if (a.read_child != null or a.pending_read_count == 0) return;
+    if (a.media_child != null or a.send_child != null or a.pending_send_count > 0 or
+        a.archive_child != null or a.pending_archive_count > 0 or avatarBusy(a)) return;
+    stopSync(a);
+    const child = std.process.spawn(a.io, .{
+        .argv = &.{ a.wacli_path, "--json", "--lock-wait", "10s", "chats", "mark-read", "--chat", a.pending_reads[0].slice() },
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+        .create_no_window = true,
+    }) catch {
+        // Give up after repeated spawn failures: drop the queue, restore
+        // the real unread badges via refreshChats, and let live sync run so
+        // a broken wacli cannot keep the app's sync permanently stopped.
+        a.read_spawn_failures += 1;
+        if (a.read_spawn_failures >= 3) {
+            a.pending_read_count = 0;
+            a.read_spawn_failures = 0;
+            startSync(a);
+            refreshChats(a);
+            setStatus(a, "Could not mark chats as read; unread badges restored");
+        } else setStatus(a, "Could not start mark as read; retrying");
+        return;
+    };
+    a.read_spawn_failures = 0;
+    a.read_child = child;
+    a.read_started_ms = win.GetTickCount64();
+}
+
+// The mark-read child gates every other background job, so a hung wacli must
+// not wedge the app: the lock wait is capped at 10s, so 30s means it is stuck.
+const read_timeout_ms: u64 = 30_000;
+
+fn checkMarkRead(a: *App) void {
+    if (a.read_child) |*child| {
+        const handle = child.id orelse return;
+        var code: win.DWORD = 0;
+        if (win.GetExitCodeProcess(handle, &code) == 0 or code == win.STILL_ACTIVE) {
+            if (win.GetTickCount64() - a.read_started_ms <= read_timeout_ms) return;
+            _ = child.kill(a.io);
+            code = 1;
+        }
+        _ = child.wait(a.io) catch {};
+        a.read_child = null;
+        removeFirstPendingRead(a);
+        // Drain the queue back-to-back before restarting live sync, which
+        // stays suspended while reads are pending.
+        if (a.pending_read_count > 0) {
+            startNextMarkRead(a);
+            return;
+        }
+        // Release any sends or archives that queued up while the store was
+        // held, then bring live sync back. startSync skips itself while a
+        // write job is running.
+        startNextSend(a);
+        startNextArchive(a);
+        startSync(a);
+        refreshChats(a);
+        setStatus(a, if (code == 0) "Chat marked as read" else "Mark as read failed");
+        // After the status above so a queued download's own message shows.
+        retryPendingDownload(a);
+    } else startNextMarkRead(a);
+}
+
+// A manual download clicked while a mark-read job held the store waits here;
+// start it once no read job or download is running and its message is on
+// screen (the request is dropped if the user switched chats meanwhile).
+fn retryPendingDownload(a: *App) void {
+    if (a.pending_download_id.len == 0 or a.read_child != null or a.pending_read_count > 0 or
+        a.media_child != null) return;
+    if (a.selected_chat >= a.chat_count) return;
+    if (!std.mem.eql(u8, a.pending_download_jid.slice(), a.chats[a.selected_chat].jid.slice())) {
+        a.pending_download_jid.set("");
+        a.pending_download_id.set("");
+        return;
+    }
+    var found: ?usize = null;
+    for (a.messages[0..a.message_count], 0..) |*message, index| {
+        if (std.mem.eql(u8, message.id.slice(), a.pending_download_id.slice())) found = index;
+    }
+    a.pending_download_jid.set("");
+    a.pending_download_id.set("");
+    if (found) |index| downloadMedia(a, index, false);
 }
 
 fn clearMessages(a: *App) void {
@@ -1116,12 +1241,18 @@ fn ensureBitmap(a: *App, message: *Message) void {
 
 fn downloadMedia(a: *App, message_index: usize, automatic: bool) void {
     if (message_index >= a.message_count or a.selected_chat >= a.chat_count) return;
-    if (a.media_child != null) {
-        if (!automatic) setStatus(a, "Waiting for the current download to finish");
-        return;
-    }
     const message = &a.messages[message_index];
     if (message.media_type.len == 0 or message.id.len == 0) return;
+    if (a.media_child != null or a.read_child != null or a.pending_read_count > 0) {
+        if (!automatic) {
+            // Reads have no queue a click can join, so remember the request
+            // and start it once the mark-read job finishes.
+            a.pending_download_jid.set(a.chats[a.selected_chat].jid.slice());
+            a.pending_download_id.set(message.id.slice());
+            setStatus(a, "Attachment download queued");
+        }
+        return;
+    }
     setStatus(a, if (automatic) "Downloading media..." else "Downloading attachment...");
     if (a.hwnd) |hwnd| _ = win.UpdateWindow(hwnd);
     stopSync(a);
@@ -1156,7 +1287,7 @@ fn isDownloadableMedia(message: *const Message) bool {
 }
 
 fn autoDownloadNextMedia(a: *App) void {
-    if (a.media_child != null or a.archive_child != null or a.pending_archive_count > 0) return;
+    if (a.media_child != null or a.read_child != null or a.archive_child != null or a.pending_archive_count > 0) return;
     for (a.messages[0..a.message_count], 0..) |*message, index| {
         if (!isDownloadableMedia(message) or message.local_path.len > 0 or message.id.len == 0) continue;
         if (mediaWasAttempted(a, message.id.slice())) continue;
@@ -1195,7 +1326,7 @@ fn checkAvatarDownload(a: *App) void {
 }
 
 fn requestSelectedAvatar(a: *App) void {
-    if (a.media_child != null or a.send_child != null or a.archive_child != null or a.pending_archive_count > 0 or avatarBusy(a)) return;
+    if (a.read_child != null or a.pending_read_count > 0 or a.media_child != null or a.send_child != null or a.archive_child != null or a.pending_archive_count > 0 or avatarBusy(a)) return;
     if (a.chat_count == 0 or a.selected_chat >= a.chat_count) return;
     const entry = avatarForChat(a, a.chats[a.selected_chat].jid.slice()) orelse return;
     if (entry.status != .unknown or entry.path.len == 0) return;
@@ -1650,7 +1781,12 @@ fn refreshMessages(a: *App) void {
 }
 
 fn startSync(a: *App) void {
-    if (a.sync_child != null) return;
+    // Hold off while any write job is pending: they pause live sync and
+    // serialize on the store lock, so don't fight them. checkSync restarts
+    // sync once the last job finishes.
+    if (a.sync_child != null or a.read_child != null or a.pending_read_count > 0 or
+        a.media_child != null or a.send_child != null or a.pending_send_count > 0 or
+        a.archive_child != null or a.pending_archive_count > 0 or avatarBusy(a)) return;
     const child = std.process.spawn(a.io, .{
         .argv = &.{ a.wacli_path, "--events", "sync", "--follow", "--max-reconnect", "0", "--stale-threshold", "1m", "--refresh-contacts", "--refresh-groups", "--download-media" },
         .stdin = .ignore,
@@ -1682,7 +1818,7 @@ fn stopSync(a: *App) void {
 }
 
 fn checkSync(a: *App) void {
-    if (a.media_child != null or a.send_child != null or a.pending_send_count > 0 or a.archive_child != null or a.pending_archive_count > 0 or avatarBusy(a)) return;
+    if (a.media_child != null or a.read_child != null or a.send_child != null or a.pending_send_count > 0 or a.archive_child != null or a.pending_archive_count > 0 or avatarBusy(a)) return;
     if (a.sync_child) |*child| {
         if (child.id) |handle| {
             var code: win.DWORD = 0;
@@ -1713,7 +1849,7 @@ fn removeFirstPendingSend(a: *App) void {
 }
 
 fn startNextSend(a: *App) void {
-    if (a.send_child != null or a.pending_send_count == 0) return;
+    if (a.send_child != null or a.read_child != null or a.pending_send_count == 0) return;
     stopSync(a);
     const pending = &a.pending_sends[0];
     const child = std.process.spawn(a.io, .{
@@ -2199,7 +2335,7 @@ fn removeFirstPendingArchive(a: *App) void {
 }
 
 fn startNextArchive(a: *App) void {
-    if (a.archive_child != null or a.pending_archive_count == 0) return;
+    if (a.archive_child != null or a.read_child != null or a.pending_archive_count == 0) return;
     if (a.media_child != null or a.send_child != null or a.pending_send_count > 0 or avatarBusy(a)) return;
     stopSync(a);
     const pending = &a.pending_archives[0];
@@ -3529,6 +3665,7 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
             if (wparam == timer_refresh) {
                 checkMediaDownload(a);
                 checkSend(a);
+                checkMarkRead(a);
                 checkAvatarDownload(a);
                 checkArchive(a);
                 if (a.media_child == null) {
@@ -3543,6 +3680,7 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
                         refreshChats(a);
                         if (!messagesAreCurrent(a)) refreshMessages(a);
                     }
+                    retryPendingDownload(a);
                     autoDownloadNextMedia(a);
                     requestSelectedAvatar(a);
                 }
@@ -3598,6 +3736,8 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
             a.send_child = null;
             if (a.archive_child) |*child| child.kill(a.io);
             a.archive_child = null;
+            if (a.read_child) |*child| child.kill(a.io);
+            a.read_child = null;
             stopSync(a);
             if (a.sync_job) |job| _ = win.CloseHandle(job);
             a.sync_job = null;
