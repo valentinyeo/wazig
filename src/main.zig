@@ -1634,6 +1634,44 @@ fn ensureWebPBitmap(a: *App, message: *Message) void {
     const data = readFileWin(a.allocator, path_utf8, 32 * 1024 * 1024) orelse return;
     defer a.allocator.free(data);
     if (!webp_detect.isWebPBytes(data)) return;
+    var features: webp.WebPBitstreamFeatures = undefined;
+    if (webp.WebPGetFeatures(data.ptr, data.len, &features) != webp.VP8_STATUS_OK) return;
+
+    if (features.has_animation == 0) {
+        // Decode straight to the display box: scaling inside libwebp avoids
+        // ever materializing the full-size frame.
+        const fit = webp_detect.fitBox(@intCast(features.width), @intCast(features.height), 420, 250);
+        var config: webp.WebPDecoderConfig = undefined;
+        if (webp.WebPInitDecoderConfig(&config) == 0) return;
+        config.options.use_scaling = 1;
+        config.options.scaled_width = @intCast(fit.width);
+        config.options.scaled_height = @intCast(fit.height);
+        config.output.colorspace = webp.MODE_RGBA;
+        const status = webp.WebPDecode(data.ptr, data.len, &config);
+        if (status == webp.VP8_STATUS_OK and config.output.u.RGBA.stride == @as(c_int, @intCast(fit.width * 4))) {
+            // CreateBitmapFromMemory copies synchronously, so the decoder
+            // buffer can be freed once the WIC bitmap holds the pixels.
+            var wic_bitmap: [*c]win.IWICBitmap = null;
+            const create_hr = a.wic_factory.*.lpVtbl.*.CreateBitmapFromMemory.?(
+                a.wic_factory,
+                fit.width,
+                fit.height,
+                &win.GUID_WICPixelFormat32bppRGBA,
+                fit.width * 4,
+                fit.width * fit.height * 4,
+                config.output.u.RGBA.rgba,
+                &wic_bitmap,
+            );
+            webp.WebPFreeDecBuffer(&config.output);
+            if (create_hr >= 0 and wic_bitmap != null) {
+                defer _ = wic_bitmap.*.lpVtbl.*.Release.?(wic_bitmap);
+                fillDibFromWic(a, message, @ptrCast(wic_bitmap), fit.width, fit.height);
+                return;
+            }
+        } else webp.WebPFreeDecBuffer(&config.output);
+        // Fall through to the full-size decode paths below on failure.
+    }
+
     var width: c_int = 0;
     var height: c_int = 0;
     var pixels = webp.WebPDecodeRGBA(data.ptr, data.len, &width, &height);
@@ -1660,16 +1698,15 @@ fn ensureWebPBitmap(a: *App, message: *Message) void {
     );
     if (create_hr < 0 or wic_bitmap == null) return;
     defer _ = wic_bitmap.*.lpVtbl.*.Release.?(wic_bitmap);
-    fillBitmapFromSource(a, message, @ptrCast(wic_bitmap), @intCast(width), @intCast(height));
+    fillDibFromWic(a, message, @ptrCast(wic_bitmap), @intCast(width), @intCast(height));
 }
 
-fn fillBitmapFromSource(a: *App, message: *Message, source: *win.IWICBitmapSource, source_width: win.UINT, source_height: win.UINT) void {
-    var target_width: win.UINT = @min(source_width, 420);
-    var target_height: win.UINT = @intCast(@max(1, @divTrunc(@as(u64, source_height) * target_width, source_width)));
-    if (target_height > 250) {
-        target_height = 250;
-        target_width = @intCast(@max(1, @divTrunc(@as(u64, source_width) * target_height, source_height)));
-    }
+// Copy a WIC source into the message's DIB at the given display size,
+// scaling down only when the source is larger than the display box.
+fn fillDibFromWic(a: *App, message: *Message, source: *win.IWICBitmapSource, source_width: win.UINT, source_height: win.UINT) void {
+    const fit = webp_detect.fitBox(source_width, source_height, 420, 250);
+    const target_width: win.UINT = fit.width;
+    const target_height: win.UINT = fit.height;
 
     var converter: [*c]win.IWICFormatConverter = null;
     if (a.wic_factory.*.lpVtbl.*.CreateFormatConverter.?(a.wic_factory, &converter) < 0 or converter == null) return;
@@ -1684,16 +1721,60 @@ fn fillBitmapFromSource(a: *App, message: *Message, source: *win.IWICBitmapSourc
         win.WICBitmapPaletteTypeCustom,
     ) < 0) return;
 
+    // libwebp already scaled the pixels to the display box; scaling again
+    // through the WIC scaler would resample a second time.
+    if (source_width == target_width and source_height == target_height) {
+        fillDibFromSource(a, message, @ptrCast(converter), target_width, target_height);
+        return;
+    }
+
     var scaler: [*c]win.IWICBitmapScaler = null;
     if (a.wic_factory.*.lpVtbl.*.CreateBitmapScaler.?(a.wic_factory, &scaler) < 0 or scaler == null) return;
     defer _ = scaler.*.lpVtbl.*.Release.?(scaler);
     if (scaler.*.lpVtbl.*.Initialize.?(scaler, @ptrCast(converter), target_width, target_height, win.WICBitmapInterpolationModeFant) < 0) return;
 
+    fillDibFromSource(a, message, @ptrCast(scaler), target_width, target_height);
+}
+
+fn fillBitmapFromSource(a: *App, message: *Message, source: *win.IWICBitmapSource, source_width: win.UINT, source_height: win.UINT) void {
+    const fit = webp_detect.fitBox(source_width, source_height, 420, 250);
+    const target_width: win.UINT = fit.width;
+    const target_height: win.UINT = fit.height;
+
+    var converter: [*c]win.IWICFormatConverter = null;
+    if (a.wic_factory.*.lpVtbl.*.CreateFormatConverter.?(a.wic_factory, &converter) < 0 or converter == null) return;
+    defer _ = converter.*.lpVtbl.*.Release.?(converter);
+    if (converter.*.lpVtbl.*.Initialize.?(
+        converter,
+        source,
+        &win.GUID_WICPixelFormat32bppPBGRA,
+        win.WICBitmapDitherTypeNone,
+        null,
+        0,
+        win.WICBitmapPaletteTypeCustom,
+    ) < 0) return;
+
+    // libwebp already scaled the pixels to the display box; scaling again
+    // through the WIC scaler would resample a second time.
+    if (source_width == target_width and source_height == target_height) {
+        fillDibFromSource(a, message, @ptrCast(converter), target_width, target_height);
+        return;
+    }
+
+    var scaler: [*c]win.IWICBitmapScaler = null;
+    if (a.wic_factory.*.lpVtbl.*.CreateBitmapScaler.?(a.wic_factory, &scaler) < 0 or scaler == null) return;
+    defer _ = scaler.*.lpVtbl.*.Release.?(scaler);
+    if (scaler.*.lpVtbl.*.Initialize.?(scaler, @ptrCast(converter), target_width, target_height, win.WICBitmapInterpolationModeFant) < 0) return;
+
+    fillDibFromSource(a, message, @ptrCast(scaler), target_width, target_height);
+}
+
+fn fillDibFromSource(a: *App, message: *Message, source: *win.IWICBitmapSource, target_width: win.UINT, target_height: win.UINT) void {
     const stride: win.UINT = target_width * 4;
     const byte_count: win.UINT = stride * target_height;
     const pixels = a.allocator.alloc(u8, byte_count) catch return;
     defer a.allocator.free(pixels);
-    if (scaler.*.lpVtbl.*.CopyPixels.?(@ptrCast(scaler), null, stride, byte_count, pixels.ptr) < 0) return;
+    if (source.*.lpVtbl.*.CopyPixels.?(source, null, stride, byte_count, pixels.ptr) < 0) return;
 
     var info = std.mem.zeroes(win.BITMAPINFO);
     info.bmiHeader.biSize = @sizeOf(win.BITMAPINFOHEADER);
@@ -4384,6 +4465,16 @@ fn drawCanvas(hwnd: win.HWND, a: *App) void {
     else
         "";
     const in_group = std.mem.endsWith(u8, chat_jid, "@g.us");
+    // Evict bitmaps left over from the previous frame for messages that
+    // scrolled off screen: between frames no handle is selected into a DC,
+    // and scrolling back re-decodes from the downloaded file on disk. This
+    // keeps bitmap memory bounded to roughly one viewport of images.
+    for (a.messages[0..a.message_count]) |*message| {
+        if (message.bitmap != null and message.bubble_hit.right <= message.bubble_hit.left) {
+            _ = win.DeleteObject(message.bitmap.?);
+            message.bitmap = null;
+        }
+    }
     var total_height: i32 = 18;
     for (a.messages[0..a.message_count], 0..) |*message, index| total_height += measureMessage(hdc, a, message, bubble_width, showSenderName(a, index)) + messageGap(a, index);
     a.max_scroll = @max(0, total_height - (client.bottom - client.top));
