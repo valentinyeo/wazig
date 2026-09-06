@@ -43,6 +43,12 @@ const libwebp_sources = [_][]const u8{
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{ .preferred_optimize_mode = .ReleaseSmall });
+    // ponytail: local builds without -Dversion report 0.9.7 to the self-update check;
+    // upgrade path: make -Dversion required once CI is the only release builder.
+    const version = b.option([]const u8, "version", "App version embedded for self-update (e.g. 0.9.7)") orelse "0.9.7";
+
+    const build_info = b.addOptions();
+    build_info.addOption([]const u8, "version", version);
 
     const exe = b.addExecutable(.{
         .name = "Messages",
@@ -56,6 +62,7 @@ pub fn build(b: *std.Build) void {
     // stickers need this to render.
     exe.root_module.addIncludePath(b.path("vendor/libwebp"));
     exe.root_module.addCSourceFiles(.{ .root = b.path("vendor/libwebp"), .files = &libwebp_sources });
+    exe.root_module.addOptions("build_info", build_info);
     exe.subsystem = .windows;
     exe.root_module.link_libc = true;
     for ([_][]const u8{
