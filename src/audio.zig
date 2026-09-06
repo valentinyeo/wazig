@@ -352,7 +352,7 @@ fn workerRun(self: *Player, path: []const u8) !void {
     defer acc.deinit(self.allocator);
     var acc_base: u64 = 0;
     var stretch: sola.Stretch = .{ .channels = output_channels, .percent = 100 };
-    var out_block: [sola.window_frames * output_channels]f32 = undefined;
+    var out_block: [sola.hop_frames * output_channels]f32 = undefined;
 
     var next_packet: usize = 0;
     var pending_skip: u64 = opus.pre_skip;
@@ -427,7 +427,7 @@ fn workerRun(self: *Player, path: []const u8) !void {
                 stretch.pos_scaled += @as(u64, sola.window_frames) * 100;
             }
         } else while (stretch.canEmit(acc_base, @intCast(acc.items.len / output_channels)) and
-            ringAvailableFrames(self) + sola.window_frames <= ring_cap)
+            ringAvailableFrames(self) + sola.hop_frames <= ring_cap)
         {
             stretch.emitWindow(acc.items, acc_base, @intCast(acc.items.len / output_channels), &out_block);
             ringWriteFrames(self, &out_block);
@@ -452,8 +452,10 @@ fn workerRun(self: *Player, path: []const u8) !void {
                     while (tail_i < fade) : (tail_i += 1) {
                         const t: f32 = @as(f32, @floatFromInt(tail_i)) * inv;
                         for (0..output_channels) |c| {
+                            // pending already holds the (1 - t) fade-out of
+                            // the last window; the fade-in completes it.
                             pcm[tail_i * output_channels + c] =
-                                stretch.tail[tail_i * output_channels + c] * (1 - t) + pcm[tail_i * output_channels + c] * t;
+                                stretch.pending[tail_i * output_channels + c] + pcm[tail_i * output_channels + c] * t;
                         }
                     }
                 }

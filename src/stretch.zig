@@ -2,18 +2,26 @@
 // way WhatsApp and Slack do. Pure f32 math so it is testable off-Windows.
 const std = @import("std");
 
-pub const window_frames = 960; // 20 ms at 48 kHz
-pub const overlap_frames = 240; // 5 ms crossfade between windows
+pub const window_frames = 960; // 20 ms read from the source per window
+pub const overlap_frames = 240; // 5 ms fade between consecutive windows
 pub const search_frames = 240; // alignment search range, frames
 pub const max_channels = 2;
 
+/// New stream frames emitted per window: the window read minus the overlap
+/// that is held back as the pending fade-out and completed by the next
+/// window's fade-in.
+pub const hop_frames = window_frames - overlap_frames;
+
 /// Input frames needed beyond the current position before a window can be
-/// emitted: the widest search candidate plus a full output window.
+/// emitted: the widest search candidate plus a full read window.
 pub const lookahead_frames = 2 * search_frames + window_frames;
 
-/// Emits `window_frames`-frame output windows from a caller-owned input
-/// buffer. The caller keeps the decoded PCM, tracks which absolute source
-/// frame `in` starts at, and asks for windows while enough look-ahead exists.
+/// Emits `hop_frames`-frame output blocks from a caller-owned input buffer.
+/// The caller keeps the decoded PCM, tracks which absolute source frame `in`
+/// starts at, and asks for windows while enough look-ahead exists. The last
+/// `overlap_frames` of each read are never emitted directly; they fade out
+/// into the pending buffer and are summed with the next window's fade-in, so
+/// consecutive blocks join without a time jump (the crackle bug).
 pub const Stretch = struct {
     channels: u32,
     /// Playback speed in percent (100 = normal). May be changed between
@@ -22,6 +30,10 @@ pub const Stretch = struct {
     /// Absolute source-frame position of the next window, scaled by 100 for
     /// fractional advance.
     pos_scaled: u64 = 0,
+    /// Fade-out of the current window's last overlap frames, already scaled
+    /// by (1 - t). Summed with the next window's fade-in.
+    pending: [overlap_frames * max_channels]f32 = [_]f32{0} ** (overlap_frames * max_channels),
+    /// Raw last overlap of the current read window, used for alignment.
     tail: [overlap_frames * max_channels]f32 = [_]f32{0} ** (overlap_frames * max_channels),
     has_tail: bool = false,
 
@@ -38,16 +50,18 @@ pub const Stretch = struct {
     /// True when `in` (in_frames starting at absolute frame in_base) holds a
     /// full window at the current position.
     pub fn canEmit(self: *const Stretch, in_base: u64, in_frames: u64) bool {
-        const rel = self.pos_scaled / 100 - in_base;
-        return rel + lookahead_frames <= in_frames;
+        return self.relFrames(in_base) + lookahead_frames <= in_frames;
     }
 
-    /// Writes the next window into `out` (window_frames * channels samples).
+    /// Writes the next `hop_frames`-frame block into `out` and returns how
+    /// many source frames were consumed by the search offset, so the caller
+    /// can advance its own position. Requires at least `lookahead_frames`
+    /// input frames beyond `pos`.
     pub fn emitWindow(self: *Stretch, in: []const f32, in_base: u64, in_frames: u64, out: []f32) void {
         const ch = self.channels;
-        std.debug.assert(self.canEmit(in_base, in_frames));
-        std.debug.assert(out.len >= window_frames * ch);
-        const rel_pos: usize = @intCast(@min(self.pos_scaled / 100 - in_base, in_frames - lookahead_frames));
+        std.debug.assert(in_frames >= self.relFrames(in_base) + lookahead_frames);
+        std.debug.assert(out.len >= hop_frames * ch);
+        const rel_pos: usize = @intCast(self.relFrames(in_base));
 
         var best_off: usize = 0;
         if (self.has_tail) {
@@ -67,28 +81,47 @@ pub const Stretch = struct {
             }
         }
         const src = rel_pos + best_off;
+        const inv: f32 = 1.0 / @as(f32, overlap_frames);
 
         if (self.has_tail) {
-            // Crossfade the overlap region from the tail into the new window.
-            const inv: f32 = 1.0 / @as(f32, overlap_frames);
+            // Overlap-add: pending fade-out of the previous window plus the
+            // fade-in of this one cover the same output positions.
             for (0..overlap_frames) |i| {
                 const t: f32 = @as(f32, @floatFromInt(i)) * inv;
                 for (0..ch) |c| {
-                    out[i * ch + c] = self.tail[i * ch + c] * (1 - t) + in[(src + i) * ch + c] * t;
+                    out[i * ch + c] = self.pending[i * ch + c] + in[(src + i) * ch + c] * t;
                 }
             }
         } else {
             self.has_tail = true;
-            @memcpy(out[0 .. overlap_frames * ch], in[src * ch .. (src + overlap_frames) * ch]);
+            for (0..overlap_frames) |i| {
+                for (0..ch) |c| {
+                    out[i * ch + c] = in[(src + i) * ch + c];
+                }
+            }
         }
         const rest = (src + overlap_frames) * ch;
-        @memcpy(out[overlap_frames * ch .. window_frames * ch], in[rest .. rest + (window_frames - overlap_frames) * ch]);
-        @memcpy(self.tail[0 .. overlap_frames * ch], out[(window_frames - overlap_frames) * ch .. window_frames * ch]);
+        @memcpy(out[overlap_frames * ch .. hop_frames * ch], in[rest .. rest + (hop_frames - overlap_frames) * ch]);
 
-        // Each emitted window of window_frames output frames consumes
-        // window_frames * percent / 100 source frames; pos_scaled is in
+        // Fade-out for the next join: raw source scaled by (1 - t), plus the
+        // raw copy used for alignment.
+        const tail_src = (src + hop_frames) * ch;
+        for (0..overlap_frames) |i| {
+            const t: f32 = @as(f32, @floatFromInt(i)) * inv;
+            for (0..ch) |c| {
+                self.tail[i * ch + c] = in[tail_src + i * ch + c];
+                self.pending[i * ch + c] = self.tail[i * ch + c] * (1 - t);
+            }
+        }
+
+        // Each emitted block of hop_frames output frames consumes
+        // hop_frames * percent / 100 source frames; pos_scaled is in
         // 1/100-frame units.
-        self.pos_scaled += @as(u64, window_frames) * self.percent;
+        self.pos_scaled += @as(u64, hop_frames) * self.percent;
+    }
+
+    fn relFrames(self: *const Stretch, in_base: u64) u64 {
+        return self.pos_scaled / 100 - in_base;
     }
 };
 
@@ -101,18 +134,18 @@ test "stretch 150 consumes about two thirds of the input" {
     for (in, 0..) |*s, i| {
         s.* = @sin(@as(f32, @floatFromInt(i)) * 2 * std.math.pi * 440 / 48000);
     }
-    const windows = 100;
-    const out = try std.testing.allocator.alloc(f32, windows * window_frames);
+    const blocks = 100;
+    const out = try std.testing.allocator.alloc(f32, blocks * hop_frames);
     defer std.testing.allocator.free(out);
-    for (0..windows) |w| {
-        st.emitWindow(in, 0, frames, out[w * window_frames ..][0..window_frames]);
+    for (0..blocks) |w| {
+        st.emitWindow(in, 0, frames, out[w * hop_frames ..][0..hop_frames]);
     }
-    // 100 windows = 2 s of output at 1.5x should consume ~3 s (144000
-    // source frames), i.e. 1440 per window.
+    // 100 blocks = 1.5 s of output at 1.5x should consume ~2.25 s (108000
+    // source frames), i.e. 1080 per block.
     const consumed = st.sourceFramesConsumed();
-    try std.testing.expect(consumed > 140000 and consumed < 148000);
+    try std.testing.expect(consumed > 104000 and consumed < 112000);
     // Output stays in the same amplitude range (no gaps or blowups).
-    for (out[window_frames..]) |s| {
+    for (out[hop_frames..]) |s| {
         try std.testing.expect(s > -1.1 and s < 1.1);
     }
     // Pitch preserved: zero crossings per output second match the input tone.
@@ -122,8 +155,8 @@ test "stretch 150 consumes about two thirds of the input" {
         if (prev <= 0 and s > 0) crossings += 1;
         prev = s;
     }
-    // 440 Hz tone over ~2 s of output: ~880 crossings, allow stretch seams.
-    try std.testing.expectApproxEqAbs(@as(f64, 880), @as(f64, @floatFromInt(crossings)), 30);
+    // 440 Hz tone over ~1.5 s of output: ~660 crossings, allow stretch seams.
+    try std.testing.expectApproxEqAbs(@as(f64, 660), @as(f64, @floatFromInt(crossings)), 30);
 }
 
 test "stretch 200 consumes about half of the input" {
@@ -134,12 +167,41 @@ test "stretch 200 consumes about half of the input" {
     for (in, 0..) |*s, i| {
         s.* = @sin(@as(f32, @floatFromInt(i)) * 2 * std.math.pi * 300 / 48000);
     }
-    const out = try std.testing.allocator.alloc(f32, window_frames);
+    const out = try std.testing.allocator.alloc(f32, hop_frames);
     defer std.testing.allocator.free(out);
-    var windows: usize = 0;
-    while (st.canEmit(0, frames)) : (windows += 1) {
+    var blocks: usize = 0;
+    while (st.sourceFramesConsumed() + lookahead_frames <= frames) : (blocks += 1) {
         st.emitWindow(in, 0, frames, out);
     }
-    // 48000 source frames at 2x -> ~24000 output frames -> ~25 windows.
-    try std.testing.expect(windows > 20 and windows < 30);
+    // 48000 source frames at 2x -> ~24000 output frames -> ~33 blocks.
+    try std.testing.expect(blocks > 28 and blocks < 38);
+}
+
+test "stretched output has no sample discontinuities beyond the input slope" {
+    // Regression test for the crackle: consecutive output blocks must join
+    // smoothly. A time jump at a block boundary shows up as a sample-to-
+    // sample step far larger than anything in the input signal.
+    var st: Stretch = .{ .channels = 1, .percent = 150 };
+    const frames = 48000 * 12;
+    const in = try std.testing.allocator.alloc(f32, frames);
+    defer std.testing.allocator.free(in);
+    for (in, 0..) |*s, i| {
+        const t = @as(f32, @floatFromInt(i)) / 48000.0;
+        const vib = 1.0 + 0.01 * @sin(t * 2 * std.math.pi * 5.0);
+        s.* = @sin(t * 2 * std.math.pi * 180 * vib) * 0.5 +
+            @sin(t * 2 * std.math.pi * 360 * vib) * 0.25 +
+            @sin(t * 2 * std.math.pi * 540 * vib) * 0.125;
+    }
+    var in_slope: f32 = 0;
+    for (1..in.len) |i| in_slope = @max(in_slope, @abs(in[i] - in[i - 1]));
+    const blocks = 300;
+    const out = try std.testing.allocator.alloc(f32, blocks * hop_frames);
+    defer std.testing.allocator.free(out);
+    for (0..blocks) |w| {
+        st.emitWindow(in, 0, frames, out[w * hop_frames ..][0..hop_frames]);
+    }
+    for (1..out.len) |i| {
+        const step = @abs(out[i] - out[i - 1]);
+        try std.testing.expect(step <= 4 * in_slope);
+    }
 }
