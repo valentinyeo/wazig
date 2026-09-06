@@ -1,6 +1,7 @@
 const std = @import("std");
 const audio = @import("audio.zig");
 const avatar = @import("avatar.zig");
+const avatar_mask = @import("avatar_mask.zig");
 const dictation = @import("dictation.zig");
 const played = @import("played.zig");
 const webp_detect = @import("webp.zig");
@@ -3276,6 +3277,8 @@ fn loadAvatarBitmap(a: *App, path: [*:0]const u16) ?win.HBITMAP {
     if (scaler.*.lpVtbl.*.Initialize.?(scaler, @ptrCast(converter), 42, 42, win.WICBitmapInterpolationModeFant) < 0) return null;
     var pixels: [42 * 42 * 4]u8 = undefined;
     if (scaler.*.lpVtbl.*.CopyPixels.?(@ptrCast(scaler), null, 42 * 4, pixels.len, &pixels) < 0) return null;
+    // Bake an anti-aliased circular alpha; GDI clip regions would leave frizzled edges.
+    avatar_mask.applyMask(&pixels, 42);
     var info = std.mem.zeroes(win.BITMAPINFO);
     info.bmiHeader.biSize = @sizeOf(win.BITMAPINFOHEADER);
     info.bmiHeader.biWidth = 42;
@@ -3319,14 +3322,33 @@ fn drawAvatarBitmap(hdc: win.HDC, bitmap: win.HBITMAP, left: i32, top: i32) void
     defer _ = win.DeleteDC(memory);
     const old_bitmap = win.SelectObject(memory, bitmap);
     defer _ = win.SelectObject(memory, old_bitmap);
-    const saved = win.SaveDC(hdc);
-    const region = win.CreateEllipticRgn(left, top, left + 42, top + 42);
-    if (region) |clip| {
-        _ = win.SelectClipRgn(hdc, clip);
-        _ = win.BitBlt(hdc, left, top, 42, 42, memory, 0, 0, win.SRCCOPY);
-        _ = win.DeleteObject(clip);
+    // Per-pixel alpha (AC_SRC_ALPHA) gives the smooth circle edge; the bitmap
+    // is premultiplied PBGRA from WIC.
+    const blend = win.BLENDFUNCTION{
+        .BlendOp = win.AC_SRC_OVER,
+        .BlendFlags = 0,
+        .SourceConstantAlpha = 255,
+        .AlphaFormat = win.AC_SRC_ALPHA,
+    };
+    _ = win.AlphaBlend(hdc, left, top, 42, 42, memory, 0, 0, 42, 42, blend);
+}
+
+fn createAvatarCircleDib(r: u8, g: u8, b: u8) ?win.HBITMAP {
+    var info = std.mem.zeroes(win.BITMAPINFO);
+    info.bmiHeader.biSize = @sizeOf(win.BITMAPINFOHEADER);
+    info.bmiHeader.biWidth = 42;
+    info.bmiHeader.biHeight = -42;
+    info.bmiHeader.biPlanes = 1;
+    info.bmiHeader.biBitCount = 32;
+    info.bmiHeader.biCompression = win.BI_RGB;
+    var bits: ?*anyopaque = null;
+    const bitmap = win.CreateDIBSection(null, &info, win.DIB_RGB_COLORS, &bits, null, 0) orelse return null;
+    if (bits == null) {
+        _ = win.DeleteObject(bitmap);
+        return null;
     }
-    _ = win.RestoreDC(hdc, saved);
+    avatar_mask.fillCircle(@as([*]u8, @ptrCast(bits.?))[0 .. 42 * 42 * 4], 42, r, g, b);
+    return bitmap;
 }
 
 fn isEmojiUnit(unit: u16) bool {
@@ -3533,13 +3555,11 @@ fn drawChat(a: *App, item: *win.DRAWITEMSTRUCT) void {
     if (avatar_entry != null and avatar_entry.?.bitmap != null) {
         drawAvatarBitmap(item.hDC, avatar_entry.?.bitmap.?, item.rcItem.left + 12, item.rcItem.top + 10);
     } else {
-        const avatar_brush = win.CreateSolidBrush(rgb(59, 74, 84)) orelse return;
-        defer _ = win.DeleteObject(avatar_brush);
-        const old_brush = win.SelectObject(item.hDC, avatar_brush);
-        const old_pen = win.SelectObject(item.hDC, win.GetStockObject(win.NULL_PEN));
-        _ = win.Ellipse(item.hDC, item.rcItem.left + 12, item.rcItem.top + 10, item.rcItem.left + 54, item.rcItem.top + 52);
-        _ = win.SelectObject(item.hDC, old_brush);
-        _ = win.SelectObject(item.hDC, old_pen);
+        // Anti-aliased circle via per-pixel alpha; GDI Ellipse has a hard edge.
+        if (createAvatarCircleDib(59, 74, 84)) |circle| {
+            defer _ = win.DeleteObject(circle);
+            drawAvatarBitmap(item.hDC, circle, item.rcItem.left + 12, item.rcItem.top + 10);
+        }
         if (chat.name.len > 0) {
             var initial_length: c_int = 1;
             if (chat.name.buf[0] >= 0xd800 and chat.name.buf[0] <= 0xdbff and chat.name.len > 1) initial_length = 2;
