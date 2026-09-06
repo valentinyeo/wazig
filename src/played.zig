@@ -22,12 +22,15 @@ pub const Set = struct {
         return false;
     }
 
-    /// Parses the store contents (one hex hash per line). Malformed or
-    /// truncated lines are skipped. The file is append-only, so parsing
-    /// wraps head-first and the newest entries survive the ring capacity.
+    /// Parses the store contents (one 16-digit hex hash per line). Lines of
+    /// any other length are treated as corrupt — including a truncated tail
+    /// from a crash mid-write, which must not become a phantom entry. The
+    /// file is append-only, so parsing wraps head-first and the newest
+    /// entries survive the ring capacity.
     pub fn load(self: *Set, contents: []const u8) void {
         var lines = std.mem.tokenizeAny(u8, contents, "\r\n");
         while (lines.next()) |line| {
+            if (line.len != 16) continue;
             const hash = std.fmt.parseInt(u64, line, 16) catch continue;
             self.hashes[self.count % self.hashes.len] = hash;
             self.count += 1;
@@ -42,7 +45,7 @@ pub const Set = struct {
         if (self.wasPlayed(id)) return null;
         self.hashes[self.count % self.hashes.len] = hash;
         self.count += 1;
-        return std.fmt.bufPrint(line_buffer, "{x}\n", .{hash}) catch null;
+        return std.fmt.bufPrint(line_buffer, "{x:0>16}\n", .{hash}) catch null;
     }
 };
 
@@ -61,19 +64,18 @@ test "mark and recall played ids, ignore repeats and empty ids" {
 
 test "load skips malformed and truncated lines" {
     var set: Set = .{};
-    set.load("dead\nzzzz\nbeef\n");
-    try std.testing.expectEqual(@as(usize, 2), set.count);
-    try std.testing.expect(set.wasPlayedRaw(0xdead));
-    try std.testing.expect(set.wasPlayedRaw(0xbeef));
-    try std.testing.expect(!set.wasPlayedRaw(0x1234));
+    set.load("deadbeefdeadbeef\nzzzz\nbeef\nbeef00000000000\n");
+    try std.testing.expectEqual(@as(usize, 1), set.count);
+    try std.testing.expect(set.wasPlayedRaw(0xdeadbeefdeadbeef));
+    try std.testing.expect(!set.wasPlayedRaw(0xbeef));
 }
 
 test "load wraps so the newest entries survive the ring capacity" {
     var set: Set = .{ .count = 2048 };
     set.hashes[0] = 0x11; // oldest slot when the ring is full
-    set.load("22\n33\n");
+    set.load("0000000000000022\n0000000000000033\n");
     try std.testing.expectEqual(@as(usize, 2050), set.count);
-    // Slot 2047 was overwritten by the wrap; the newest two survive.
+    // Slot 0 (the oldest) was overwritten by the wrap; the newest two survive.
     try std.testing.expect(!set.wasPlayedRaw(0x11));
     try std.testing.expect(set.wasPlayedRaw(0x22));
     try std.testing.expect(set.wasPlayedRaw(0x33));
