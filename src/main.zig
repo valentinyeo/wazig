@@ -629,6 +629,12 @@ fn wacliJobArgs(job: *WacliJob, args: []const []const u8) void {
     for (args[0..job.arg_count], 0..) |argument, index| job.args[index].set(argument);
 }
 
+fn wacliPendingSub(a: *App, kind: WacliJobKind) void {
+    a.wacli_mutex.lockUncancelable(a.io);
+    if (a.wacli_pending[@intFromEnum(kind)] > 0) a.wacli_pending[@intFromEnum(kind)] -= 1;
+    a.wacli_mutex.unlock(a.io);
+}
+
 fn wacliEnqueue(a: *App, job: WacliJob, urgent: bool) void {
     a.wacli_mutex.lockUncancelable(a.io);
     if (a.wacli_queue_len >= a.wacli_queue.len) {
@@ -643,6 +649,7 @@ fn wacliEnqueue(a: *App, job: WacliJob, urgent: bool) void {
                 break;
             }
         }
+        if (a.wacli_queue[victim].kind == .reaction) setStatus(a, "Reaction queue is full; try again");
         a.wacli_pending[@intFromEnum(a.wacli_queue[victim].kind)] -= 1;
         var shift = victim;
         while (shift + 1 < a.wacli_queue_len) : (shift += 1) a.wacli_queue[shift] = a.wacli_queue[shift + 1];
@@ -699,7 +706,10 @@ fn wacliRunJob(a: *App, job: WacliJob) void {
     var argv: [max_wacli_args][]const u8 = undefined;
     var count: usize = 0;
     while (count < job.arg_count) : (count += 1) argv[count] = job.args[count].slice();
-    const result = a.allocator.create(WacliResult) catch return;
+    const result = a.allocator.create(WacliResult) catch {
+        wacliPendingSub(a, job.kind);
+        return;
+    };
     result.* = .{ .kind = job.kind, .gen = job.gen, .jid = job.jid, .msg_id = job.msg_id, .extra = job.extra };
     const run = std.process.run(a.allocator, a.io, .{
         .argv = argv[0..count],
@@ -729,11 +739,19 @@ fn wacliRunJob(a: *App, job: WacliJob) void {
 
 fn wacliPost(a: *App, result: *WacliResult) void {
     const hwnd = a.hwnd orelse {
-        if (result.data.len > 0) a.allocator.free(result.data);
-        a.allocator.destroy(result);
+        wacliDiscard(a, result);
         return;
     };
-    _ = win.PostMessageW(hwnd, wm_wacli_done, 0, @bitCast(@intFromPtr(result)));
+    if (win.PostMessageW(hwnd, wm_wacli_done, 0, @bitCast(@intFromPtr(result))) == 0) wacliDiscard(a, result);
+}
+
+// Terminal path for a result the UI will never see: free it and release its
+// pending slot so a lost result cannot wedge live sync or a refresh.
+fn wacliDiscard(a: *App, result: *WacliResult) void {
+    const kind = result.kind;
+    if (result.data.len > 0) a.allocator.free(result.data);
+    a.allocator.destroy(result);
+    wacliPendingSub(a, kind);
 }
 
 fn msgCacheGet(a: *App, jid: []const u8) ?[]const u8 {
@@ -4496,7 +4514,7 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
                 if (result.data.len > 0) a.allocator.free(result.data);
                 a.allocator.destroy(result);
             }
-            if (a.wacli_pending[@intFromEnum(result.kind)] > 0) a.wacli_pending[@intFromEnum(result.kind)] -= 1;
+            wacliPendingSub(a, result.kind);
             switch (result.kind) {
                 .groups => if (result.ok) applyGroups(a, result.data),
                 .chats => {
