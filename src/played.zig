@@ -41,11 +41,25 @@ pub const Set = struct {
     /// was already recorded.
     pub fn mark(self: *Set, id: []const u8, line_buffer: []u8) ?[]const u8 {
         if (id.len == 0) return null;
-        const hash = std.hash.Wyhash.hash(0, id);
-        if (self.wasPlayed(id)) return null;
+        return self.markRaw(std.hash.Wyhash.hash(0, id), line_buffer);
+    }
+
+    /// Same as mark for a precomputed hash (e.g. a jid+id composite key).
+    pub fn markRaw(self: *Set, hash: u64, line_buffer: []u8) ?[]const u8 {
+        if (self.wasPlayedRaw(hash)) return null;
         self.hashes[self.count % self.hashes.len] = hash;
         self.count += 1;
         return std.fmt.bufPrint(line_buffer, "{x:0>16}\n", .{hash}) catch null;
+    }
+
+    /// Composite key for two-part identities (chat jid + message id) so ids
+    /// from different chats can never collide in a shared hash set.
+    pub fn pairKey(first: []const u8, second: []const u8) u64 {
+        var hasher = std.hash.Wyhash.init(0);
+        hasher.update(first);
+        hasher.update("\x00");
+        hasher.update(second);
+        return hasher.final();
     }
 };
 
@@ -60,6 +74,18 @@ test "mark and recall played ids, ignore repeats and empty ids" {
     var reloaded: Set = .{};
     reloaded.load(line);
     try std.testing.expect(reloaded.wasPlayed("abc"));
+}
+
+test "markRaw and pairKey keep jids and ids separate" {
+    var set: Set = .{};
+    var buffer: [40]u8 = undefined;
+    const key = Set.pairKey("chat1", "msg1");
+    try std.testing.expect(set.markRaw(key, &buffer) != null);
+    try std.testing.expect(set.markRaw(key, &buffer) == null);
+    try std.testing.expect(set.wasPlayedRaw(key));
+    // The same id under a different chat must stay distinct.
+    try std.testing.expect(set.markRaw(Set.pairKey("chat2", "msg1"), &buffer) != null);
+    try std.testing.expect(Set.pairKey("chat1", "msg1") != Set.pairKey("chat1", "msg2"));
 }
 
 test "load skips malformed and truncated lines" {
