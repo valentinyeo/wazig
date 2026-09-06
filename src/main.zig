@@ -748,6 +748,23 @@ fn loadPlayed(a: *App) void {
         total += 1;
     }
     a.played_count = @min(total, a.played.len);
+    // The file is append-only and can carry duplicates once the ring
+    // wraps; compact it once at startup when it has grown past the
+    // in-memory set so the read cap never makes the feature die.
+    if (contents.len > a.played.len * 41) {
+        var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
+        defer seen.deinit(a.allocator);
+        var out = std.ArrayList(u8).empty;
+        defer out.deinit(a.allocator);
+        var buffer: [40]u8 = undefined;
+        for (a.played[0..a.played_count]) |hash| {
+            const got = seen.getOrPut(a.allocator, hash) catch return;
+            if (got.found_existing) continue;
+            const line = std.fmt.bufPrint(&buffer, "{x}\n", .{hash}) catch return;
+            out.appendSlice(a.allocator, line) catch return;
+        }
+        writeFileWin(a.played_path, out.items);
+    }
 }
 
 fn markPlayed(a: *App, id: []const u8) void {
@@ -759,20 +776,15 @@ fn markPlayed(a: *App, id: []const u8) void {
     if (a.played_path.len == 0) return;
     var buffer: [40]u8 = undefined;
     const line = std.fmt.bufPrint(&buffer, "{x}\n", .{hash}) catch return;
-    var contents = std.ArrayList(u8).empty;
-    defer contents.deinit(a.allocator);
-    if (readFileWin(a.allocator, a.played_path, 128 * 1024)) |existing| {
-        defer a.allocator.free(existing);
-        contents.appendSlice(a.allocator, existing) catch return;
-    } else {
-        // Only start a fresh store when the file genuinely does not
-        // exist; a transient read failure must not truncate it.
-        const wide = std.unicode.utf8ToUtf16LeAllocZ(a.allocator, a.played_path) catch return;
-        defer a.allocator.free(wide);
-        if (win.GetFileAttributesW(wide.ptr) != win.INVALID_FILE_ATTRIBUTES) return;
-    }
-    contents.appendSlice(a.allocator, line) catch return;
-    writeFileWin(a.played_path, contents.items);
+    // Append-only persistence: a rewrite could truncate the store on a
+    // crash, and a full read-rewrite on every play would hitch the UI.
+    const wide = std.unicode.utf8ToUtf16LeAllocZ(a.allocator, a.played_path) catch return;
+    defer a.allocator.free(wide);
+    const handle = win.CreateFileW(wide.ptr, win.FILE_APPEND_DATA, win.FILE_SHARE_READ, null, win.OPEN_ALWAYS, win.FILE_ATTRIBUTE_NORMAL, null);
+    if (handle == win.INVALID_HANDLE_VALUE or handle == null) return;
+    defer _ = win.CloseHandle(handle);
+    var written: win.DWORD = 0;
+    _ = win.WriteFile(handle, line.ptr, @intCast(line.len), &written, null);
 }
 
 fn ensureAudioPlayer(a: *App) ?*audio.Player {
