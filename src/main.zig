@@ -33,6 +33,7 @@ const app_version = build_info.version;
 const update = @import("update.zig");
 
 const max_chats = 256;
+const max_pins = 64;
 const max_groups = 1024;
 const max_messages = 100;
 const max_pending_sends = 32;
@@ -82,6 +83,7 @@ const command_copy_selection = 2021;
 const command_copy_transcript = 2022;
 const command_reply = 2023;
 const command_open_video_external = 2024;
+const command_pin = 2025;
 const reaction_like = 3001;
 const reaction_love = 3002;
 const reaction_laugh = 3003;
@@ -284,6 +286,9 @@ const App = struct {
     brush_raised: ?win.HBRUSH = null,
     chats: [max_chats]Chat = [_]Chat{.{}} ** max_chats,
     chat_count: usize = 0,
+    pinned_jids: [max_pins]Utf8Text(191) = [_]Utf8Text(191){.{}} ** max_pins,
+    pinned_count: usize = 0,
+    pins_loaded: bool = false,
     groups: [max_groups]Group = [_]Group{.{}} ** max_groups,
     group_count: usize = 0,
     messages: [max_messages]Message = [_]Message{.{}} ** max_messages,
@@ -470,6 +475,63 @@ fn saveFontScale(scale: i32) void {
     defer _ = win.RegCloseKey(key);
     const value: win.DWORD = @intCast(scale);
     _ = win.RegSetValueExW(key, lit("FontScale"), 0, win.REG_DWORD, @ptrCast(&value), @sizeOf(win.DWORD));
+}
+
+// Chat pins are stored as one REG_SZ with comma-separated JIDs. JIDs never
+// contain commas, so the join is unambiguous.
+fn validPinJid(jid: []const u8) bool {
+    if (jid.len == 0 or jid.len > 191) return false;
+    for (jid) |c| switch (c) {
+        '0'...'9', 'a'...'z', 'A'...'Z', '@', '.', '-', '_' => {},
+        else => return false,
+    };
+    return true;
+}
+
+fn jidPinned(a: *App, jid: []const u8) bool {
+    for (a.pinned_jids[0..a.pinned_count]) |pinned| {
+        if (std.mem.eql(u8, pinned.slice(), jid)) return true;
+    }
+    return false;
+}
+
+// Returns false when the registry value does not exist yet (fresh install);
+// malformed entries are skipped so a corrupt value can never wedge the app.
+fn loadPinnedChats(a: *App) bool {
+    const stored = loadRegistryString(a.allocator, lit("PinnedChats")) orelse return false;
+    defer a.allocator.free(stored);
+    var it = std.mem.splitScalar(u8, stored, ',');
+    while (it.next()) |jid| {
+        if (!validPinJid(jid)) continue;
+        if (a.pinned_count >= max_pins) break;
+        a.pinned_jids[a.pinned_count].set(jid);
+        a.pinned_count += 1;
+    }
+    return true;
+}
+
+// Saves first and reports success so callers never show state the registry
+// does not agree with.
+fn savePinnedChats(a: *App) bool {
+    var buffer: [max_pins * 192]u8 = undefined;
+    var len: usize = 0;
+    for (a.pinned_jids[0..a.pinned_count]) |pinned| {
+        const jid = pinned.slice();
+        if (len + jid.len + 1 > buffer.len) break;
+        if (len > 0) {
+            buffer[len] = ',';
+            len += 1;
+        }
+        @memcpy(buffer[len..][0..jid.len], jid);
+        len += jid.len;
+    }
+    const wide = std.unicode.utf8ToUtf16LeAllocZ(a.allocator, buffer[0..len]) catch return false;
+    defer a.allocator.free(wide);
+    var key: win.HKEY = null;
+    var disposition: win.DWORD = 0;
+    if (win.RegCreateKeyExW(winHandle(win.HKEY, 0x80000001), lit("Software\\Messages"), 0, null, 0, win.KEY_SET_VALUE, null, &key, &disposition) != win.ERROR_SUCCESS) return false;
+    defer _ = win.RegCloseKey(key);
+    return win.RegSetValueExW(key, lit("PinnedChats"), 0, win.REG_SZ, @ptrCast(wide.ptr), @intCast(wide.len * 2)) == win.ERROR_SUCCESS;
 }
 
 fn scaledFontHeight(base: i32, scale: i32) i32 {
@@ -724,15 +786,20 @@ fn refreshChats(a: *App) void {
         a.chats[a.chat_count] = chat;
         a.chat_count += 1;
     }
-    var i: usize = 1;
-    while (i < a.chat_count) : (i += 1) {
-        var j = i;
-        while (j > 0 and std.mem.order(u8, a.chats[j - 1].timestamp.slice(), a.chats[j].timestamp.slice()) == .lt) : (j -= 1) {
-            const temporary = a.chats[j - 1];
-            a.chats[j - 1] = a.chats[j];
-            a.chats[j] = temporary;
+    if (!a.pins_loaded and !a.show_archived and !a.unread_only and query_utf8 == null) {
+        // First full chat load with no saved pins: import WhatsApp-native
+        // pins once, then the local list is the only authority.
+        for (a.chats[0..a.chat_count]) |*chat| {
+            if (chat.pinned and a.pinned_count < max_pins and !jidPinned(a, chat.jid.slice())) {
+                a.pinned_jids[a.pinned_count].set(chat.jid.slice());
+                a.pinned_count += 1;
+            }
         }
+        a.pins_loaded = true;
+        _ = savePinnedChats(a);
     }
+    for (a.chats[0..a.chat_count]) |*chat| chat.pinned = jidPinned(a, chat.jid.slice());
+    resortChats(a);
     // A mark-read write may still be queued or running: keep those chats
     // shown as read until the write lands and the next refresh reflects it.
     for (a.chats[0..a.chat_count]) |*chat| {
@@ -745,10 +812,43 @@ fn refreshChats(a: *App) void {
         }
     }
 
+    refreshChatListbox(a, selected_jid[0..selected_len]);
+    var status_buffer: [64]u8 = undefined;
+    if (a.chat_count != a.last_chat_count) {
+        a.last_chat_count = a.chat_count;
+        const status = std.fmt.bufPrint(&status_buffer, "{d} chats", .{a.chat_count}) catch "Chats loaded";
+        setStatus(a, status);
+    }
+}
+
+// Stable insertion sort: pinned chats first, newest message first within
+// each group. Used by every chat refresh and by pin toggles.
+fn sortChats(chats: []Chat) void {
+    var i: usize = 1;
+    while (i < chats.len) : (i += 1) {
+        var j = i;
+        while (j > 0 and chatSortsBefore(chats[j], chats[j - 1])) : (j -= 1) {
+            const temporary = chats[j - 1];
+            chats[j - 1] = chats[j];
+            chats[j] = temporary;
+        }
+    }
+}
+
+fn resortChats(a: *App) void {
+    sortChats(a.chats[0..a.chat_count]);
+}
+
+fn chatSortsBefore(cur: Chat, prev: Chat) bool {
+    if (cur.pinned != prev.pinned) return cur.pinned;
+    return std.mem.order(u8, cur.timestamp.slice(), prev.timestamp.slice()) == .gt;
+}
+
+fn refreshChatListbox(a: *App, selected_jid: []const u8) void {
     a.selected_chat = 0;
-    if (selected_len > 0) {
+    if (selected_jid.len > 0) {
         for (a.chats[0..a.chat_count], 0..) |chat, index| {
-            if (std.mem.eql(u8, selected_jid[0..selected_len], chat.jid.slice())) {
+            if (std.mem.eql(u8, selected_jid, chat.jid.slice())) {
                 a.selected_chat = index;
                 break;
             }
@@ -764,12 +864,44 @@ fn refreshChats(a: *App) void {
         _ = win.SendMessageW(list, win.WM_SETREDRAW, 1, 0);
         _ = win.InvalidateRect(list, null, win.TRUE);
     }
-    var status_buffer: [64]u8 = undefined;
-    if (a.chat_count != a.last_chat_count) {
-        a.last_chat_count = a.chat_count;
-        const status = std.fmt.bufPrint(&status_buffer, "{d} chats", .{a.chat_count}) catch "Chats loaded";
-        setStatus(a, status);
+}
+
+fn togglePinSelectedChat(a: *App) void {
+    if (a.selected_chat >= a.chat_count) return;
+    const chat = &a.chats[a.selected_chat];
+    const jid = chat.jid.slice();
+    const was_pinned = chat.pinned;
+    if (was_pinned) {
+        var index: usize = 0;
+        while (index < a.pinned_count) : (index += 1) {
+            if (std.mem.eql(u8, a.pinned_jids[index].slice(), jid)) break;
+        }
+        while (index + 1 < a.pinned_count) : (index += 1) a.pinned_jids[index] = a.pinned_jids[index + 1];
+        a.pinned_count -= 1;
+    } else {
+        if (a.pinned_count >= a.pinned_jids.len) {
+            setStatus(a, "Pin list is full");
+            return;
+        }
+        a.pinned_jids[a.pinned_count].set(jid);
+        a.pinned_count += 1;
     }
+    if (!savePinnedChats(a)) {
+        // Roll the in-memory change back so the UI matches the registry.
+        if (was_pinned) {
+            a.pinned_jids[a.pinned_count].set(jid);
+            a.pinned_count += 1;
+        } else {
+            a.pinned_count -= 1;
+        }
+        setStatus(a, "Could not save pin");
+        return;
+    }
+    chat.pinned = !was_pinned;
+    const jid_copy = chat.jid; // list rebuild below reorders a.chats
+    resortChats(a);
+    refreshChatListbox(a, jid_copy.slice());
+    setStatus(a, if (was_pinned) "Chat unpinned" else "Chat pinned to top");
 }
 
 fn markChatRead(a: *App) void {
@@ -2848,6 +2980,7 @@ fn buildPaletteItems(a: *App) void {
     appendPalette(a, "Toggle unread chats", "U", command_unread);
     appendPalette(a, if (a.show_archived) "Show inbox chats" else "Show archived chats", "", command_archived);
     appendPalette(a, if (a.show_archived) "Unarchive selected chat" else "Archive selected chat", "Ctrl+E", command_archive);
+    appendPalette(a, if (a.selected_chat < a.chat_count and a.chats[a.selected_chat].pinned) "Unpin chat" else "Pin chat to top", "", command_pin);
     appendPalette(a, "Reply to selected message", "Ctrl+Shift+R", command_reply);
     appendPalette(a, "React to message: 👍 Like", "", reaction_like);
     appendPalette(a, "React to message: ❤️ Love", "", reaction_love);
@@ -3168,6 +3301,7 @@ fn runCommand(a: *App, command: u16) void {
             refreshMessages(a);
         },
         command_archive => archiveSelectedChat(a),
+        command_pin => togglePinSelectedChat(a),
         command_reply => startReply(a),
         command_archived => {
             a.show_archived = !a.show_archived;
@@ -3596,6 +3730,13 @@ fn drawChat(a: *App, item: *win.DRAWITEMSTRUCT) void {
     _ = win.DrawTextW(item.hDC, chat.time.ptr(), @intCast(chat.time.len), &time_rect, win.DT_RIGHT | win.DT_SINGLELINE | win.DT_VCENTER);
     var kind_rect = win.RECT{ .left = item.rcItem.left + 66, .top = item.rcItem.top + 35, .right = item.rcItem.right - 42, .bottom = item.rcItem.top + 56 };
     _ = win.DrawTextW(item.hDC, chat.kind.ptr(), @intCast(chat.kind.len), &kind_rect, win.DT_LEFT | win.DT_SINGLELINE | win.DT_END_ELLIPSIS);
+
+    if (chat.pinned) {
+        const pin_glyph = [_]u16{ 0xD83D, 0xDCCC };
+        _ = win.SelectObject(item.hDC, @ptrCast(a.font_emoji orelse a.font_bold.?));
+        _ = win.SetTextColor(item.hDC, color_muted);
+        _ = win.TextOutW(item.hDC, item.rcItem.right - 74, item.rcItem.top + 11, &pin_glyph, 2);
+    }
 
     if (chat.unread or chat.unread_count > 0) {
         const unread_brush = win.CreateSolidBrush(color_accent) orelse return;
@@ -4718,9 +4859,10 @@ pub fn main(init: std.process.Init) !void {
         }
     }
     if (openrouter_model.len == 0) openrouter_model = "openai/gpt-5.6-luna";
-    var app = App{ .allocator = init.gpa, .io = init.io, .instance = instance, .wacli_path = wacli_path, .avatar_dir = avatar_dir, .deepgram_configured = deepgram_key.len > 0, .deepgram_key = deepgram_key, .openrouter_key = openrouter_key, .openrouter_model = openrouter_model, .openrouter_configured = openrouter_key.len > 0, .dictation_language = loadDictationLanguage(), .font_scale = loadFontScale() };
+    var app = App{ .allocator = init.gpa, .io = init.io, .instance = instance, .wacli_path = wacli_path, .avatar_dir = avatar_dir, .deepgram_configured = deepgram_key.len > 0, .deepgram_key = deepgram_key, .openrouter_key = openrouter_key, .openrouter_model = openrouter_model, .openrouter_configured = openrouter_key.len > 0, .dictation_language = loadDictationLanguage(), .font_scale = loadFontScale(), .pins_loaded = false };
     app.played_path = findPlayedPath(init, init.gpa);
     loadPlayed(&app);
+    app.pins_loaded = loadPinnedChats(&app);
     app.store_watch_path.set(init.gpa, store_watch_path);
     app_ptr = &app;
     defer app_ptr = null;
@@ -5225,4 +5367,40 @@ test "sender name shows only at the start of a same-sender run" {
     a.messages[1].from_me = false;
     a.messages[1].sender_jid.set("111@g.us");
     try std.testing.expect(!showSenderName(&a, 2));
+}
+
+test "chat sort keeps pinned chats first and stays stable inside each group" {
+    var chats = [_]Chat{.{}} ** 4;
+    chats[0].timestamp.set("100");
+    chats[1].timestamp.set("300");
+    chats[2].timestamp.set("400");
+    chats[3].timestamp.set("200");
+    chats[2].pinned = true;
+    sortChats(&chats);
+    // Pin (ts 400) leads, then unpinned newest-first: 300, 200, 100.
+    try std.testing.expect(chats[0].pinned);
+    try std.testing.expectEqualStrings("300", chats[1].timestamp.slice());
+    try std.testing.expectEqualStrings("200", chats[2].timestamp.slice());
+    try std.testing.expectEqualStrings("100", chats[3].timestamp.slice());
+
+    // Equal keys keep their relative order.
+    var tied = [_]Chat{.{}} ** 3;
+    tied[0].timestamp.set("50");
+    tied[1].timestamp.set("50");
+    tied[2].timestamp.set("50");
+    sortChats(&tied);
+    try std.testing.expectEqualStrings("50", tied[0].timestamp.slice());
+    try std.testing.expectEqualStrings("50", tied[1].timestamp.slice());
+}
+
+test "pin jid validation rejects separators and junk" {
+    try std.testing.expect(validPinJid("4915112345678@s.whatsapp.net"));
+    try std.testing.expect(validPinJid("12345-67890@g.us"));
+    try std.testing.expect(!validPinJid(""));
+    try std.testing.expect(!validPinJid("49,11@s.whatsapp.net"));
+    try std.testing.expect(!validPinJid("49;del@s.whatsapp.net"));
+    var long: [192]u8 = [_]u8{'1'} ** 192;
+    try std.testing.expect(!validPinJid(&long));
+    long[191] = '2';
+    try std.testing.expect(validPinJid(long[0..191]));
 }
