@@ -304,6 +304,9 @@ const App = struct {
     audio_playing_id: Utf8Text(191) = .{},
     audio_position_ms: i64 = 0,
     audio_duration_ms: i64 = 0,
+    audio_auto_advance: bool = false,
+    audio_chain_waiting: bool = false,
+    audio_chain_id: Utf8Text(191) = .{},
     media_child: ?std.process.Child = null,
     read_child: ?std.process.Child = null,
     read_spawn_failures: u32 = 0,
@@ -917,6 +920,8 @@ fn ensureAudioPlayer(a: *App) ?*audio.Player {
 }
 
 fn stopAudio(a: *App) void {
+    a.audio_auto_advance = false;
+    a.audio_chain_waiting = false;
     if (a.audio_state == .empty) return;
     a.audio_state = .empty;
     a.audio_playing_id.set("");
@@ -935,6 +940,8 @@ fn startAudioPlayback(a: *App, message: *Message) void {
     defer a.allocator.free(path_utf8);
     player.play(path_utf8);
     markPlayed(a, message.id.slice());
+    a.audio_auto_advance = true;
+    a.audio_chain_waiting = false;
     a.audio_playing_id.set(message.id.slice());
     a.audio_state = .playing;
     a.audio_position_ms = 0;
@@ -999,9 +1006,52 @@ fn handleAudioClick(a: *App, message: *Message, x: i32) void {
     seekAudio(a, x, hit);
 }
 
+// When a voice note ends, start the next audio message below it, downloading
+// first if needed, until the chat runs out. Switching chats, stopping, or a
+// failed download ends the chain.
+fn advanceAudio(a: *App, after_id: []const u8) bool {
+    if (!a.audio_auto_advance) return false;
+    var start: usize = a.message_count;
+    for (a.messages[0..a.message_count], 0..) |*message, index| {
+        if (std.mem.eql(u8, message.id.slice(), after_id)) {
+            start = index + 1;
+            break;
+        }
+    }
+    if (start >= a.message_count) return false;
+    for (a.messages[start..a.message_count], start..) |*message, index| {
+        if (!isAudio(message) or message.id.len == 0) continue;
+        if (message.local_path.len > 0) {
+            startAudioPlayback(a, message);
+            return true;
+        } else if (a.media_child == null and a.read_child == null and a.pending_read_count == 0) {
+            downloadMedia(a, index, true);
+            // Arm only if the download actually started; a failed spawn just
+            // ends the chain instead of leaking a stale trigger.
+            if (a.media_child != null) {
+                a.audio_chain_waiting = true;
+                a.audio_chain_id.set(message.id.slice());
+            }
+        }
+        // A busy store means the next note cannot start; the chain stops here.
+        return true;
+    }
+    return false;
+}
+
 fn updateAudioPlayback(a: *App) void {
     const player = a.audio_player orelse return;
     const state = player.state();
+    // Fire only on the transition into .ended: the player reports .ended
+    // continuously afterwards, and the mapped UI state becomes .ready.
+    if (state == .ended and (a.audio_state == .playing or a.audio_state == .paused)) {
+        var ended_id: [191]u8 = undefined;
+        const ended = a.audio_playing_id.slice();
+        const ended_len = @min(ended.len, ended_id.len);
+        @memcpy(ended_id[0..ended_len], ended[0..ended_len]);
+        // The next note is playing; skip the stale snapshot handling below.
+        if (advanceAudio(a, ended_id[0..ended_len])) return;
+    }
     if (player.start_failed.load(.acquire) and state == .idle) {
         if (a.audio_state != .empty) {
             a.audio_state = .empty;
@@ -1756,6 +1806,19 @@ fn checkMediaDownload(a: *App) void {
         a.media_child = null;
         startSync(a);
         refreshMessages(a);
+        if (a.audio_chain_waiting) {
+            a.audio_chain_waiting = false;
+            if (code == 0) {
+                for (a.messages[0..a.message_count]) |*message| {
+                    if (std.mem.eql(u8, message.id.slice(), a.audio_chain_id.slice())) {
+                        if (message.local_path.len > 0) startAudioPlayback(a, message);
+                        break;
+                    }
+                }
+            } else if (a.audio_state != .empty) {
+                a.audio_auto_advance = false;
+            }
+        }
         setStatus(a, if (code == 0) "Attachment downloaded" else "Download failed, the attachment may have expired");
     }
 }
