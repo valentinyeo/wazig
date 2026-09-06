@@ -87,6 +87,16 @@ const command_copy_selection = 2021;
 const command_copy_transcript = 2022;
 const command_reply = 2023;
 const command_open_video_external = 2024;
+const command_play_audio = 2028;
+const command_toggle_transcript = 2029;
+const command_react_menu = 2030;
+const command_next_message = 2031;
+const command_prev_message = 2032;
+const command_jump_latest = 2033;
+const command_links = 2034;
+const command_next_chat = 2035;
+const command_prev_chat = 2036;
+const command_send = 2037;
 const command_emoji = 2027;
 const reaction_like = 3001;
 const reaction_love = 3002;
@@ -226,7 +236,7 @@ const PaletteItem = struct {
 
 // buildPaletteItems registers more items than the original cap allowed, so
 // entries near the end were silently dropped.
-const max_palette_items = 32;
+const max_palette_items = 48;
 const palette_width: i32 = 540;
 const palette_row_height: i32 = 40;
 const palette_edit_zone: i32 = 64;
@@ -4202,7 +4212,6 @@ fn buildPaletteItems(a: *App) void {
     a.palette_item_count = 0;
     appendPalette(a, "Search chats", "Ctrl+F", command_search);
     appendPalette(a, "Compose message", "C", command_compose);
-    appendPalette(a, "Insert emoji", "", command_emoji);
     appendPalette(a, "Dictate", "Ctrl+D", command_dictate);
     appendPalette(a, "Dictation language: Automatic", "", command_dictation_auto);
     appendPalette(a, "Dictation language: English", "", command_dictation_english);
@@ -4217,6 +4226,20 @@ fn buildPaletteItems(a: *App) void {
     appendPalette(a, if (a.show_archived) "Show inbox chats" else "Show archived chats", "", command_archived);
     appendPalette(a, if (a.show_archived) "Unarchive selected chat" else "Archive selected chat", "Ctrl+E", command_archive);
     appendPalette(a, "Reply to selected message", "Ctrl+Shift+R", command_reply);
+    appendPalette(a, "React to selected message", "Ctrl+R", command_react_menu);
+    appendPalette(a, "Copy message text", "Ctrl+C", command_copy_text);
+    appendPalette(a, "Copy message link", "", command_copy_link);
+    appendPalette(a, "Copy transcript", "", command_copy_transcript);
+    appendPalette(a, "Play or pause voice message", "Ctrl+P", command_play_audio);
+    appendPalette(a, "Show or hide transcript", "Ctrl+T", command_toggle_transcript);
+    appendPalette(a, "Select next message", "Alt+J", command_next_message);
+    appendPalette(a, "Select previous message", "Alt+K", command_prev_message);
+    appendPalette(a, "Jump to latest message", "Alt+G", command_jump_latest);
+    appendPalette(a, "Open links in message", "Ctrl+O", command_links);
+    appendPalette(a, "Next chat", "Ctrl+Tab", command_next_chat);
+    appendPalette(a, "Previous chat", "Ctrl+Shift+Tab", command_prev_chat);
+    appendPalette(a, "Insert emoji", "", command_emoji);
+    appendPalette(a, "Send message", "Enter", command_send);
     appendPalette(a, "React to message: 👍 Like", "", reaction_like);
     appendPalette(a, "React to message: ❤️ Love", "", reaction_love);
     appendPalette(a, "React to message: 😂 Laugh", "", reaction_laugh);
@@ -4672,6 +4695,27 @@ fn runCommand(a: *App, command: u16) void {
         command_quit => {
             if (a.hwnd) |hwnd| _ = win.PostMessageW(hwnd, win.WM_CLOSE, 0, 0);
         },
+        command_react_menu => openReactionMenuForSelected(a),
+        command_copy_text => copySelectedText(a),
+        command_copy_link => copySelectedLink(a),
+        command_play_audio => playSelectedAudio(a),
+        command_toggle_transcript => toggleSelectedTranscript(a),
+        command_next_message => selectMessage(a, 1),
+        command_prev_message => selectMessage(a, -1),
+        command_jump_latest => {
+            jumpToLatestMessage(a);
+            setStatus(a, "Jumped to latest message");
+        },
+        command_links => openLinkPalette(a),
+        command_next_chat => {
+            selectChat(a, 1, true);
+            focusCompose(a);
+        },
+        command_prev_chat => {
+            selectChat(a, -1, true);
+            focusCompose(a);
+        },
+        command_send => sendMessage(a),
         else => reactToSelected(a, command),
     }
 }
@@ -6209,6 +6253,40 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
     }
 }
 
+fn playSelectedAudio(a: *App) void {
+    if (a.selected_message) |selected| {
+        if (selected < a.message_count) {
+            const audio_item = &a.messages[selected];
+            if (isAudio(audio_item)) {
+                if (std.mem.eql(u8, a.audio_playing_id.slice(), audio_item.id.slice()) and a.audio_state != .empty) {
+                    toggleAudio(a, audio_item);
+                } else if (audio_item.local_path.len > 0) {
+                    startAudioPlayback(a, audio_item);
+                } else {
+                    downloadMedia(a, selected, false);
+                }
+                return;
+            }
+        }
+    }
+    setStatus(a, "Select a voice message with Alt+J/K first");
+}
+
+fn toggleSelectedTranscript(a: *App) void {
+    if (a.selected_message) |selected| {
+        if (selected < a.message_count) {
+            const transcript_item = &a.messages[selected];
+            if (transcript_item.transcript.len > 0) {
+                transcript_item.transcript_expanded = !transcript_item.transcript_expanded;
+                scrollToSelectedMessage(a);
+                if (a.canvas) |canvas| _ = win.InvalidateRect(canvas, null, win.TRUE);
+                return;
+            }
+        }
+    }
+    setStatus(a, "Select a voice message with Alt+J/K first");
+}
+
 fn handleKeyboard(a: *App, message: *const win.MSG) bool {
     if (message.message != win.WM_KEYDOWN and message.message != win.WM_SYSKEYDOWN) return false;
     const key: u32 = @intCast(message.wParam);
@@ -6336,39 +6414,11 @@ fn handleKeyboard(a: *App, message: *const win.MSG) bool {
         return true;
     }
     if (control and key == 'P') {
-        var handled_audio = false;
-        if (a.selected_message) |selected| {
-            if (selected < a.message_count) {
-                const audio_item = &a.messages[selected];
-                if (isAudio(audio_item)) {
-                    handled_audio = true;
-                    if (std.mem.eql(u8, a.audio_playing_id.slice(), audio_item.id.slice()) and a.audio_state != .empty) {
-                        toggleAudio(a, audio_item);
-                    } else if (audio_item.local_path.len > 0) {
-                        startAudioPlayback(a, audio_item);
-                    } else {
-                        downloadMedia(a, selected, false);
-                    }
-                }
-            }
-        }
-        if (!handled_audio) setStatus(a, "Select a voice message with Alt+J/K first");
+        playSelectedAudio(a);
         return true;
     }
     if (control and key == 'T') {
-        var handled_transcript = false;
-        if (a.selected_message) |selected| {
-            if (selected < a.message_count) {
-                const transcript_item = &a.messages[selected];
-                if (transcript_item.transcript.len > 0) {
-                    handled_transcript = true;
-                    transcript_item.transcript_expanded = !transcript_item.transcript_expanded;
-                    scrollToSelectedMessage(a);
-                    if (a.canvas) |canvas| _ = win.InvalidateRect(canvas, null, win.TRUE);
-                }
-            }
-        }
-        if (!handled_transcript) setStatus(a, "Select a voice message with Alt+J/K first");
+        toggleSelectedTranscript(a);
         return true;
     }
     if (alt and (key == 'J' or key == 'K')) {
