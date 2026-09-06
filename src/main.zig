@@ -6,6 +6,7 @@ const dictation = @import("dictation.zig");
 const played = @import("played.zig");
 const compose_layout = @import("compose_layout.zig");
 const webp_detect = @import("webp.zig");
+const scrollbar = @import("scrollbar.zig");
 
 const webp = @cImport({
     @cInclude("src/webp/decode.h");
@@ -53,8 +54,17 @@ const timer_telegram = 7;
 const command_telegram_login = 2025;
 const command_telegram_logout = 2026;
 const wm_update_ready = win.WM_APP + 2;
+const wm_wacli_done = win.WM_APP + 3;
+const wacli_queue_size = 8;
+const max_wacli_args = 16;
+const wacli_arg_cap = 512;
+const max_msg_cache = 8;
+const msg_cache_max_bytes = 4 * 1024 * 1024;
 const update_check_interval_ms: u32 = 4 * 60 * 60 * 1000;
 const update_restart_delay_ms: u32 = 10 * 1000;
+const scrollbar_width: i32 = 8; // 6px thumb + 1px inset on each side
+const scrollbar_min_thumb: i32 = 24;
+const SbDrag = enum { none, chats, compose, palette, canvas };
 const update_max_asset_bytes: usize = 256 * 1024 * 1024;
 const id_search = 1008;
 const id_chats = 1016;
@@ -269,6 +279,41 @@ const Message = struct {
     bubble_hit: win.RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 },
 };
 
+// Background wacli reads: one worker thread runs every wacli call so the UI
+// thread never blocks on process startup (100-300 ms per spawn). The worker
+// posts a WacliResult pointer back with wm_wacli_done; the UI thread parses
+// and applies it. Jobs carry a generation token so a stale answer can never
+// overwrite a newer view.
+const WacliJobKind = enum(u8) { chats, groups, messages, reaction };
+const wacli_kind_count = @typeInfo(WacliJobKind).@"enum".fields.len;
+
+const WacliJob = struct {
+    kind: WacliJobKind = .chats,
+    gen: u64 = 0,
+    jid: Utf8Text(191) = .{},
+    msg_id: Utf8Text(191) = .{},
+    extra: Utf8Text(63) = .{},
+    arg_count: usize = 0,
+    args: [max_wacli_args]Utf8Text(wacli_arg_cap) = [_]Utf8Text(wacli_arg_cap){.{}} ** max_wacli_args,
+};
+
+const WacliResult = struct {
+    kind: WacliJobKind = .chats,
+    gen: u64 = 0,
+    ok: bool = false,
+    jid: Utf8Text(191) = .{},
+    msg_id: Utf8Text(191) = .{},
+    extra: Utf8Text(63) = .{},
+    data: []u8 = &.{},
+};
+
+// Last raw wacli response per chat, so switching back to a recent chat paints
+// its messages instantly while the fresh read runs.
+const MsgCacheEntry = struct {
+    jid: Utf8Text(191) = .{},
+    data: ?[]u8 = null,
+};
+
 const App = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -312,6 +357,14 @@ const App = struct {
     brush_bg: ?win.HBRUSH = null,
     brush_panel: ?win.HBRUSH = null,
     brush_raised: ?win.HBRUSH = null,
+    brush_muted: ?win.HBRUSH = null,
+    sb_drag: SbDrag = .none,
+    sb_chats_top: i32 = -1,
+    sb_chats_total: i32 = -1,
+    sb_compose_top: i32 = -1,
+    sb_compose_lines: i32 = -1,
+    sb_palette_top: i32 = -1,
+    sb_palette_total: i32 = -1,
     chats: [max_chats]Chat = [_]Chat{.{}} ** max_chats,
     chat_count: usize = 0,
     telegram: ?*tg.Client = null,
@@ -393,6 +446,21 @@ const App = struct {
     displayed_timestamp: Utf8Text(47) = .{},
     played_set: played.Set = .{},
     played_path: []u8 = &.{},
+    // The wacli worker thread shares allocator and io with the UI thread:
+    // safe because start.zig provides c_allocator and std.Io.Threaded, both
+    // thread-safe. wacli_pending is only touched under wacli_mutex.
+    wacli_thread: ?std.Thread = null,
+    wacli_mutex: std.Io.Mutex = .init,
+    wacli_cond: std.Io.Condition = .init,
+    wacli_queue: [wacli_queue_size]WacliJob = [_]WacliJob{.{}} ** wacli_queue_size,
+    wacli_queue_len: usize = 0,
+    wacli_quit: bool = false,
+    wacli_pending: [wacli_kind_count]u32 = [_]u32{0} ** wacli_kind_count,
+    messages_gen: u64 = 0,
+    chats_gen: u64 = 0,
+    chats_pending_flags: u8 = 0,
+    msg_cache: [max_msg_cache]MsgCacheEntry = [_]MsgCacheEntry{.{}} ** max_msg_cache,
+    msg_cache_len: usize = 0,
     store_watch_path: WideText(519) = .{},
     last_store_write: u64 = 0,
 };
@@ -601,29 +669,203 @@ fn getInt(object: std.json.ObjectMap, key: []const u8) i64 {
     };
 }
 
-fn runWacli(a: *App, argv: []const []const u8) !std.json.Parsed(std.json.Value) {
-    const result = try std.process.run(a.allocator, a.io, .{
-        .argv = argv,
+fn wacliJobArgs(job: *WacliJob, args: []const []const u8) void {
+    job.arg_count = @min(args.len, max_wacli_args);
+    for (args[0..job.arg_count], 0..) |argument, index| job.args[index].set(argument);
+}
+
+fn wacliPendingGet(a: *App, kind: WacliJobKind) u32 {
+    a.wacli_mutex.lockUncancelable(a.io);
+    const value = a.wacli_pending[@intFromEnum(kind)];
+    a.wacli_mutex.unlock(a.io);
+    return value;
+}
+
+fn wacliPendingSub(a: *App, kind: WacliJobKind) void {
+    a.wacli_mutex.lockUncancelable(a.io);
+    if (a.wacli_pending[@intFromEnum(kind)] > 0) a.wacli_pending[@intFromEnum(kind)] -= 1;
+    a.wacli_mutex.unlock(a.io);
+}
+
+fn wacliEnqueue(a: *App, job: WacliJob, urgent: bool) void {
+    var dropped_reaction = false;
+    a.wacli_mutex.lockUncancelable(a.io);
+    if (a.wacli_queue_len >= a.wacli_queue.len) {
+        // Superseded refreshes are droppable; reactions are dropped only as a
+        // last resort: the victim's pending count drops to zero, so the
+        // checkSync timer restarts live sync within a second either way.
+        // Scan from the back so the oldest droppable job is evicted; index 0
+        // holds the newest (urgent) job and must survive.
+        var victim: usize = a.wacli_queue_len - 1;
+        var index: usize = a.wacli_queue_len;
+        while (index > 0) {
+            index -= 1;
+            if (a.wacli_queue[index].kind != .reaction) {
+                victim = index;
+                break;
+            }
+        }
+        dropped_reaction = a.wacli_queue[victim].kind == .reaction;
+        a.wacli_pending[@intFromEnum(a.wacli_queue[victim].kind)] -= 1;
+        var shift = victim;
+        while (shift + 1 < a.wacli_queue_len) : (shift += 1) a.wacli_queue[shift] = a.wacli_queue[shift + 1];
+        a.wacli_queue_len -= 1;
+    }
+    if (urgent) {
+        var shift = a.wacli_queue_len;
+        while (shift > 0) : (shift -= 1) a.wacli_queue[shift] = a.wacli_queue[shift - 1];
+        a.wacli_queue[0] = job;
+    } else {
+        a.wacli_queue[a.wacli_queue_len] = job;
+    }
+    a.wacli_queue_len += 1;
+    a.wacli_pending[@intFromEnum(job.kind)] += 1;
+    a.wacli_cond.signal(a.io);
+    a.wacli_mutex.unlock(a.io);
+    if (dropped_reaction) setStatus(a, "Reaction queue is full; try again");
+    if (a.wacli_thread == null) wacliPumpSync(a);
+}
+
+// Fallback when the worker thread never started: run queued jobs inline on
+// the UI thread. Blocking, but the app stays functional.
+fn wacliPumpSync(a: *App) void {
+    while (true) {
+        a.wacli_mutex.lockUncancelable(a.io);
+        if (a.wacli_thread != null or a.wacli_queue_len == 0) {
+            a.wacli_mutex.unlock(a.io);
+            return;
+        }
+        const job = a.wacli_queue[0];
+        var shift: usize = 0;
+        while (shift + 1 < a.wacli_queue_len) : (shift += 1) a.wacli_queue[shift] = a.wacli_queue[shift + 1];
+        a.wacli_queue_len -= 1;
+        a.wacli_mutex.unlock(a.io);
+        wacliRunJob(a, job);
+    }
+}
+
+fn wacliShutdown(a: *App) void {
+    a.wacli_mutex.lockUncancelable(a.io);
+    a.wacli_quit = true;
+    a.wacli_cond.signal(a.io);
+    a.wacli_mutex.unlock(a.io);
+    if (a.wacli_thread) |thread| thread.join();
+    a.wacli_thread = null;
+    for (a.msg_cache[0..a.msg_cache_len]) |*entry| {
+        if (entry.data) |data| a.allocator.free(data);
+        entry.data = null;
+    }
+    a.msg_cache_len = 0;
+}
+
+fn wacliWorkerMain(a: *App) void {
+    while (true) {
+        a.wacli_mutex.lockUncancelable(a.io);
+        while (a.wacli_queue_len == 0 and !a.wacli_quit) a.wacli_cond.waitUncancelable(a.io, &a.wacli_mutex);
+        // Quit discards any remaining queued jobs: the window is going away
+        // and joining behind them would hang the close.
+        if (a.wacli_quit) {
+            a.wacli_mutex.unlock(a.io);
+            return;
+        }
+        const job = a.wacli_queue[0];
+        var shift: usize = 0;
+        while (shift + 1 < a.wacli_queue_len) : (shift += 1) a.wacli_queue[shift] = a.wacli_queue[shift + 1];
+        a.wacli_queue_len -= 1;
+        a.wacli_mutex.unlock(a.io);
+        wacliRunJob(a, job);
+    }
+}
+
+// ponytail: no hard timeout around the worker's wacli call, so a hung wacli
+// read stalls the queue and blocks shutdown; upgrade path is spawn plus a
+// WaitForSingleObject deadline with TerminateProcess.
+fn wacliRunJob(a: *App, job: WacliJob) void {
+    var argv: [max_wacli_args][]const u8 = undefined;
+    var count: usize = 0;
+    while (count < job.arg_count) : (count += 1) argv[count] = job.args[count].slice();
+    const result = a.allocator.create(WacliResult) catch {
+        wacliPendingSub(a, job.kind);
+        return;
+    };
+    result.* = .{ .kind = job.kind, .gen = job.gen, .jid = job.jid, .msg_id = job.msg_id, .extra = job.extra };
+    const run = std.process.run(a.allocator, a.io, .{
+        .argv = argv[0..count],
         .stdout_limit = .limited(8 * 1024 * 1024),
         .stderr_limit = .limited(256 * 1024),
         .create_no_window = true,
-    });
+    }) catch {
+        wacliPost(a, result);
+        return;
+    };
     defer {
-        a.allocator.free(result.stdout);
-        a.allocator.free(result.stderr);
+        a.allocator.free(run.stdout);
+        a.allocator.free(run.stderr);
     }
-    const exit_ok = switch (result.term) {
+    result.ok = switch (run.term) {
         .exited => |code| code == 0,
         else => false,
     };
-    if (!exit_ok) return error.WacliFailed;
-    return std.json.parseFromSlice(std.json.Value, a.allocator, result.stdout, .{});
+    if (result.ok) {
+        result.data = a.allocator.dupe(u8, run.stdout) catch blk: {
+            result.ok = false;
+            break :blk &.{};
+        };
+    }
+    wacliPost(a, result);
 }
 
-fn runWacliExclusive(a: *App, argv: []const []const u8) !std.json.Parsed(std.json.Value) {
-    stopSync(a);
-    defer if (a.media_child == null) startSync(a);
-    return runWacli(a, argv);
+fn wacliPost(a: *App, result: *WacliResult) void {
+    const hwnd = a.hwnd orelse {
+        wacliDiscard(a, result);
+        return;
+    };
+    if (win.PostMessageW(hwnd, wm_wacli_done, 0, @bitCast(@intFromPtr(result))) == 0) wacliDiscard(a, result);
+}
+
+// Terminal path for a result the UI will never see: free it and release its
+// pending slot so a lost result cannot wedge live sync or a refresh.
+fn wacliDiscard(a: *App, result: *WacliResult) void {
+    const kind = result.kind;
+    if (result.data.len > 0) a.allocator.free(result.data);
+    a.allocator.destroy(result);
+    wacliPendingSub(a, kind);
+}
+
+fn msgCacheGet(a: *App, jid: []const u8) ?[]const u8 {
+    for (a.msg_cache[0..a.msg_cache_len]) |*entry| {
+        if (std.mem.eql(u8, entry.jid.slice(), jid)) return entry.data;
+    }
+    return null;
+}
+
+fn msgCacheStore(a: *App, jid: []const u8, data: []const u8) void {
+    if (data.len == 0 or data.len > msg_cache_max_bytes) return;
+    const copy = a.allocator.dupe(u8, data) catch return;
+    var slot: ?usize = null;
+    for (a.msg_cache[0..a.msg_cache_len], 0..) |*entry, index| {
+        if (std.mem.eql(u8, entry.jid.slice(), jid)) {
+            slot = index;
+            break;
+        }
+    }
+    if (slot == null and a.msg_cache_len < a.msg_cache.len) {
+        a.msg_cache_len += 1;
+        slot = a.msg_cache_len - 1;
+    }
+    if (slot == null) {
+        if (a.msg_cache[0].data) |old| a.allocator.free(old);
+        var shift: usize = 0;
+        while (shift + 1 < a.msg_cache_len) : (shift += 1) a.msg_cache[shift] = a.msg_cache[shift + 1];
+        // The shift copied the last slot's pointer into len-2; clear it here
+        // so the reuse below cannot free the same pointer twice.
+        a.msg_cache[a.msg_cache_len - 1].data = null;
+        slot = a.msg_cache_len - 1;
+    }
+    const entry = &a.msg_cache[slot.?];
+    if (entry.data) |old| a.allocator.free(old);
+    entry.jid.set(jid);
+    entry.data = copy;
 }
 
 fn timestampPart(timestamp: []const u8, start: usize, length: usize) ?u16 {
@@ -685,8 +927,14 @@ fn groupName(a: *const App, jid: []const u8) ?[]const u8 {
 }
 
 fn refreshGroups(a: *App) void {
-    const args = [_][]const u8{ a.wacli_path, "--json", "--read-only", "groups", "list", "--limit", "1000" };
-    var parsed = runWacli(a, &args) catch return;
+    if (wacliPendingGet(a, .groups) > 0) return;
+    var job = WacliJob{ .kind = .groups };
+    wacliJobArgs(&job, &.{ a.wacli_path, "--json", "--read-only", "groups", "list", "--limit", "1000" });
+    wacliEnqueue(a, job, false);
+}
+
+fn applyGroups(a: *App, raw: []const u8) void {
+    var parsed = std.json.parseFromSlice(std.json.Value, a.allocator, raw, .{}) catch return;
     defer parsed.deinit();
     const root = switch (parsed.value) {
         .object => |object| object,
@@ -714,34 +962,46 @@ fn refreshGroups(a: *App) void {
 }
 
 fn refreshChats(a: *App) void {
+    const flags: u8 = (if (a.unread_only) @as(u8, 1) else 0) | (if (a.show_archived) @as(u8, 2) else 0);
+    // Skip only while an identical job is already queued; a queued job built
+    // with different archive/unread flags is superseded by an urgent re-read.
+    if (wacliPendingGet(a, .chats) > 0 and a.chats_pending_flags == flags) return;
+    var job = WacliJob{ .kind = .chats };
+    wacliJobArgs(&job, &.{
+        a.wacli_path,                                           "--json", "--read-only", "chats", "list", "--limit", "250",
+        if (a.show_archived) "--archived" else "--no-archived",
+    });
+    if (a.unread_only) {
+        // One extra slot; the base list leaves room for it.
+        job.args[job.arg_count].set("--unread");
+        job.arg_count += 1;
+    }
+    a.chats_gen += 1;
+    job.gen = a.chats_gen;
+    wacliEnqueue(a, job, wacliPendingGet(a, .chats) > 0);
+    a.chats_pending_flags = flags;
+}
+
+fn applyChats(a: *App, raw: []const u8) void {
     var query_wide: [256]u16 = [_]u16{0} ** 256;
     const query_len = if (a.search) |search| @as(usize, @intCast(win.GetWindowTextW(search, &query_wide, query_wide.len))) else 0;
     const query_utf8 = if (query_len > 0) std.unicode.utf16LeToUtf8Alloc(a.allocator, query_wide[0..query_len]) catch null else null;
     defer if (query_utf8) |query| a.allocator.free(query);
 
-    var args: [12][]const u8 = undefined;
-    var count: usize = 0;
-    args[count] = a.wacli_path;
-    count += 1;
-    args[count] = "--json";
-    count += 1;
-    args[count] = "--read-only";
-    count += 1;
-    args[count] = "chats";
-    count += 1;
-    args[count] = "list";
-    count += 1;
-    args[count] = "--limit";
-    count += 1;
-    args[count] = "250";
-    count += 1;
-    args[count] = if (a.show_archived) "--archived" else "--no-archived";
-    count += 1;
-    if (a.unread_only) {
-        args[count] = "--unread";
-        count += 1;
-    }
-
+    var parsed = std.json.parseFromSlice(std.json.Value, a.allocator, raw, .{}) catch {
+        setStatus(a, "Unable to read chats from wacli");
+        return;
+    };
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |o| o,
+        else => return,
+    };
+    const data_value = root.get("data") orelse return;
+    const data = switch (data_value) {
+        .array => |items| items,
+        else => return,
+    };
     var selected_jid: [192]u8 = [_]u8{0} ** 192;
     var selected_len: usize = 0;
     if (a.selected_chat < a.chat_count) {
@@ -765,21 +1025,6 @@ fn refreshChats(a: *App) void {
             }
         }
     }
-
-    var parsed = runWacli(a, args[0..count]) catch {
-        setStatus(a, "Unable to read chats from wacli");
-        return;
-    };
-    defer parsed.deinit();
-    const root = switch (parsed.value) {
-        .object => |o| o,
-        else => return,
-    };
-    const data_value = root.get("data") orelse return;
-    const data = switch (data_value) {
-        .array => |items| items,
-        else => return,
-    };
     a.chat_count = 0;
     for (data.items) |item| {
         if (a.chat_count >= max_chats) break;
@@ -1720,6 +1965,44 @@ fn ensureWebPBitmap(a: *App, message: *Message) void {
     const data = readFileWin(a.allocator, path_utf8, 32 * 1024 * 1024) orelse return;
     defer a.allocator.free(data);
     if (!webp_detect.isWebPBytes(data)) return;
+    var features: webp.WebPBitstreamFeatures = undefined;
+    if (webp.WebPGetFeatures(data.ptr, data.len, &features) != webp.VP8_STATUS_OK) return;
+
+    if (features.has_animation == 0) {
+        // Decode straight to the display box: scaling inside libwebp avoids
+        // ever materializing the full-size frame.
+        const fit = webp_detect.fitBox(@intCast(features.width), @intCast(features.height), 420, 250);
+        var config: webp.WebPDecoderConfig = undefined;
+        if (webp.WebPInitDecoderConfig(&config) == 0) return;
+        config.options.use_scaling = 1;
+        config.options.scaled_width = @intCast(fit.width);
+        config.options.scaled_height = @intCast(fit.height);
+        config.output.colorspace = webp.MODE_RGBA;
+        const status = webp.WebPDecode(data.ptr, data.len, &config);
+        if (status == webp.VP8_STATUS_OK and config.output.u.RGBA.stride == @as(c_int, @intCast(fit.width * 4))) {
+            // CreateBitmapFromMemory copies synchronously, so the decoder
+            // buffer can be freed once the WIC bitmap holds the pixels.
+            var wic_bitmap: [*c]win.IWICBitmap = null;
+            const create_hr = a.wic_factory.*.lpVtbl.*.CreateBitmapFromMemory.?(
+                a.wic_factory,
+                fit.width,
+                fit.height,
+                &win.GUID_WICPixelFormat32bppRGBA,
+                fit.width * 4,
+                fit.width * fit.height * 4,
+                config.output.u.RGBA.rgba,
+                &wic_bitmap,
+            );
+            webp.WebPFreeDecBuffer(&config.output);
+            if (create_hr >= 0 and wic_bitmap != null) {
+                defer _ = wic_bitmap.*.lpVtbl.*.Release.?(wic_bitmap);
+                fillDibFromWic(a, message, @ptrCast(wic_bitmap), fit.width, fit.height);
+                return;
+            }
+        } else webp.WebPFreeDecBuffer(&config.output);
+        // Fall through to the full-size decode paths below on failure.
+    }
+
     var width: c_int = 0;
     var height: c_int = 0;
     var pixels = webp.WebPDecodeRGBA(data.ptr, data.len, &width, &height);
@@ -1746,16 +2029,15 @@ fn ensureWebPBitmap(a: *App, message: *Message) void {
     );
     if (create_hr < 0 or wic_bitmap == null) return;
     defer _ = wic_bitmap.*.lpVtbl.*.Release.?(wic_bitmap);
-    fillBitmapFromSource(a, message, @ptrCast(wic_bitmap), @intCast(width), @intCast(height));
+    fillDibFromWic(a, message, @ptrCast(wic_bitmap), @intCast(width), @intCast(height));
 }
 
-fn fillBitmapFromSource(a: *App, message: *Message, source: *win.IWICBitmapSource, source_width: win.UINT, source_height: win.UINT) void {
-    var target_width: win.UINT = @min(source_width, 420);
-    var target_height: win.UINT = @intCast(@max(1, @divTrunc(@as(u64, source_height) * target_width, source_width)));
-    if (target_height > 250) {
-        target_height = 250;
-        target_width = @intCast(@max(1, @divTrunc(@as(u64, source_width) * target_height, source_height)));
-    }
+// Copy a WIC source into the message's DIB at the given display size,
+// scaling down only when the source is larger than the display box.
+fn fillDibFromWic(a: *App, message: *Message, source: *win.IWICBitmapSource, source_width: win.UINT, source_height: win.UINT) void {
+    const fit = webp_detect.fitBox(source_width, source_height, 420, 250);
+    const target_width: win.UINT = fit.width;
+    const target_height: win.UINT = fit.height;
 
     var converter: [*c]win.IWICFormatConverter = null;
     if (a.wic_factory.*.lpVtbl.*.CreateFormatConverter.?(a.wic_factory, &converter) < 0 or converter == null) return;
@@ -1770,16 +2052,60 @@ fn fillBitmapFromSource(a: *App, message: *Message, source: *win.IWICBitmapSourc
         win.WICBitmapPaletteTypeCustom,
     ) < 0) return;
 
+    // libwebp already scaled the pixels to the display box; scaling again
+    // through the WIC scaler would resample a second time.
+    if (source_width == target_width and source_height == target_height) {
+        fillDibFromSource(a, message, @ptrCast(converter), target_width, target_height);
+        return;
+    }
+
     var scaler: [*c]win.IWICBitmapScaler = null;
     if (a.wic_factory.*.lpVtbl.*.CreateBitmapScaler.?(a.wic_factory, &scaler) < 0 or scaler == null) return;
     defer _ = scaler.*.lpVtbl.*.Release.?(scaler);
     if (scaler.*.lpVtbl.*.Initialize.?(scaler, @ptrCast(converter), target_width, target_height, win.WICBitmapInterpolationModeFant) < 0) return;
 
+    fillDibFromSource(a, message, @ptrCast(scaler), target_width, target_height);
+}
+
+fn fillBitmapFromSource(a: *App, message: *Message, source: *win.IWICBitmapSource, source_width: win.UINT, source_height: win.UINT) void {
+    const fit = webp_detect.fitBox(source_width, source_height, 420, 250);
+    const target_width: win.UINT = fit.width;
+    const target_height: win.UINT = fit.height;
+
+    var converter: [*c]win.IWICFormatConverter = null;
+    if (a.wic_factory.*.lpVtbl.*.CreateFormatConverter.?(a.wic_factory, &converter) < 0 or converter == null) return;
+    defer _ = converter.*.lpVtbl.*.Release.?(converter);
+    if (converter.*.lpVtbl.*.Initialize.?(
+        converter,
+        source,
+        &win.GUID_WICPixelFormat32bppPBGRA,
+        win.WICBitmapDitherTypeNone,
+        null,
+        0,
+        win.WICBitmapPaletteTypeCustom,
+    ) < 0) return;
+
+    // libwebp already scaled the pixels to the display box; scaling again
+    // through the WIC scaler would resample a second time.
+    if (source_width == target_width and source_height == target_height) {
+        fillDibFromSource(a, message, @ptrCast(converter), target_width, target_height);
+        return;
+    }
+
+    var scaler: [*c]win.IWICBitmapScaler = null;
+    if (a.wic_factory.*.lpVtbl.*.CreateBitmapScaler.?(a.wic_factory, &scaler) < 0 or scaler == null) return;
+    defer _ = scaler.*.lpVtbl.*.Release.?(scaler);
+    if (scaler.*.lpVtbl.*.Initialize.?(scaler, @ptrCast(converter), target_width, target_height, win.WICBitmapInterpolationModeFant) < 0) return;
+
+    fillDibFromSource(a, message, @ptrCast(scaler), target_width, target_height);
+}
+
+fn fillDibFromSource(a: *App, message: *Message, source: *win.IWICBitmapSource, target_width: win.UINT, target_height: win.UINT) void {
     const stride: win.UINT = target_width * 4;
     const byte_count: win.UINT = stride * target_height;
     const pixels = a.allocator.alloc(u8, byte_count) catch return;
     defer a.allocator.free(pixels);
-    if (scaler.*.lpVtbl.*.CopyPixels.?(@ptrCast(scaler), null, stride, byte_count, pixels.ptr) < 0) return;
+    if (source.*.lpVtbl.*.CopyPixels.?(source, null, stride, byte_count, pixels.ptr) < 0) return;
 
     var info = std.mem.zeroes(win.BITMAPINFO);
     info.bmiHeader.biSize = @sizeOf(win.BITMAPINFOHEADER);
@@ -2461,14 +2787,25 @@ fn refreshMessages(a: *App) void {
     if (chat.provider == .telegram) return refreshTelegramMessages(a);
     const chat_changed = !std.mem.eql(u8, a.displayed_jid.slice(), chat.jid.slice());
     if (chat_changed) stopAudio(a);
-    const args = [_][]const u8{
+    // Instant first paint: render the chat's last known response from the
+    // cache while the fresh read runs in the worker. Only the fresh result
+    // (final) runs mark-as-read.
+    if (msgCacheGet(a, chat.jid.slice())) |cached| applyMessageData(a, cached, false);
+    a.messages_gen += 1;
+    var job = WacliJob{ .kind = .messages, .gen = a.messages_gen };
+    job.jid.set(chat.jid.slice());
+    wacliJobArgs(&job, &.{
         a.wacli_path, "--json", "--read-only", "messages", "list", "--chat", chat.jid.slice(), "--limit", "80",
-    };
-    var parsed = runWacli(a, &args) catch {
-        setStatus(a, "Unable to read messages from wacli");
-        return;
-    };
+    });
+    wacliEnqueue(a, job, true);
+}
+
+fn applyMessageData(a: *App, raw: []const u8, final: bool) void {
+    var parsed = std.json.parseFromSlice(std.json.Value, a.allocator, raw, .{}) catch return;
     defer parsed.deinit();
+    if (a.chat_count == 0 or a.selected_chat >= a.chat_count) return;
+    const chat = &a.chats[a.selected_chat];
+    const chat_changed = !std.mem.eql(u8, a.displayed_jid.slice(), chat.jid.slice());
     const root = switch (parsed.value) {
         .object => |o| o,
         else => return,
@@ -2549,9 +2886,11 @@ fn refreshMessages(a: *App) void {
     // every time background refreshes redrew the conversation.
     if (chat_changed) a.scroll_y = 0;
     a.displayed_jid.set(chat.jid.slice());
-    a.displayed_timestamp.set(chat.timestamp.slice());
+    // Only a fresh result marks the view current: a cached paint must keep
+    // the old timestamp so a later store change still triggers a real read.
+    if (final) a.displayed_timestamp.set(chat.timestamp.slice());
     if (a.canvas) |canvas| _ = win.InvalidateRect(canvas, null, win.TRUE);
-    markChatRead(a);
+    if (final) markChatRead(a);
 }
 
 fn startSync(a: *App) void {
@@ -2560,7 +2899,8 @@ fn startSync(a: *App) void {
     // sync once the last job finishes.
     if (a.sync_child != null or a.read_child != null or a.pending_read_count > 0 or
         a.media_child != null or a.send_child != null or a.pending_send_count > 0 or
-        a.archive_child != null or a.pending_archive_count > 0 or avatarBusy(a)) return;
+        a.archive_child != null or a.pending_archive_count > 0 or avatarBusy(a) or
+        wacliPendingGet(a, .reaction) > 0) return;
     const child = std.process.spawn(a.io, .{
         .argv = &.{ a.wacli_path, "--events", "sync", "--follow", "--max-reconnect", "0", "--stale-threshold", "1m", "--refresh-contacts", "--refresh-groups", "--download-media" },
         .stdin = .ignore,
@@ -3085,14 +3425,33 @@ fn reactToSelected(a: *App, command: u16) void {
         count += 1;
     }
     setStatus(a, if (emoji.len == 0) "Removing reaction..." else "Adding reaction...");
-    var parsed = runWacliExclusive(a, args[0..count]) catch {
+    // Pause live sync on the UI thread before the worker spawns the write;
+    // the worker cannot touch the sync child itself.
+    stopSync(a);
+    var job = WacliJob{ .kind = .reaction };
+    job.jid.set(chat.jid.slice());
+    job.msg_id.set(message.id.slice());
+    job.extra.set(emoji);
+    wacliJobArgs(&job, args[0..count]);
+    // FIFO, not urgent: two quick reactions (add then remove) must reach the
+    // server in the order the user made them.
+    wacliEnqueue(a, job, false);
+}
+
+fn applyReaction(a: *App, result: *WacliResult) void {
+    defer if (a.media_child == null) startSync(a);
+    if (!result.ok) {
         setStatus(a, "Reaction failed");
         return;
-    };
-    parsed.deinit();
-    message.reaction.set(a.allocator, emoji);
+    }
+    for (a.messages[0..a.message_count]) |*message| {
+        if (std.mem.eql(u8, message.id.slice(), result.msg_id.slice())) {
+            message.reaction.set(a.allocator, result.extra.slice());
+            break;
+        }
+    }
     if (a.canvas) |canvas| _ = win.InvalidateRect(canvas, null, win.TRUE);
-    setStatus(a, if (emoji.len == 0) "Reaction removed" else "Reaction sent");
+    setStatus(a, if (result.extra.len == 0) "Reaction removed" else "Reaction sent");
 }
 
 fn insertEmoji(a: *App, emoji: []const u8) void {
@@ -3329,7 +3688,7 @@ fn paletteLayout(a: *App) void {
     const height = palette_edit_zone + rows * palette_row_height + 12;
     _ = win.SetWindowPos(palette, null, 0, 0, palette_width, height, win.SWP_NOMOVE | win.SWP_NOZORDER | win.SWP_NOACTIVATE);
     if (a.palette_list) |list| {
-        _ = win.MoveWindow(list, 1, palette_edit_zone, palette_width - 2, height - palette_edit_zone - 1, win.TRUE);
+        _ = win.MoveWindow(list, 1, palette_edit_zone, palette_width - 2 - scrollbar_width, height - palette_edit_zone - 1, win.TRUE);
     }
 }
 
@@ -3486,7 +3845,7 @@ fn showPaletteWindow(a: *App) void {
     var margins = win.MARGINS{ .cxLeftWidth = 0, .cxRightWidth = 0, .cyTopHeight = 0, .cyBottomHeight = 1 };
     _ = win.DwmExtendFrameIntoClientArea(palette, &margins);
     a.palette_edit = win.CreateWindowExW(0, lit("EDIT"), null, win.WS_CHILD | win.WS_VISIBLE | win.WS_TABSTOP | win.ES_AUTOHSCROLL, 16, 13, palette_width - 32, 36, palette, controlId(id_palette_edit), a.instance, null);
-    a.palette_list = win.CreateWindowExW(0, lit("LISTBOX"), null, win.WS_CHILD | win.WS_VISIBLE | win.WS_VSCROLL | win.LBS_NOTIFY | win.LBS_OWNERDRAWFIXED | win.LBS_NOINTEGRALHEIGHT, 1, palette_edit_zone, palette_width - 2, palette_max_rows * palette_row_height + 12, palette, controlId(id_palette_list), a.instance, null);
+    a.palette_list = win.CreateWindowExW(0, lit("LISTBOX"), null, win.WS_CHILD | win.WS_VISIBLE | win.LBS_NOTIFY | win.LBS_OWNERDRAWFIXED | win.LBS_NOINTEGRALHEIGHT, 1, palette_edit_zone, palette_width - 2 - scrollbar_width, palette_max_rows * palette_row_height + 12, palette, controlId(id_palette_list), a.instance, null);
     setFont(a.palette_edit, a.font);
     setFont(a.palette_list, a.font);
     if (a.palette_edit) |edit| {
@@ -3572,6 +3931,41 @@ fn paletteProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: wi
                 var empty_rect = win.RECT{ .left = 20, .top = palette_edit_zone + 4, .right = client.right - 20, .bottom = palette_edit_zone + 36 };
                 _ = win.DrawTextW(hdc, lit("No matching commands"), -1, &empty_rect, win.DT_LEFT | win.DT_SINGLELINE | win.DT_VCENTER);
             }
+            if (a.palette_list) |list| drawScrollbar(hdc, stripRightOf(list, hwnd), listboxScrollInfo(list), a.brush_muted.?);
+            return 0;
+        },
+        win.WM_LBUTTONDOWN => {
+            const x: i32 = @as(i16, @bitCast(loword(@as(usize, @bitCast(lparam)))));
+            const y: i32 = @as(i16, @bitCast(hiword(@as(usize, @bitCast(lparam)))));
+            if (a.palette_list) |list| {
+                const strip = stripRightOf(list, hwnd);
+                if (hitStrip(strip, x, y)) {
+                    const info = listboxScrollInfo(list);
+                    if (scrollbar.thumbGeom(trackOf(strip).top, trackOf(strip).h, info.total, info.page, info.top, scrollbar_min_thumb) != null)
+                        beginStripDrag(a, hwnd, strip, info, y, .palette, setPaletteScroll);
+                    return 0;
+                }
+            }
+            return win.DefWindowProcW(hwnd, message, wparam, lparam);
+        },
+        win.WM_MOUSEMOVE => {
+            if (a.sb_drag == .palette) {
+                const y: i32 = @as(i16, @bitCast(hiword(@as(usize, @bitCast(lparam)))));
+                if (a.palette_list) |list| dragStrip(a, stripRightOf(list, hwnd), listboxScrollInfo(list), y, setPaletteScroll);
+                return 0;
+            }
+            return win.DefWindowProcW(hwnd, message, wparam, lparam);
+        },
+        win.WM_LBUTTONUP => {
+            if (a.sb_drag == .palette) {
+                _ = win.ReleaseCapture();
+                a.sb_drag = .none;
+                return 0;
+            }
+            return win.DefWindowProcW(hwnd, message, wparam, lparam);
+        },
+        win.WM_CAPTURECHANGED => {
+            a.sb_drag = .none;
             return 0;
         },
         win.WM_ACTIVATE => {
@@ -3584,6 +3978,7 @@ fn paletteProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: wi
             a.palette = null;
             a.palette_edit = null;
             a.palette_list = null;
+            if (a.sb_drag == .palette) a.sb_drag = .none;
             return 0;
         },
         else => return win.DefWindowProcW(hwnd, message, wparam, lparam),
@@ -3722,17 +4117,6 @@ fn composerContentHeight(a: *App) i32 {
     return @max(compose_layout.edit_min_height, lines * line_h + margins + composerNonClientY(compose));
 }
 
-fn updateComposeScrollbar(a: *App, edit_height: i32) void {
-    const compose = a.compose orelse return;
-    const style = win.GetWindowLongPtrW(compose, win.GWL_STYLE);
-    const needs = composerContentHeight(a) > edit_height;
-    const want_style: isize = if (needs) style | @as(isize, @bitCast(@as(usize, win.WS_VSCROLL))) else style & ~@as(isize, @bitCast(@as(usize, win.WS_VSCROLL)));
-    if (want_style != style) {
-        _ = win.SetWindowLongPtrW(compose, win.GWL_STYLE, want_style);
-        _ = win.SetWindowPos(compose, null, 0, 0, 0, 0, win.SWP_FRAMECHANGED | win.SWP_NOMOVE | win.SWP_NOSIZE | win.SWP_NOZORDER | win.SWP_NOACTIVATE);
-    }
-}
-
 fn layout(a: *App, width: i32, height: i32) void {
     a.compose_client_width = width;
     a.compose_client_height = height;
@@ -3741,13 +4125,12 @@ fn layout(a: *App, width: i32, height: i32) void {
     const search_height: i32 = 48;
     const status_height: i32 = 26;
     var sizes = compose_layout.compute(a.compose_dragged, composerContentHeight(a), height);
-    // Width may change with the new height only via the scrollbar; measure once
-    // more after sizing so the wrap count reflects the final width.
+    // The wrap count depends on the edit's width, so measure once more after
+    // sizing (the themed strip keeps that width constant across heights).
     if (a.compose) |hwnd| {
-        _ = win.MoveWindow(hwnd, left_width + 14, height - 11 - sizes.edit_height, width - left_width - 258, sizes.edit_height, win.TRUE);
+        _ = win.MoveWindow(hwnd, left_width + 14, height - 11 - sizes.edit_height, width - left_width - 258 - scrollbar_width, sizes.edit_height, win.TRUE);
         sizes = compose_layout.compute(a.compose_dragged, composerContentHeight(a), height);
-        _ = win.MoveWindow(hwnd, left_width + 14, height - 11 - sizes.edit_height, width - left_width - 258, sizes.edit_height, win.TRUE);
-        updateComposeScrollbar(a, sizes.edit_height);
+        _ = win.MoveWindow(hwnd, left_width + 14, height - 11 - sizes.edit_height, width - left_width - 258 - scrollbar_width, sizes.edit_height, win.TRUE);
     }
     a.compose_strip_top = height - sizes.strip_height;
     if (a.search) |hwnd| {
@@ -3758,7 +4141,7 @@ fn layout(a: *App, width: i32, height: i32) void {
             if (win.SetWindowRgn(hwnd, rgn, win.TRUE) == 0) _ = win.DeleteObject(rgn);
         }
     }
-    if (a.chats_hwnd) |hwnd| _ = win.MoveWindow(hwnd, 0, header_height + search_height, left_width, height - header_height - search_height - status_height, win.TRUE);
+    if (a.chats_hwnd) |hwnd| _ = win.MoveWindow(hwnd, 0, header_height + search_height, left_width - scrollbar_width, height - header_height - search_height - status_height, win.TRUE);
     if (a.status) |hwnd| _ = win.MoveWindow(hwnd, 12, height - status_height, left_width - 24, status_height, win.TRUE);
     if (a.canvas) |hwnd| _ = win.MoveWindow(hwnd, left_width + 1, header_height, width - left_width - 1, height - header_height - sizes.strip_height, win.TRUE);
     if (a.emoji_btn) |hwnd| _ = win.MoveWindow(hwnd, width - 236, height - 55, 44, 44, win.TRUE);
@@ -4276,6 +4659,159 @@ fn drawSenderAvatar(hdc: win.HDC, a: *App, x: i32, top: i32, message: *const Mes
     _ = win.SelectObject(hdc, old_font);
 }
 
+// Themed scrollbars (WAZI-35): the child controls are created without
+// WS_VSCROLL and narrowed by scrollbar_width in layout(); the freed column is
+// painted here with a rounded thumb and driven by jump-and-center dragging.
+const ScrollInfo = struct { total: i32 = 0, page: i32 = 0, top: i32 = 0 };
+
+fn trackOf(strip: win.RECT) struct { top: i32, h: i32 } {
+    return .{ .top = strip.top + 2, .h = strip.bottom - strip.top - 4 };
+}
+
+fn stripRightOf(child: win.HWND, parent: win.HWND) win.RECT {
+    var rect: win.RECT = undefined;
+    _ = win.GetWindowRect(child, &rect);
+    var top_left = win.POINT{ .x = rect.left, .y = rect.top };
+    var bottom_right = win.POINT{ .x = rect.right, .y = rect.bottom };
+    _ = win.ScreenToClient(parent, &top_left);
+    _ = win.ScreenToClient(parent, &bottom_right);
+    return .{ .left = bottom_right.x, .top = top_left.y, .right = bottom_right.x + scrollbar_width, .bottom = bottom_right.y };
+}
+
+fn hitStrip(strip: win.RECT, x: i32, y: i32) bool {
+    return x >= strip.left and x < strip.right and y >= strip.top and y <= strip.bottom;
+}
+
+fn drawScrollbar(hdc: win.HDC, strip: win.RECT, info: ScrollInfo, brush: win.HBRUSH) void {
+    const t = trackOf(strip);
+    const geom = scrollbar.thumbGeom(t.top, t.h, info.total, info.page, info.top, scrollbar_min_thumb) orelse return;
+    const width = strip.right - strip.left - 2;
+    // Fully-rounded pill: corner square equals the thumb width. GDI regions
+    // exclude the right and bottom edges, hence the un-adjusted coordinates.
+    const rgn = win.CreateRoundRectRgn(strip.left + 1, geom.top, strip.right - 1, geom.top + geom.height, width, width) orelse return;
+    defer _ = win.DeleteObject(rgn);
+    _ = win.FillRgn(hdc, rgn, brush);
+}
+
+fn listboxScrollInfo(hwnd: win.HWND) ScrollInfo {
+    const total: i32 = @intCast(win.SendMessageW(hwnd, win.LB_GETCOUNT, 0, 0));
+    if (total <= 0) return .{};
+    var client: win.RECT = undefined;
+    _ = win.GetClientRect(hwnd, &client);
+    const item_height: i32 = @intCast(@max(1, win.SendMessageW(hwnd, win.LB_GETITEMHEIGHT, 0, 0)));
+    return .{
+        .total = total,
+        .page = @max(1, @divTrunc(client.bottom - client.top, item_height)),
+        .top = @intCast(@max(0, win.SendMessageW(hwnd, win.LB_GETTOPINDEX, 0, 0))),
+    };
+}
+
+fn setListboxTop(hwnd: win.HWND, top: i32) void {
+    _ = win.SendMessageW(hwnd, win.LB_SETTOPINDEX, @intCast(@max(0, top)), 0);
+}
+
+fn composeScrollInfo(a: *App, hwnd: win.HWND) ScrollInfo {
+    const total: i32 = @intCast(@max(1, win.SendMessageW(hwnd, win.EM_GETLINECOUNT, 0, 0)));
+    const top: i32 = @intCast(win.SendMessageW(hwnd, win.EM_GETFIRSTVISIBLELINE, 0, 0));
+    const font = a.font orelse return .{ .total = total, .page = 1, .top = top };
+    const dc = win.GetDC(hwnd) orelse return .{ .total = total, .page = 1, .top = top };
+    defer _ = win.ReleaseDC(hwnd, dc);
+    var client: win.RECT = undefined;
+    _ = win.GetClientRect(hwnd, &client);
+    const line_height = @max(1, textLineHeight(dc, font));
+    return .{ .total = total, .page = @max(1, @divTrunc(client.bottom - client.top, line_height)), .top = top };
+}
+
+fn setComposeTop(hwnd: win.HWND, target: i32) void {
+    const current: i32 = @intCast(win.SendMessageW(hwnd, win.EM_GETFIRSTVISIBLELINE, 0, 0));
+    _ = win.SendMessageW(hwnd, win.EM_LINESCROLL, 0, @bitCast(@as(isize, target - current)));
+}
+
+fn canvasStripRect(a: *App) win.RECT {
+    const canvas = a.canvas orelse return .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
+    var client: win.RECT = undefined;
+    _ = win.GetClientRect(canvas, &client);
+    return .{ .left = client.right - scrollbar_width, .top = client.top, .right = client.right, .bottom = client.bottom };
+}
+
+fn canvasScrollInfo(a: *App) ScrollInfo {
+    const canvas = a.canvas orelse return .{};
+    var client: win.RECT = undefined;
+    _ = win.GetClientRect(canvas, &client);
+    const page = @max(1, client.bottom - client.top);
+    const max_scroll = @max(0, a.max_scroll);
+    // scroll_y counts from the bottom of the conversation (0 = newest message).
+    return .{ .total = page + max_scroll, .page = page, .top = max_scroll - a.scroll_y };
+}
+
+fn setCanvasScroll(a: *App, top: i32) void {
+    const max_scroll = @max(0, a.max_scroll);
+    a.scroll_y = std.math.clamp(max_scroll - @max(0, top), 0, max_scroll);
+    if (a.canvas) |canvas| _ = win.InvalidateRect(canvas, null, win.TRUE);
+}
+
+fn setChatsScroll(a: *App, top: i32) void {
+    if (a.chats_hwnd) |list| setListboxTop(list, top);
+}
+
+fn setComposeScroll(a: *App, top: i32) void {
+    if (a.compose) |edit| setComposeTop(edit, top);
+}
+
+fn setPaletteScroll(a: *App, top: i32) void {
+    if (a.palette_list) |list| setListboxTop(list, top);
+}
+
+const SetScrollTop = *const fn (*App, i32) void;
+
+fn beginStripDrag(a: *App, hwnd: win.HWND, strip: win.RECT, info: ScrollInfo, y: i32, target: SbDrag, set_top: SetScrollTop) void {
+    const t = trackOf(strip);
+    set_top(a, scrollbar.topFromPoint(y, t.top, t.h, info.total, info.page, scrollbar_min_thumb));
+    a.sb_drag = target;
+    _ = win.SetCapture(hwnd);
+}
+
+fn dragStrip(a: *App, strip: win.RECT, info: ScrollInfo, y: i32, set_top: SetScrollTop) void {
+    const t = trackOf(strip);
+    set_top(a, scrollbar.topFromPoint(y, t.top, t.h, info.total, info.page, scrollbar_min_thumb));
+}
+
+// Poll scroll positions once per animation tick: child controls scroll
+// natively (wheel, keyboard) without notifying the parent, so compare against
+// the last painted state and repaint the strip on change.
+fn syncScrollbarStrips(a: *App) void {
+    const owner = a.hwnd orelse return;
+    if (a.chats_hwnd) |list| {
+        const info = listboxScrollInfo(list);
+        if (info.total != a.sb_chats_total or info.top != a.sb_chats_top) {
+            a.sb_chats_total = info.total;
+            a.sb_chats_top = info.top;
+            var strip = stripRightOf(list, owner);
+            _ = win.InvalidateRect(owner, &strip, win.FALSE);
+        }
+    }
+    if (a.compose) |edit| {
+        const info = composeScrollInfo(a, edit);
+        if (info.total != a.sb_compose_lines or info.top != a.sb_compose_top) {
+            a.sb_compose_lines = info.total;
+            a.sb_compose_top = info.top;
+            var strip = stripRightOf(edit, owner);
+            _ = win.InvalidateRect(owner, &strip, win.FALSE);
+        }
+    }
+    if (a.palette_list) |list| {
+        if (a.palette) |palette| {
+            const info = listboxScrollInfo(list);
+            if (info.total != a.sb_palette_total or info.top != a.sb_palette_top) {
+                a.sb_palette_total = info.total;
+                a.sb_palette_top = info.top;
+                var strip = stripRightOf(list, palette);
+                _ = win.InvalidateRect(palette, &strip, win.FALSE);
+            }
+        }
+    }
+}
+
 fn drawCanvas(hwnd: win.HWND, a: *App) void {
     var paint: win.PAINTSTRUCT = undefined;
     const screen_dc = win.BeginPaint(hwnd, &paint);
@@ -4313,6 +4849,16 @@ fn drawCanvas(hwnd: win.HWND, a: *App) void {
     else
         "";
     const in_group = std.mem.endsWith(u8, chat_jid, "@g.us");
+    // Evict bitmaps left over from the previous frame for messages that
+    // scrolled off screen: between frames no handle is selected into a DC,
+    // and scrolling back re-decodes from the downloaded file on disk. This
+    // keeps bitmap memory bounded to roughly one viewport of images.
+    for (a.messages[0..a.message_count]) |*message| {
+        if (message.bitmap != null and message.bubble_hit.right <= message.bubble_hit.left) {
+            _ = win.DeleteObject(message.bitmap.?);
+            message.bitmap = null;
+        }
+    }
     var total_height: i32 = 18;
     for (a.messages[0..a.message_count], 0..) |*message, index| total_height += measureMessage(hdc, a, message, bubble_width, showSenderName(a, index)) + messageGap(a, index);
     a.max_scroll = @max(0, total_height - (client.bottom - client.top));
@@ -4545,6 +5091,7 @@ fn drawCanvas(hwnd: win.HWND, a: *App) void {
         var time_rect = win.RECT{ .left = right - 52, .top = y + height - 20, .right = right - 10, .bottom = y + height - 5 };
         _ = win.DrawTextW(hdc, message.time.ptr(), @intCast(message.time.len), &time_rect, win.DT_RIGHT | win.DT_SINGLELINE);
     }
+    drawScrollbar(hdc, canvasStripRect(a), canvasScrollInfo(a), a.brush_muted.?);
 }
 
 fn canvasProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.LPARAM) callconv(.winapi) win.LRESULT {
@@ -4564,6 +5111,19 @@ fn canvasProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win
         win.WM_LBUTTONDOWN => {
             const x: i32 = @as(i16, @bitCast(loword(@as(usize, @bitCast(lparam)))));
             const y: i32 = @as(i16, @bitCast(hiword(@as(usize, @bitCast(lparam)))));
+            if (a.canvas != null) {
+                // The strip overlays canvas content, so only capture clicks
+                // when a thumb is actually drawn.
+                const strip = canvasStripRect(a);
+                const info = canvasScrollInfo(a);
+                if (hitStrip(strip, x, y)) {
+                    if (scrollbar.thumbGeom(trackOf(strip).top, trackOf(strip).h, info.total, info.page, info.top, scrollbar_min_thumb)) |geom| {
+                        _ = geom;
+                        beginStripDrag(a, hwnd, strip, info, y, .canvas, setCanvasScroll);
+                        return 0;
+                    }
+                }
+            }
             for (a.messages[0..a.message_count], 0..) |*item, index| {
                 const bubble = item.bubble_hit;
                 if (x >= bubble.left and x <= bubble.right and y >= bubble.top and y <= bubble.bottom) {
@@ -4583,6 +5143,11 @@ fn canvasProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win
             return 0;
         },
         win.WM_MOUSEMOVE => {
+            if (a.sb_drag == .canvas) {
+                const y: i32 = @as(i16, @bitCast(hiword(@as(usize, @bitCast(lparam)))));
+                if (a.canvas != null) dragStrip(a, canvasStripRect(a), canvasScrollInfo(a), y, setCanvasScroll);
+                return 0;
+            }
             if (!a.text_dragging or a.sel_message == null) return win.DefWindowProcW(hwnd, message, wparam, lparam);
             const x: i32 = @as(i16, @bitCast(loword(@as(usize, @bitCast(lparam)))));
             const y: i32 = @as(i16, @bitCast(hiword(@as(usize, @bitCast(lparam)))));
@@ -4601,6 +5166,11 @@ fn canvasProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win
         win.WM_LBUTTONUP => {
             const x: i32 = @as(i16, @bitCast(loword(@as(usize, @bitCast(lparam)))));
             const y: i32 = @as(i16, @bitCast(hiword(@as(usize, @bitCast(lparam)))));
+            if (a.sb_drag == .canvas) {
+                _ = win.ReleaseCapture();
+                a.sb_drag = .none;
+                return 0;
+            }
             if (a.text_dragging) {
                 _ = win.ReleaseCapture();
                 a.text_dragging = false;
@@ -4611,6 +5181,11 @@ fn canvasProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win
                 return 0;
             }
             handleCanvasClick(a, hwnd, x, y);
+            return 0;
+        },
+        win.WM_CAPTURECHANGED => {
+            a.sb_drag = .none;
+            a.text_dragging = false;
             return 0;
         },
         win.WM_RBUTTONUP => {
@@ -4665,13 +5240,47 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
             }
             return 0;
         },
+        wm_wacli_done => {
+            const result: *WacliResult = @ptrFromInt(@as(usize, @bitCast(lparam)));
+            defer {
+                if (result.data.len > 0) a.allocator.free(result.data);
+                a.allocator.destroy(result);
+            }
+            wacliPendingSub(a, result.kind);
+            switch (result.kind) {
+                .groups => if (result.ok) applyGroups(a, result.data),
+                .chats => {
+                    if (!result.ok) {
+                        setStatus(a, "Unable to read chats from wacli");
+                    } else if (result.gen == a.chats_gen) {
+                        // A queued job with older archive/unread flags must
+                        // not repaint over a newer one.
+                        applyChats(a, result.data);
+                    }
+                },
+                .messages => {
+                    if (!result.ok) {
+                        setStatus(a, "Unable to read messages from wacli");
+                    } else if (a.selected_chat < a.chat_count and
+                        std.mem.eql(u8, a.chats[a.selected_chat].jid.slice(), result.jid.slice()) and
+                        result.gen == a.messages_gen)
+                    {
+                        applyMessageData(a, result.data, true);
+                        msgCacheStore(a, result.jid.slice(), result.data);
+                    }
+                },
+                .reaction => applyReaction(a, result),
+            }
+            return 0;
+        },
         win.WM_CREATE => {
             a.hwnd = hwnd;
             a.brush_bg = win.CreateSolidBrush(color_bg);
             a.brush_panel = win.CreateSolidBrush(color_panel);
             a.brush_raised = win.CreateSolidBrush(color_raised);
+            a.brush_muted = win.CreateSolidBrush(color_muted);
             a.search = win.CreateWindowExW(0, lit("EDIT"), null, win.WS_CHILD | win.WS_VISIBLE | win.WS_TABSTOP | win.ES_AUTOHSCROLL, 0, 0, 0, 0, hwnd, controlId(id_search), a.instance, null);
-            a.chats_hwnd = win.CreateWindowExW(0, lit("LISTBOX"), null, win.WS_CHILD | win.WS_VISIBLE | win.WS_TABSTOP | win.WS_VSCROLL | win.LBS_NOTIFY | win.LBS_OWNERDRAWFIXED | win.LBS_NOINTEGRALHEIGHT, 0, 0, 0, 0, hwnd, controlId(id_chats), a.instance, null);
+            a.chats_hwnd = win.CreateWindowExW(0, lit("LISTBOX"), null, win.WS_CHILD | win.WS_VISIBLE | win.WS_TABSTOP | win.LBS_NOTIFY | win.LBS_OWNERDRAWFIXED | win.LBS_NOINTEGRALHEIGHT, 0, 0, 0, 0, hwnd, controlId(id_chats), a.instance, null);
             a.canvas = win.CreateWindowExW(0, lit("WacliMessageCanvas"), null, win.WS_CHILD | win.WS_VISIBLE | win.WS_TABSTOP, 0, 0, 0, 0, hwnd, controlId(id_canvas), a.instance, null);
             a.compose = win.CreateWindowExW(0, lit("EDIT"), null, win.WS_CHILD | win.WS_VISIBLE | win.WS_TABSTOP | win.ES_MULTILINE | win.ES_AUTOVSCROLL, 0, 0, 0, 0, hwnd, controlId(id_compose), a.instance, null);
             a.dictate = win.CreateWindowExW(0, lit("BUTTON"), lit("Dictate"), win.WS_CHILD | win.WS_VISIBLE | win.WS_TABSTOP | win.BS_PUSHBUTTON, 0, 0, 0, 0, hwnd, controlId(id_dictate), a.instance, null);
@@ -4691,6 +5300,10 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
             _ = win.SetTimer(hwnd, timer_animation, 120, null);
             _ = win.SetTimer(hwnd, timer_telegram, 250, null);
             _ = win.SetTimer(hwnd, timer_update_check, update_check_interval_ms, null);
+            if (a.wacli_thread == null) {
+                a.wacli_thread = std.Thread.spawn(.{ .stack_size = 1024 * 1024 }, wacliWorkerMain, .{a}) catch null;
+            }
+            if (a.wacli_thread == null) setStatus(a, "Background reader failed to start");
             refreshGroups(a);
             refreshChats(a);
             refreshMessages(a);
@@ -4720,6 +5333,8 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
                 var grip = win.RECT{ .left = cx - 22, .top = a.compose_strip_top + 4, .right = cx + 22, .bottom = a.compose_strip_top + 6 };
                 _ = win.FillRect(hdc, &grip, a.brush_panel.?);
             }
+            if (a.chats_hwnd) |list| drawScrollbar(hdc, stripRightOf(list, hwnd), listboxScrollInfo(list), a.brush_muted.?);
+            if (a.compose) |edit| drawScrollbar(hdc, stripRightOf(edit, hwnd), composeScrollInfo(a, edit), a.brush_muted.?);
             _ = win.EndPaint(hwnd, &paint);
             return 0;
         },
@@ -4739,17 +5354,45 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
             return win.DefWindowProcW(hwnd, message, wparam, lparam);
         },
         win.WM_LBUTTONDOWN => {
-            if (a.compose != null) {
-                const y: i32 = @as(i16, @bitCast(hiword(@as(usize, @bitCast(lparam)))));
-                if (y >= a.compose_strip_top and y < a.compose_strip_top + 11) {
-                    a.compose_dragging = true;
-                    _ = win.SetCapture(hwnd);
+            const x: i32 = @as(i16, @bitCast(loword(@as(usize, @bitCast(lparam)))));
+            const y: i32 = @as(i16, @bitCast(hiword(@as(usize, @bitCast(lparam)))));
+            // The composer's resize band takes precedence over the scrollbar
+            // strip: their top 11px overlap when the edit is at minimum height.
+            if (a.compose != null and y >= a.compose_strip_top and y < a.compose_strip_top + 11) {
+                a.compose_dragging = true;
+                _ = win.SetCapture(hwnd);
+                return 0;
+            }
+            if (a.chats_hwnd) |list| {
+                const strip = stripRightOf(list, hwnd);
+                if (hitStrip(strip, x, y)) {
+                    const info = listboxScrollInfo(list);
+                    if (scrollbar.thumbGeom(trackOf(strip).top, trackOf(strip).h, info.total, info.page, info.top, scrollbar_min_thumb) != null)
+                        beginStripDrag(a, hwnd, strip, info, y, .chats, setChatsScroll);
+                    return 0;
+                }
+            }
+            if (a.compose) |edit| {
+                const strip = stripRightOf(edit, hwnd);
+                if (hitStrip(strip, x, y)) {
+                    const info = composeScrollInfo(a, edit);
+                    if (scrollbar.thumbGeom(trackOf(strip).top, trackOf(strip).h, info.total, info.page, info.top, scrollbar_min_thumb) != null)
+                        beginStripDrag(a, hwnd, strip, info, y, .compose, setComposeScroll);
                     return 0;
                 }
             }
             return win.DefWindowProcW(hwnd, message, wparam, lparam);
         },
         win.WM_MOUSEMOVE => {
+            if (a.sb_drag != .none) {
+                const y: i32 = @as(i16, @bitCast(hiword(@as(usize, @bitCast(lparam)))));
+                switch (a.sb_drag) {
+                    .chats => if (a.chats_hwnd) |list| dragStrip(a, stripRightOf(list, hwnd), listboxScrollInfo(list), y, setChatsScroll),
+                    .compose => if (a.compose) |edit| dragStrip(a, stripRightOf(edit, hwnd), composeScrollInfo(a, edit), y, setComposeScroll),
+                    else => {},
+                }
+                return 0;
+            }
             if (a.compose_dragging) {
                 const y: i32 = @as(i16, @bitCast(hiword(@as(usize, @bitCast(lparam)))));
                 a.compose_dragged = std.math.clamp(a.compose_client_height - 11 - y, 44, 400);
@@ -4759,6 +5402,11 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
             return win.DefWindowProcW(hwnd, message, wparam, lparam);
         },
         win.WM_LBUTTONUP => {
+            if (a.sb_drag != .none) {
+                _ = win.ReleaseCapture();
+                a.sb_drag = .none;
+                return 0;
+            }
             if (a.compose_dragging) {
                 a.compose_dragging = false;
                 _ = win.ReleaseCapture();
@@ -4769,6 +5417,7 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
         },
         win.WM_CAPTURECHANGED => {
             a.compose_dragging = false;
+            a.sb_drag = .none;
             return 0;
         },
         win.WM_DRAWITEM => {
@@ -4835,6 +5484,7 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
                 advanceGifs(a);
                 updateAudioPlayback(a);
                 updateDictation(a);
+                syncScrollbarStrips(a);
                 // Harvest the finished result before scheduling the next
                 // job; the session has one result slot and scheduling first
                 // silently discarded every completed transcript.
@@ -4869,6 +5519,7 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
             return 0;
         },
         win.WM_DESTROY => {
+            wacliShutdown(a);
             closePlayer(a);
             _ = win.KillTimer(hwnd, timer_refresh);
             _ = win.KillTimer(hwnd, timer_search);
