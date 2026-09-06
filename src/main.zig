@@ -407,6 +407,7 @@ fn createTooltips(a: *App, hwnd: win.HWND) void {
     addTooltip(tt, a.compose, lit("Message box  Enter sends · Shift+Enter new line"));
     addTooltip(tt, a.dictate, lit("Dictate  Ctrl+D"));
     addTooltip(tt, a.send, lit("Send message  Enter"));
+    addTooltip(tt, a.emoji_btn, lit("Emoji menu"));
 }
 
 fn loadRegistryString(allocator: std.mem.Allocator, name: [*:0]const u16) ?[]const u8 {
