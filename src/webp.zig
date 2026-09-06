@@ -25,6 +25,7 @@ pub fn firstAnimationFrame(data: []const u8) ?[]const u8 {
         if (std.mem.eql(u8, data[offset .. offset + 4], "ANMF")) {
             // ANMF payload: 16-byte frame header, then optional ALPH chunk and
             // the VP8/VP8L chunk.
+            if (size > data.len - offset - 8) return null;
             var inner = offset + 8 + 16;
             const inner_size = chunkSizeAt(data, inner) orelse return null;
             if (std.mem.eql(u8, data[inner .. inner + 4], "ALPH")) {
@@ -63,7 +64,7 @@ test "firstAnimationFrame extracts the VP8 payload of the first ANMF chunk" {
     @memcpy(data[0..12], "RIFF" ++ "\x40\x00\x00\x00" ++ "WEBP");
     @memcpy(data[12..20], "VP8X" ++ "\x0a\x00\x00\x00");
     @memset(data[20..30], 0);
-    @memcpy(data[30..38], "ANMF" ++ "\x1e\x00\x00\x00");
+    @memcpy(data[30..38], "ANMF" ++ "\x1c\x00\x00\x00");
     @memset(data[38..54], 0); // 16-byte frame header
     @memcpy(data[54..62], "VP8 " ++ "\x04\x00\x00\x00");
     @memcpy(data[62..66], "bits");
