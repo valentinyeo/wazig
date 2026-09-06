@@ -3389,10 +3389,12 @@ fn layout(a: *App, width: i32, height: i32) void {
     const header_height: i32 = 0;
     const search_height: i32 = 48;
     const status_height: i32 = 26;
-    const sizes = compose_layout.compute(a.compose_dragged, composerContentHeight(a), height);
-    // WAZI-35: the composer scrollbar is the themed strip beside the edit, so
-    // the width is constant and one measure suffices.
+    var sizes = compose_layout.compute(a.compose_dragged, composerContentHeight(a), height);
+    // The wrap count depends on the edit's width, so measure once more after
+    // sizing (the themed strip keeps that width constant across heights).
     if (a.compose) |hwnd| {
+        _ = win.MoveWindow(hwnd, left_width + 14, height - 11 - sizes.edit_height, width - left_width - 258 - scrollbar_width, sizes.edit_height, win.TRUE);
+        sizes = compose_layout.compute(a.compose_dragged, composerContentHeight(a), height);
         _ = win.MoveWindow(hwnd, left_width + 14, height - 11 - sizes.edit_height, width - left_width - 258 - scrollbar_width, sizes.edit_height, win.TRUE);
     }
     a.compose_strip_top = height - sizes.strip_height;
@@ -4363,12 +4365,16 @@ fn canvasProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win
             const x: i32 = @as(i16, @bitCast(loword(@as(usize, @bitCast(lparam)))));
             const y: i32 = @as(i16, @bitCast(hiword(@as(usize, @bitCast(lparam)))));
             if (a.canvas != null) {
+                // The strip overlays canvas content, so only capture clicks
+                // when a thumb is actually drawn.
                 const strip = canvasStripRect(a);
+                const info = canvasScrollInfo(a);
                 if (hitStrip(strip, x, y)) {
-                    const info = canvasScrollInfo(a);
-                    if (scrollbar.thumbGeom(trackOf(strip).top, trackOf(strip).h, info.total, info.page, info.top, scrollbar_min_thumb) != null)
+                    if (scrollbar.thumbGeom(trackOf(strip).top, trackOf(strip).h, info.total, info.page, info.top, scrollbar_min_thumb)) |geom| {
+                        _ = geom;
                         beginStripDrag(a, hwnd, strip, info, y, .canvas, setCanvasScroll);
-                    return 0;
+                        return 0;
+                    }
                 }
             }
             for (a.messages[0..a.message_count], 0..) |*item, index| {
