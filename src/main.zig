@@ -289,6 +289,7 @@ const App = struct {
     media_child: ?std.process.Child = null,
     read_child: ?std.process.Child = null,
     read_spawn_failures: u32 = 0,
+    read_started_ms: u64 = 0,
     pending_reads: [max_pending_reads]Utf8Text(191) = [_]Utf8Text(191){.{}} ** max_pending_reads,
     pending_read_count: usize = 0,
     send_child: ?std.process.Child = null,
@@ -757,13 +758,22 @@ fn startNextMarkRead(a: *App) void {
     };
     a.read_spawn_failures = 0;
     a.read_child = child;
+    a.read_started_ms = win.GetTickCount64();
 }
+
+// The mark-read child gates every other background job, so a hung wacli must
+// not wedge the app: the lock wait is capped at 10s, so 30s means it is stuck.
+const read_timeout_ms: u64 = 30_000;
 
 fn checkMarkRead(a: *App) void {
     if (a.read_child) |*child| {
         const handle = child.id orelse return;
         var code: win.DWORD = 0;
-        if (win.GetExitCodeProcess(handle, &code) == 0 or code == win.STILL_ACTIVE) return;
+        if (win.GetExitCodeProcess(handle, &code) == 0 or code == win.STILL_ACTIVE) {
+            if (win.GetTickCount64() - a.read_started_ms <= read_timeout_ms) return;
+            _ = child.kill(a.io);
+            code = 1;
+        }
         _ = child.wait(a.io) catch {};
         a.read_child = null;
         removeFirstPendingRead(a);
