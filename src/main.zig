@@ -2,6 +2,7 @@ const std = @import("std");
 const audio = @import("audio.zig");
 const avatar = @import("avatar.zig");
 const dictation = @import("dictation.zig");
+const played = @import("played.zig");
 
 const win = @cImport({
     @cDefine("WIN32_LEAN_AND_MEAN", "1");
@@ -338,6 +339,8 @@ const App = struct {
     reply_sender: Utf8Text(191) = .{},
     displayed_jid: Utf8Text(191) = .{},
     displayed_timestamp: Utf8Text(47) = .{},
+    played_set: played.Set = .{},
+    played_path: []u8 = &.{},
     store_watch_path: WideText(519) = .{},
     last_store_write: u64 = 0,
 };
@@ -926,6 +929,7 @@ fn startAudioPlayback(a: *App, message: *Message) void {
     const path_utf8 = std.unicode.utf16LeToUtf8Alloc(a.allocator, message.local_path.slice()) catch return;
     defer a.allocator.free(path_utf8);
     player.play(path_utf8);
+    markPlayed(a, message.id.slice());
     a.audio_playing_id.set(message.id.slice());
     a.audio_state = .playing;
     a.audio_position_ms = 0;
@@ -3565,6 +3569,12 @@ fn drawCanvas(hwnd: win.HWND, a: *App) void {
                     _ = win.DeleteObject(filled_brush);
                 }
                 _ = win.DeleteObject(track_brush);
+                if (!active and a.played_set.wasPlayed(message.id.slice())) {
+                    _ = win.SelectObject(hdc, @ptrCast(a.font_small.?));
+                    _ = win.SetTextColor(hdc, color_muted);
+                    var played_rect = win.RECT{ .left = right - 60, .top = strip_top, .right = right - 10, .bottom = strip_top + 42 };
+                    _ = win.DrawTextW(hdc, lit("✓ played"), -1, &played_rect, win.DT_RIGHT | win.DT_SINGLELINE | win.DT_VCENTER);
+                }
                 if (active and a.audio_duration_ms > 0) {
                     var time_buffer: [24]u8 = undefined;
                     var position_buffer: [16]u8 = undefined;
@@ -4192,6 +4202,59 @@ fn jumpToLatestMessage(a: *App) void {
     if (a.canvas) |canvas| _ = win.InvalidateRect(canvas, null, win.TRUE);
 }
 
+fn findPlayedPath(init: std.process.Init, allocator: std.mem.Allocator) []u8 {
+    const local = init.environ_map.get("LOCALAPPDATA") orelse return &.{};
+    const dir = std.fs.path.join(allocator, &.{ local, "Messages" }) catch return &.{};
+    const cwd = std.Io.Dir.cwd();
+    cwd.createDirPath(init.io, dir) catch {};
+    const path = std.fs.path.join(allocator, &.{ dir, "played.txt" }) catch {
+        allocator.free(dir);
+        return &.{};
+    };
+    allocator.free(dir);
+    return path;
+}
+
+fn loadPlayed(a: *App) void {
+    if (a.played_path.len == 0) return;
+    const wide = std.unicode.utf8ToUtf16LeAllocZ(a.allocator, a.played_path) catch return;
+    defer a.allocator.free(wide);
+    // Read only the tail of the append-only store: the newest entries are
+    // at the end and the read is capped to keep startup bounded.
+    const handle = win.CreateFileW(wide.ptr, win.GENERIC_READ, win.FILE_SHARE_READ, null, win.OPEN_EXISTING, win.FILE_ATTRIBUTE_NORMAL, null);
+    if (handle == win.INVALID_HANDLE_VALUE or handle == null) return;
+    defer _ = win.CloseHandle(handle);
+    var size: win.LARGE_INTEGER = undefined;
+    if (win.GetFileSizeEx(handle, &size) == 0 or size.QuadPart <= 0) return;
+    const capped: i64 = @min(size.QuadPart, 128 * 1024);
+    const distance: win.LARGE_INTEGER = .{ .QuadPart = -capped };
+    if (win.SetFilePointerEx(handle, distance, null, win.FILE_END) == 0) return;
+    const buffer = a.allocator.alloc(u8, @intCast(capped)) catch return;
+    defer a.allocator.free(buffer);
+    var total: usize = 0;
+    while (total < buffer.len) {
+        var got: win.DWORD = 0;
+        if (win.ReadFile(handle, buffer.ptr + total, @intCast(buffer.len - total), &got, null) == 0) break;
+        if (got == 0) break;
+        total += got;
+    }
+    a.played_set.load(buffer[0..total]);
+}
+
+fn markPlayed(a: *App, id: []const u8) void {
+    if (a.played_path.len == 0) return;
+    var line_buffer: [40]u8 = undefined;
+    const line = a.played_set.mark(id, &line_buffer) orelse return;
+    const wide = std.unicode.utf8ToUtf16LeAllocZ(a.allocator, a.played_path) catch return;
+    defer a.allocator.free(wide);
+    // True append: a crash mid-write can never truncate existing history.
+    const handle = win.CreateFileW(wide.ptr, win.FILE_APPEND_DATA, win.FILE_SHARE_READ, null, win.OPEN_ALWAYS, win.FILE_ATTRIBUTE_NORMAL, null);
+    if (handle == win.INVALID_HANDLE_VALUE or handle == null) return;
+    defer _ = win.CloseHandle(handle);
+    var written: win.DWORD = 0;
+    _ = win.WriteFile(handle, line.ptr, @intCast(line.len), &written, null);
+}
+
 fn findWacli(init: std.process.Init, allocator: std.mem.Allocator) ![]u8 {
     const local = init.environ_map.get("LOCALAPPDATA") orelse return error.MissingLocalAppData;
     return std.fs.path.join(allocator, &.{ local, "Programs", "wacli", "wacli.exe" });
@@ -4272,6 +4335,8 @@ pub fn main(init: std.process.Init) !void {
     }
     if (openrouter_model.len == 0) openrouter_model = "openai/gpt-5.6-luna";
     var app = App{ .allocator = init.gpa, .io = init.io, .instance = instance, .wacli_path = wacli_path, .avatar_dir = avatar_dir, .deepgram_configured = deepgram_key.len > 0, .deepgram_key = deepgram_key, .openrouter_key = openrouter_key, .openrouter_model = openrouter_model, .openrouter_configured = openrouter_key.len > 0, .dictation_language = loadDictationLanguage(), .font_scale = loadFontScale() };
+    app.played_path = findPlayedPath(init, init.gpa);
+    loadPlayed(&app);
     app.store_watch_path.set(init.gpa, store_watch_path);
     app_ptr = &app;
     defer app_ptr = null;
