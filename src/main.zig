@@ -3233,6 +3233,64 @@ fn measureMessage(hdc: win.HDC, a: *App, message: *const Message, width: i32) i3
     return @max(height, 58);
 }
 
+const SenderColor = struct { r: u8, g: u8, b: u8 };
+
+const sender_palette = [_]SenderColor{
+    .{ .r = 0, .g = 168, .b = 132 },
+    .{ .r = 83, .g = 189, .b = 235 },
+    .{ .r = 235, .g = 140, .b = 84 },
+    .{ .r = 178, .g = 132, .b = 235 },
+    .{ .r = 235, .g = 195, .b = 84 },
+    .{ .r = 235, .g = 110, .b = 150 },
+};
+
+// Stable per-sender color so the same person keeps one color within a chat.
+fn senderColorFor(seed: []const u8) SenderColor {
+    if (seed.len == 0) return sender_palette[0];
+    var hash: u32 = 2166136261;
+    for (seed) |byte| {
+        hash ^= byte;
+        hash = hash *% 16777619;
+    }
+    return sender_palette[hash % sender_palette.len];
+}
+
+// First grapheme-ish chunk of a UTF-16 name: pairs up surrogate halves so an
+// emoji initial does not render as a lone surrogate.
+fn senderInitial(sender: []const u16) []const u16 {
+    if (sender.len == 0) return sender;
+    const first = sender[0];
+    if (first >= 0xd800 and first <= 0xdbff and sender.len > 1 and sender[1] >= 0xdc00 and sender[1] <= 0xdfff)
+        return sender[0..2];
+    return sender[0..1];
+}
+
+fn drawSenderAvatar(hdc: win.HDC, a: *App, x: i32, top: i32, message: *const Message) void {
+    // Seed the color from the jid; fall back to the first name code unit when
+    // the jid is missing (both are stable per person).
+    const seed = if (message.sender_jid.len > 0)
+        message.sender_jid.slice()
+    else blk: {
+        const units = message.sender.slice();
+        break :blk std.mem.sliceAsBytes(units[0..@min(units.len, 2)]);
+    };
+    const tint = senderColorFor(seed);
+    const circle_brush = win.CreateSolidBrush(rgb(tint.r, tint.g, tint.b)) orelse return;
+    defer _ = win.DeleteObject(circle_brush);
+    const old_brush = win.SelectObject(hdc, circle_brush);
+    const old_pen = win.SelectObject(hdc, win.GetStockObject(win.NULL_PEN));
+    _ = win.Ellipse(hdc, x, top, x + 30, top + 30);
+    _ = win.SelectObject(hdc, old_brush);
+    _ = win.SelectObject(hdc, old_pen);
+    const initial = senderInitial(message.sender.slice());
+    const old_font = win.SelectObject(hdc, @ptrCast(a.font_bold.?));
+    const old_color = win.SetTextColor(hdc, color_text);
+    var rect = win.RECT{ .left = x, .top = top, .right = x + 30, .bottom = top + 30 };
+    _ = win.DrawTextW(hdc, @ptrCast(initial.ptr), @intCast(initial.len), &rect, win.DT_CENTER | win.DT_SINGLELINE | win.DT_VCENTER);
+    _ = win.SetTextColor(hdc, old_color);
+    _ = win.SelectObject(hdc, old_font);
+}
+
 fn drawCanvas(hwnd: win.HWND, a: *App) void {
     var paint: win.PAINTSTRUCT = undefined;
     const screen_dc = win.BeginPaint(hwnd, &paint);
@@ -3263,6 +3321,13 @@ fn drawCanvas(hwnd: win.HWND, a: *App) void {
     _ = win.SetBkMode(hdc, win.TRANSPARENT);
     const available_width = client.right - client.left;
     const bubble_width = std.math.clamp(@divTrunc(available_width * 7, 10), 280, 620);
+    const chat_jid = if (a.displayed_jid.len > 0)
+        a.displayed_jid.slice()
+    else if (a.chat_count > 0 and a.selected_chat < a.chat_count)
+        a.chats[a.selected_chat].jid.slice()
+    else
+        "";
+    const in_group = std.mem.endsWith(u8, chat_jid, "@g.us");
     var total_height: i32 = 18;
     for (a.messages[0..a.message_count]) |*message| total_height += measureMessage(hdc, a, message, bubble_width) + 8;
     a.max_scroll = @max(0, total_height - (client.bottom - client.top));
@@ -3283,7 +3348,7 @@ fn drawCanvas(hwnd: win.HWND, a: *App) void {
         const height = measureMessage(hdc, a, message, bubble_width);
         y -= height - estimated_height;
         if (y > client.bottom or y + height < client.top) continue;
-        const left = if (message.from_me) client.right - bubble_width - 24 else 24;
+        const left: i32 = if (message.from_me) client.right - bubble_width - 24 else if (in_group) 62 else 24;
         const right = left + bubble_width;
         message.bubble_hit = .{ .left = left, .top = y, .right = right, .bottom = y + height };
         const brush = win.CreateSolidBrush(if (message.from_me) color_outgoing else color_incoming) orelse continue;
@@ -3308,6 +3373,7 @@ fn drawCanvas(hwnd: win.HWND, a: *App) void {
             _ = win.DrawTextW(hdc, message.sender.ptr(), @intCast(message.sender.len), &sender_rect, win.DT_LEFT | win.DT_SINGLELINE | win.DT_END_ELLIPSIS);
         }
         var text_top = y + 28;
+        if (in_group and !message.from_me and message.sender.len > 0) drawSenderAvatar(hdc, a, left - 38, y + 8, message);
         if (message.bitmap) |bitmap| {
             const image_left = left + @divTrunc(bubble_width - message.bitmap_width, 2);
             const image_top = text_top + 4;
