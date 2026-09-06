@@ -83,7 +83,8 @@ jobs:
           git clone --depth 1 --branch v1.3.1 https://github.com/madler/zlib.git /tmp/zlibsrc
           (cd /tmp/zlibsrc && CC=x86_64-w64-mingw32-gcc ./configure --static --prefix="$P" && make -j$(nproc) install)
           git clone --depth 1 --branch openssl-3.3.2 https://github.com/openssl/openssl.git /tmp/opensslsrc
-          (cd /tmp/opensslsrc && ./Configure mingw64 no-shared no-tests no-docs --libdir=lib --prefix="$P" --cross-compile-prefix=x86_64-w64-mingw32- && make -j$(nproc) -s install_sw && cp -n "$P/lib64"/*.a "$P/lib/" 2>/dev/null || true)
+          (cd /tmp/opensslsrc && ./Configure mingw64 no-asm no-shared no-tests no-docs --libdir=lib --prefix="$P" --cross-compile-prefix=x86_64-w64-mingw32- && make -j$(nproc) -s install_sw)
+          cp -n "$P/lib64"/*.a "$P/lib/" 2>/dev/null || true
           git clone https://github.com/tdlib/td.git /tmp/tdsrc
           (cd /tmp/tdsrc && git checkout "$TDLIB_COMMIT")
           # Stage 1: build TDLib's host generators natively; they write the
