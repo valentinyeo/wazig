@@ -243,6 +243,7 @@ const App = struct {
     send: ?win.HWND = null,
     emoji_btn: ?win.HWND = null,
     dictate: ?win.HWND = null,
+    tooltips: ?win.HWND = null,
     status: ?win.HWND = null,
     palette: ?win.HWND = null,
     palette_edit: ?win.HWND = null,
@@ -3576,6 +3577,45 @@ fn canvasProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win
     }
 }
 
+fn addTooltip(tt: win.HWND, tool: ?win.HWND, text: [*:0]const u16) void {
+    const target = tool orelse return;
+    var info = win.TOOLINFOW{
+        .cbSize = @sizeOf(win.TOOLINFOW),
+        .uFlags = win.TTF_IDISHWND | win.TTF_SUBCLASS,
+        .hwnd = win.GetParent(target),
+        .uId = @intFromPtr(target),
+        .lpszText = @constCast(text),
+    };
+    _ = win.SendMessageW(tt, win.TTM_ADDTOOLW, 0, @as(win.LPARAM, @bitCast(@intFromPtr(&info))));
+}
+
+fn createTooltips(a: *App, hwnd: win.HWND) void {
+    const tt = win.CreateWindowExW(
+        win.WS_EX_TOPMOST,
+        lit("tooltips_class32"),
+        null,
+        win.WS_POPUP | win.TTS_NOPREFIX,
+        0,
+        0,
+        0,
+        0,
+        hwnd,
+        null,
+        a.instance,
+        null,
+    ) orelse return;
+    a.tooltips = tt;
+    // TTM_SETMAXWIDTH (WM_USER + 24); not exposed by the commctrl.h import
+    _ = win.SendMessageW(tt, 0x400 + 24, 0, 260);
+    addTooltip(tt, a.search, lit("Search chats  Ctrl+F or /"));
+    addTooltip(tt, a.chats_hwnd, lit("Chats  ↑/↓ move · Enter to compose"));
+    addTooltip(tt, a.canvas, lit("Messages  Alt+J/K select · Ctrl+T transcript · Ctrl+P play voice"));
+    addTooltip(tt, a.compose, lit("Message box  Enter sends · Shift+Enter new line"));
+    addTooltip(tt, a.dictate, lit("Dictate  Ctrl+D"));
+    addTooltip(tt, a.send, lit("Send message  Enter"));
+    addTooltip(tt, a.emoji_btn, lit("Emoji menu"));
+}
+
 fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.LPARAM) callconv(.winapi) win.LRESULT {
     const a = app_ptr orelse return win.DefWindowProcW(hwnd, message, wparam, lparam);
     switch (message) {
@@ -3599,6 +3639,7 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
             a.send = win.CreateWindowExW(0, lit("BUTTON"), lit("Send"), win.WS_CHILD | win.WS_VISIBLE | win.WS_TABSTOP | win.BS_PUSHBUTTON, 0, 0, 0, 0, hwnd, controlId(id_send), a.instance, null);
             a.emoji_btn = win.CreateWindowExW(0, lit("BUTTON"), lit("😊"), win.WS_CHILD | win.WS_VISIBLE | win.WS_TABSTOP | win.BS_PUSHBUTTON, 0, 0, 0, 0, hwnd, controlId(id_emoji), a.instance, null);
             a.status = win.CreateWindowExW(0, lit("STATIC"), lit("Loading..."), win.WS_CHILD | win.WS_VISIBLE | win.SS_LEFT, 0, 0, 0, 0, hwnd, controlId(id_status), a.instance, null);
+            createTooltips(a, hwnd);
             recreateFonts(a);
             if (a.search) |search| _ = win.SendMessageW(search, win.EM_SETCUEBANNER, 1, @bitCast(@intFromPtr(lit("Search chats  Ctrl+F"))));
             if (a.chats_hwnd) |list| _ = win.SendMessageW(list, win.LB_SETITEMHEIGHT, 0, 64);
