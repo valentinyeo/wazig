@@ -718,7 +718,7 @@ fn loadDictationLanguage() dictation.Language {
 // Pinned chats are stored locally as newline-separated jids under
 // Software\Messages\PinnedChats. Pinning never touches WhatsApp's own pin.
 fn isChatPinned(a: *const App, jid: []const u8) bool {
-    for (a.pins[0..a.pin_count]) |pin| {
+    for (a.pins[0..a.pin_count]) |*pin| {
         if (std.mem.eql(u8, pin.slice(), jid)) return true;
     }
     return false;
