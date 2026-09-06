@@ -2,6 +2,12 @@ const std = @import("std");
 const audio = @import("audio.zig");
 const avatar = @import("avatar.zig");
 const dictation = @import("dictation.zig");
+const played = @import("played.zig");
+const webp_detect = @import("webp.zig");
+
+const webp = @cImport({
+    @cInclude("src/webp/decode.h");
+});
 
 const win = @cImport({
     @cDefine("WIN32_LEAN_AND_MEAN", "1");
@@ -17,6 +23,7 @@ const win = @cImport({
     @cInclude("mfapi.h");
     @cInclude("mfidl.h");
     @cInclude("mfreadwrite.h");
+    @cInclude("mfplay.h");
     @cInclude("winhttp.h");
 });
 
@@ -72,6 +79,8 @@ const command_copy_text = 2019;
 const command_copy_link = 2020;
 const command_copy_selection = 2021;
 const command_copy_transcript = 2022;
+const command_reply = 2023;
+const command_open_video_external = 2024;
 const reaction_like = 3001;
 const reaction_love = 3002;
 const reaction_laugh = 3003;
@@ -160,6 +169,8 @@ const Group = struct {
 const PendingSend = struct {
     jid: Utf8Text(191) = .{},
     text: Utf8Text(4095) = .{},
+    reply_to: Utf8Text(191) = .{},
+    reply_sender: Utf8Text(191) = .{},
 };
 
 const LinkSpan = struct {
@@ -192,7 +203,9 @@ const PaletteItem = struct {
     url: WideText(519) = .{},
 };
 
-const max_palette_items = 16;
+// buildPaletteItems registers more items than the original cap allowed, so
+// entries near the end were silently dropped.
+const max_palette_items = 32;
 const palette_width: i32 = 540;
 const palette_row_height: i32 = 40;
 const palette_edit_zone: i32 = 64;
@@ -244,6 +257,7 @@ const App = struct {
     send: ?win.HWND = null,
     emoji_btn: ?win.HWND = null,
     dictate: ?win.HWND = null,
+    tooltips: ?win.HWND = null,
     status: ?win.HWND = null,
     palette: ?win.HWND = null,
     palette_edit: ?win.HWND = null,
@@ -295,6 +309,9 @@ const App = struct {
     audio_playing_id: Utf8Text(191) = .{},
     audio_position_ms: i64 = 0,
     audio_duration_ms: i64 = 0,
+    audio_auto_advance: bool = false,
+    audio_chain_waiting: bool = false,
+    audio_chain_id: Utf8Text(191) = .{},
     media_child: ?std.process.Child = null,
     read_child: ?std.process.Child = null,
     read_spawn_failures: u32 = 0,
@@ -331,8 +348,14 @@ const App = struct {
     avatar_count: usize = 0,
     avatar_active_index: ?usize = null,
     wic_factory: [*c]win.IWICImagingFactory = null,
+    player_window: ?win.HWND = null,
+    mf_player: ?*win.IMFPMediaPlayer = null,
+    reply_to: Utf8Text(191) = .{},
+    reply_sender: Utf8Text(191) = .{},
     displayed_jid: Utf8Text(191) = .{},
     displayed_timestamp: Utf8Text(47) = .{},
+    played_set: played.Set = .{},
+    played_path: []u8 = &.{},
     store_watch_path: WideText(519) = .{},
     last_store_write: u64 = 0,
 };
@@ -364,6 +387,45 @@ fn setFont(hwnd: ?win.HWND, font: ?win.HFONT) void {
     if (hwnd) |window| {
         _ = win.SendMessageW(window, win.WM_SETFONT, if (font) |value| @intFromPtr(value) else 0, 1);
     }
+}
+
+fn addTooltip(tt: win.HWND, tool: ?win.HWND, text: [*:0]const u16) void {
+    const target = tool orelse return;
+    var info = win.TOOLINFOW{
+        .cbSize = @sizeOf(win.TOOLINFOW),
+        .uFlags = win.TTF_IDISHWND | win.TTF_SUBCLASS,
+        .hwnd = win.GetParent(target),
+        .uId = @intFromPtr(target),
+        .lpszText = @constCast(text),
+    };
+    _ = win.SendMessageW(tt, win.TTM_ADDTOOLW, 0, @as(win.LPARAM, @bitCast(@intFromPtr(&info))));
+}
+
+fn createTooltips(a: *App, hwnd: win.HWND) void {
+    const tt = win.CreateWindowExW(
+        win.WS_EX_TOPMOST,
+        lit("tooltips_class32"),
+        null,
+        win.WS_POPUP | win.TTS_NOPREFIX,
+        0,
+        0,
+        0,
+        0,
+        hwnd,
+        null,
+        a.instance,
+        null,
+    ) orelse return;
+    a.tooltips = tt;
+    // TTM_SETMAXWIDTH (WM_USER + 24); not exposed by the commctrl.h import
+    _ = win.SendMessageW(tt, 0x400 + 24, 0, 260);
+    addTooltip(tt, a.search, lit("Search chats  Ctrl+F or /"));
+    addTooltip(tt, a.chats_hwnd, lit("Chats  ↑/↓ move · Ctrl+Tab next chat"));
+    addTooltip(tt, a.canvas, lit("Messages  Alt+J/K select · Ctrl+P play voice · Ctrl+T transcript · Ctrl+R react"));
+    addTooltip(tt, a.compose, lit("Message box  Enter sends · Shift+Enter new line"));
+    addTooltip(tt, a.dictate, lit("Dictate  Ctrl+D"));
+    addTooltip(tt, a.send, lit("Send message  Enter"));
+    addTooltip(tt, a.emoji_btn, lit("Emoji menu"));
 }
 
 fn loadRegistryString(allocator: std.mem.Allocator, name: [*:0]const u16) ?[]const u8 {
@@ -865,6 +927,8 @@ fn ensureAudioPlayer(a: *App) ?*audio.Player {
 }
 
 fn stopAudio(a: *App) void {
+    a.audio_auto_advance = false;
+    a.audio_chain_waiting = false;
     if (a.audio_state == .empty) return;
     a.audio_state = .empty;
     a.audio_playing_id.set("");
@@ -882,6 +946,9 @@ fn startAudioPlayback(a: *App, message: *Message) void {
     const path_utf8 = std.unicode.utf16LeToUtf8Alloc(a.allocator, message.local_path.slice()) catch return;
     defer a.allocator.free(path_utf8);
     player.play(path_utf8);
+    markPlayed(a, message.id.slice());
+    a.audio_auto_advance = true;
+    a.audio_chain_waiting = false;
     a.audio_playing_id.set(message.id.slice());
     a.audio_state = .playing;
     a.audio_position_ms = 0;
@@ -946,9 +1013,52 @@ fn handleAudioClick(a: *App, message: *Message, x: i32) void {
     seekAudio(a, x, hit);
 }
 
+// When a voice note ends, start the next audio message below it, downloading
+// first if needed, until the chat runs out. Switching chats, stopping, or a
+// failed download ends the chain.
+fn advanceAudio(a: *App, after_id: []const u8) bool {
+    if (!a.audio_auto_advance) return false;
+    var start: usize = a.message_count;
+    for (a.messages[0..a.message_count], 0..) |*message, index| {
+        if (std.mem.eql(u8, message.id.slice(), after_id)) {
+            start = index + 1;
+            break;
+        }
+    }
+    if (start >= a.message_count) return false;
+    for (a.messages[start..a.message_count], start..) |*message, index| {
+        if (!isAudio(message) or message.id.len == 0) continue;
+        if (message.local_path.len > 0) {
+            startAudioPlayback(a, message);
+            return true;
+        } else if (a.media_child == null and a.read_child == null and a.pending_read_count == 0) {
+            downloadMedia(a, index, true);
+            // Arm only if the download actually started; a failed spawn just
+            // ends the chain instead of leaking a stale trigger.
+            if (a.media_child != null) {
+                a.audio_chain_waiting = true;
+                a.audio_chain_id.set(message.id.slice());
+            }
+        }
+        // A busy store means the next note cannot start; the chain stops here.
+        return true;
+    }
+    return false;
+}
+
 fn updateAudioPlayback(a: *App) void {
     const player = a.audio_player orelse return;
     const state = player.state();
+    // Fire only on the transition into .ended: the player reports .ended
+    // continuously afterwards, and the mapped UI state becomes .ready.
+    if (state == .ended and (a.audio_state == .playing or a.audio_state == .paused)) {
+        var ended_id: [191]u8 = undefined;
+        const ended = a.audio_playing_id.slice();
+        const ended_len = @min(ended.len, ended_id.len);
+        @memcpy(ended_id[0..ended_len], ended[0..ended_len]);
+        // The next note is playing; skip the stale snapshot handling below.
+        if (advanceAudio(a, ended_id[0..ended_len])) return;
+    }
     if (player.start_failed.load(.acquire) and state == .idle) {
         if (a.audio_state != .empty) {
             a.audio_state = .empty;
@@ -1175,7 +1285,10 @@ fn ensureBitmap(a: *App, message: *Message) void {
         win.WICDecodeMetadataCacheOnLoad,
         &decoder,
     );
-    if (decoder_hr < 0 or decoder == null) return;
+    if (decoder_hr < 0 or decoder == null) {
+        ensureWebPBitmap(a, message);
+        return;
+    }
     defer _ = decoder.*.lpVtbl.*.Release.?(decoder);
 
     var frame_count: win.UINT = 0;
@@ -1189,6 +1302,50 @@ fn ensureBitmap(a: *App, message: *Message) void {
     var source_height: win.UINT = 0;
     if (frame.*.lpVtbl.*.GetSize.?(@ptrCast(frame), &source_width, &source_height) < 0 or source_width == 0 or source_height == 0) return;
 
+    fillBitmapFromSource(a, message, @ptrCast(frame), source_width, source_height);
+}
+
+// Windows WIC has no WebP codec, so stickers (WebP files) would never render.
+// Decode them with the vendored libwebp; animated stickers are handled by
+// firstAnimationFrame (the simple API cannot decode animation) and show the
+// first frame. ponytail: frames are not animated on screen; use WebPAnimDecoder
+// (vendor src/demux) if stickers should move later.
+fn ensureWebPBitmap(a: *App, message: *Message) void {
+    const path_utf8 = std.unicode.utf16LeToUtf8Alloc(a.allocator, message.local_path.slice()) catch return;
+    defer a.allocator.free(path_utf8);
+    const data = readFileWin(a.allocator, path_utf8, 32 * 1024 * 1024) orelse return;
+    defer a.allocator.free(data);
+    if (!webp_detect.isWebPBytes(data)) return;
+    var width: c_int = 0;
+    var height: c_int = 0;
+    var pixels = webp.WebPDecodeRGBA(data.ptr, data.len, &width, &height);
+    if (pixels == null) {
+        if (webp_detect.firstAnimationFrame(data)) |frame| {
+            pixels = webp.WebPDecodeRGBA(frame.ptr, frame.len, &width, &height);
+        }
+    }
+    defer webp.WebPFree(pixels);
+    if (pixels == null or width <= 0 or height <= 0) return;
+
+    // Wrap the decoded pixels as a WIC bitmap so the shared convert/scale/DIB
+    // path can be reused.
+    var wic_bitmap: [*c]win.IWICBitmap = null;
+    const create_hr = a.wic_factory.*.lpVtbl.*.CreateBitmapFromMemory.?(
+        a.wic_factory,
+        @intCast(width),
+        @intCast(height),
+        &win.GUID_WICPixelFormat32bppRGBA,
+        @intCast(@as(u32, @intCast(width)) * 4),
+        @intCast(@as(u32, @intCast(width)) * @as(u32, @intCast(height)) * 4),
+        pixels,
+        &wic_bitmap,
+    );
+    if (create_hr < 0 or wic_bitmap == null) return;
+    defer _ = wic_bitmap.*.lpVtbl.*.Release.?(wic_bitmap);
+    fillBitmapFromSource(a, message, @ptrCast(wic_bitmap), @intCast(width), @intCast(height));
+}
+
+fn fillBitmapFromSource(a: *App, message: *Message, source: *win.IWICBitmapSource, source_width: win.UINT, source_height: win.UINT) void {
     var target_width: win.UINT = @min(source_width, 420);
     var target_height: win.UINT = @intCast(@max(1, @divTrunc(@as(u64, source_height) * target_width, source_width)));
     if (target_height > 250) {
@@ -1201,7 +1358,7 @@ fn ensureBitmap(a: *App, message: *Message) void {
     defer _ = converter.*.lpVtbl.*.Release.?(converter);
     if (converter.*.lpVtbl.*.Initialize.?(
         converter,
-        @ptrCast(frame),
+        source,
         &win.GUID_WICPixelFormat32bppPBGRA,
         win.WICBitmapDitherTypeNone,
         null,
@@ -1308,28 +1465,48 @@ fn avatarBusy(a: *const App) bool {
 }
 
 fn checkAvatarDownload(a: *App) void {
-    const session = a.avatar_session orelse return;
+    const session = a.avatar_session orelse {
+        requestNextAvatar(a);
+        return;
+    };
     const state = session.state();
-    if (state == .idle or state == .working) return;
-    if (a.avatar_active_index) |index| {
-        if (index < a.avatar_count) {
-            const entry = &a.avatars[index];
-            if (state == .ready) {
-                entry.bitmap = loadAvatarBitmap(a, entry.path.ptr());
-                entry.status = if (entry.bitmap != null) .ready else .unavailable;
-            } else entry.status = .unavailable;
+    if (state == .working) return;
+    if (state != .idle) {
+        if (a.avatar_active_index) |index| {
+            if (index < a.avatar_count) {
+                const entry = &a.avatars[index];
+                if (state == .ready) {
+                    entry.bitmap = loadAvatarBitmap(a, entry.path.ptr());
+                    entry.status = if (entry.bitmap != null) .ready else .unavailable;
+                } else entry.status = .unavailable;
+            }
         }
+        a.avatar_active_index = null;
+        session.reset();
+        startSync(a);
+        if (a.chats_hwnd) |list| _ = win.InvalidateRect(list, null, win.FALSE);
     }
-    a.avatar_active_index = null;
-    session.reset();
-    startSync(a);
-    if (a.chats_hwnd) |list| _ = win.InvalidateRect(list, null, win.FALSE);
+    requestNextAvatar(a);
 }
 
-fn requestSelectedAvatar(a: *App) void {
+// Fetch missing chat icons in list order, one per sync pause, so chats the
+// user never opened still get their picture (fetched once, cached on disk).
+// ponytail: a failed or picture-less chat is terminal until the app restarts
+// (status .unavailable), and there is no TTL refresh of cached icons;
+// upgrade path: retry counter with backoff plus a weekly file-age check.
+fn requestNextAvatar(a: *App) void {
+    for (a.chats[0..a.chat_count], 0..) |*chat, index| {
+        const entry = avatarForChat(a, chat.jid.slice()) orelse continue;
+        if (entry.status != .unknown or entry.path.len == 0) continue;
+        requestAvatar(a, index);
+        return;
+    }
+}
+
+fn requestAvatar(a: *App, chat_index: usize) void {
     if (a.read_child != null or a.pending_read_count > 0 or a.media_child != null or a.send_child != null or a.archive_child != null or a.pending_archive_count > 0 or avatarBusy(a)) return;
-    if (a.chat_count == 0 or a.selected_chat >= a.chat_count) return;
-    const entry = avatarForChat(a, a.chats[a.selected_chat].jid.slice()) orelse return;
+    if (a.chat_count == 0 or chat_index >= a.chat_count) return;
+    const entry = avatarForChat(a, a.chats[chat_index].jid.slice()) orelse return;
     if (entry.status != .unknown or entry.path.len == 0) return;
     var index: usize = 0;
     while (index < a.avatar_count and &a.avatars[index] != entry) : (index += 1) {}
@@ -1636,6 +1813,19 @@ fn checkMediaDownload(a: *App) void {
         a.media_child = null;
         startSync(a);
         refreshMessages(a);
+        if (a.audio_chain_waiting) {
+            a.audio_chain_waiting = false;
+            if (code == 0) {
+                for (a.messages[0..a.message_count]) |*message| {
+                    if (std.mem.eql(u8, message.id.slice(), a.audio_chain_id.slice())) {
+                        if (message.local_path.len > 0) startAudioPlayback(a, message);
+                        break;
+                    }
+                }
+            } else if (a.audio_state != .empty) {
+                a.audio_auto_advance = false;
+            }
+        }
         setStatus(a, if (code == 0) "Attachment downloaded" else "Download failed, the attachment may have expired");
     }
 }
@@ -1644,6 +1834,178 @@ fn openMedia(a: *App, message: *const Message) void {
     if (message.local_path.len == 0) return;
     const result = win.ShellExecuteW(a.hwnd.?, lit("open"), message.local_path.ptr(), null, null, win.SW_SHOWNORMAL);
     if (@intFromPtr(result) <= 32) setStatus(a, "Windows could not open the attachment");
+}
+
+fn clampPlayerSize(width: u32, height: u32) [2]u32 {
+    const max_width: u32 = 800;
+    const max_height: u32 = 450;
+    if (width == 0 or height == 0) return .{ 640, 360 };
+    var w: u64 = width;
+    var h: u64 = height;
+    if (w > max_width) {
+        h = @max(1, h * max_width / w);
+        w = max_width;
+    }
+    if (h > max_height) {
+        w = @max(1, w * max_height / h);
+        h = max_height;
+    }
+    return .{ @intCast(w), @intCast(h) };
+}
+
+fn playerCallbackQueryInterface(_: [*c]win.IMFPMediaPlayerCallback, riid: [*c]const win.GUID, ppv_object: [*c]?*anyopaque) callconv(.winapi) win.HRESULT {
+    if (ppv_object != null and riid != null) {
+        const iid_callback = win.GUID{ .Data1 = 0x766c8ffb, .Data2 = 0x5fdb, .Data3 = 0x4fea, .Data4 = .{ 0xa2, 0x8d, 0xb9, 0x12, 0x99, 0x6f, 0x51, 0xbd } };
+        const iid_unknown = win.GUID{ .Data1 = 0, .Data2 = 0, .Data3 = 0, .Data4 = .{ 0xc0, 0, 0, 0, 0, 0, 0, 0x46 } };
+        const g = riid.*;
+        const is_unknown = std.meta.eql(g, iid_unknown);
+        const is_callback = std.meta.eql(g, iid_callback);
+        if (is_unknown or is_callback) {
+            ppv_object.* = @ptrCast(&player_callback);
+            _ = playerCallbackAddRef(&player_callback);
+            return 0;
+        }
+        ppv_object.* = null;
+    }
+    return win.E_NOINTERFACE;
+}
+
+fn playerCallbackAddRef(_: [*c]win.IMFPMediaPlayerCallback) callconv(.winapi) win.ULONG {
+    return @atomicRmw(u32, &player_callback_refs, .Add, 1, .monotonic) + 1;
+}
+
+fn playerCallbackRelease(_: [*c]win.IMFPMediaPlayerCallback) callconv(.winapi) win.ULONG {
+    return @atomicRmw(u32, &player_callback_refs, .Sub, 1, .monotonic) - 1;
+}
+
+fn playerCallbackEvent(_: [*c]win.IMFPMediaPlayerCallback, event: [*c]win.MFP_EVENT_HEADER) callconv(.winapi) void {
+    // Runs on an MFPlay worker thread; deliberately touches no window state
+    // to avoid cross-thread races. On playback failure the window simply
+    // stops and the user closes it with Esc or the close button.
+    _ = event;
+}
+
+var player_callback = win.IMFPMediaPlayerCallback{ .lpVtbl = &player_callback_vtable };
+var player_callback_vtable = win.IMFPMediaPlayerCallbackVtbl{
+    .QueryInterface = playerCallbackQueryInterface,
+    .AddRef = playerCallbackAddRef,
+    .Release = playerCallbackRelease,
+    .OnMediaPlayerEvent = playerCallbackEvent,
+};
+var player_callback_refs: u32 = 1;
+
+var player_class_registered: bool = false;
+
+fn closePlayer(a: *App) void {
+    if (a.mf_player) |player| {
+        // Drop the field first: Shutdown pumps messages on the STA, and a
+        // re-entrant paint or resize must not see a released player.
+        a.mf_player = null;
+        _ = player.lpVtbl.*.Shutdown.?(player);
+        _ = player.lpVtbl.*.Release.?(player);
+    }
+    if (a.player_window) |hwnd| {
+        a.player_window = null;
+        _ = win.DestroyWindow(hwnd);
+    }
+}
+
+fn playerProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.LPARAM) callconv(.winapi) win.LRESULT {
+    const a = app_ptr orelse return win.DefWindowProcW(hwnd, message, wparam, lparam);
+    switch (message) {
+        win.WM_KEYDOWN => {
+            if (wparam == 27) { // escape
+                closePlayer(a);
+                return 0;
+            }
+        },
+        win.WM_SIZE => {
+            // MFPlay does not move its video surface on its own.
+            if (a.mf_player) |player| _ = player.lpVtbl.*.UpdateVideo.?(player);
+        },
+        win.WM_PAINT => {
+            // Paint ordering per the MFPlay docs: erase, present, validate.
+            var ps = win.PAINTSTRUCT{};
+            const hdc = win.BeginPaint(hwnd, &ps);
+            if (a.mf_player) |player| _ = player.lpVtbl.*.UpdateVideo.?(player);
+            _ = win.EndPaint(hwnd, &ps);
+            _ = hdc;
+            return 0;
+        },
+        win.WM_CLOSE => {
+            closePlayer(a);
+            return 0;
+        },
+        win.WM_DESTROY => {
+            if (a.player_window != null and a.player_window.? == hwnd) a.player_window = null;
+            if (a.mf_player) |player| {
+                _ = player.lpVtbl.*.Shutdown.?(player);
+                _ = player.lpVtbl.*.Release.?(player);
+                a.mf_player = null;
+            }
+            return 0;
+        },
+        else => {},
+    }
+    return win.DefWindowProcW(hwnd, message, wparam, lparam);
+}
+
+fn playVideoInline(a: *App, message: *const Message) void {
+    if (message.local_path.len == 0) return;
+    if (a.player_window != null) closePlayer(a);
+    const size = clampPlayerSize(@intCast(@max(message.bitmap_width, 0)), @intCast(@max(message.bitmap_height, 0)));
+    var rect = win.RECT{ .left = 0, .top = 0, .right = @intCast(size[0]), .bottom = @intCast(size[1]) };
+    _ = win.AdjustWindowRect(&rect, win.WS_OVERLAPPEDWINDOW, 0);
+    const width = rect.right - rect.left;
+    const height = rect.bottom - rect.top;
+
+    if (!player_class_registered) {
+        const class_brush = win.CreateSolidBrush(color_bg);
+        var class = win.WNDCLASSEXW{
+            .cbSize = @sizeOf(win.WNDCLASSEXW),
+            .style = win.CS_HREDRAW | win.CS_VREDRAW,
+            .lpfnWndProc = playerProc,
+            .hInstance = a.instance,
+            .hCursor = win.LoadCursorW(null, @ptrFromInt(32512)),
+            .hbrBackground = class_brush,
+            .lpszClassName = lit("MessagesVideoPlayer"),
+            .hIconSm = null,
+        };
+        if (win.RegisterClassExW(&class) == 0) {
+            if (class_brush) |brush| _ = win.DeleteObject(brush);
+            setStatus(a, "Could not open the video player");
+            return;
+        }
+        player_class_registered = true;
+    }
+    const hwnd = win.CreateWindowExW(
+        0,
+        lit("MessagesVideoPlayer"),
+        lit("Messages · Video"),
+        win.WS_OVERLAPPEDWINDOW,
+        win.CW_USEDEFAULT,
+        win.CW_USEDEFAULT,
+        width,
+        height,
+        a.hwnd orelse null,
+        null,
+        a.instance,
+        null,
+    ) orelse {
+        setStatus(a, "Could not open the video player");
+        return;
+    };
+    a.player_window = hwnd;
+    var player: ?*win.IMFPMediaPlayer = null;
+    const hr = win.MFPCreateMediaPlayer(message.local_path.ptr(), 1, win.MFP_OPTION_NONE, &player_callback, hwnd, &player);
+    if (hr < 0 or player == null) {
+        setStatus(a, "Video playback is not available for this file");
+        a.player_window = null;
+        _ = win.DestroyWindow(hwnd);
+        return;
+    }
+    a.mf_player = player;
+    _ = win.ShowWindow(hwnd, win.SW_SHOW);
 }
 
 fn advanceGifs(a: *App) void {
@@ -1853,8 +2215,24 @@ fn startNextSend(a: *App) void {
     if (a.send_child != null or a.read_child != null or a.pending_send_count == 0) return;
     stopSync(a);
     const pending = &a.pending_sends[0];
+    var args: [14][]const u8 = undefined;
+    var count: usize = 0;
+    for ([_][]const u8{ a.wacli_path, "--json", "--lock-wait", "10s", "send", "text", "--to", pending.jid.slice(), "--message", pending.text.slice() }) |argument| {
+        args[count] = argument;
+        count += 1;
+    }
+    if (pending.reply_to.len > 0) {
+        args[count] = "--reply-to";
+        args[count + 1] = pending.reply_to.slice();
+        count += 2;
+        if (pending.reply_sender.len > 0) {
+            args[count] = "--reply-to-sender";
+            args[count + 1] = pending.reply_sender.slice();
+            count += 2;
+        }
+    }
     const child = std.process.spawn(a.io, .{
-        .argv = &.{ a.wacli_path, "--json", "--lock-wait", "10s", "send", "text", "--to", pending.jid.slice(), "--message", pending.text.slice() },
+        .argv = args[0..count],
         .stdin = .ignore,
         .stdout = .ignore,
         .stderr = .ignore,
@@ -1905,11 +2283,40 @@ fn sendMessage(a: *App) void {
     const pending = &a.pending_sends[a.pending_send_count];
     pending.jid.set(a.chats[a.selected_chat].jid.slice());
     pending.text.set(text);
+    pending.reply_to.set(a.reply_to.slice());
+    pending.reply_sender.set(a.reply_sender.slice());
+    clearReply(a);
     a.pending_send_count += 1;
     a.user_viewed = true;
     _ = win.SetWindowTextW(a.compose.?, lit(""));
     focusCompose(a);
     startNextSend(a);
+}
+
+fn clearReply(a: *App) void {
+    a.reply_to.set("");
+    a.reply_sender.set("");
+}
+
+fn startReply(a: *App) void {
+    const selected = a.selected_message orelse {
+        setStatus(a, "Select a message with right-click or Ctrl+Tab");
+        return;
+    };
+    if (selected >= a.message_count or a.selected_chat >= a.chat_count) return;
+    const message = &a.messages[selected];
+    a.reply_to.set(message.id.slice());
+    a.reply_sender.set(message.sender_jid.slice());
+    const sender_bytes = std.unicode.utf16LeToUtf8Alloc(a.allocator, message.sender.slice()) catch {
+        setStatus(a, "Reply ready... Esc in the composer cancels");
+        return;
+    };
+    defer a.allocator.free(sender_bytes);
+    const shown = if (sender_bytes.len == 0) "message" else sender_bytes[0..@min(sender_bytes.len, 64)];
+    var status_buffer: [160]u8 = undefined;
+    const status = std.fmt.bufPrint(&status_buffer, "Replying to {s}... Esc in the composer cancels", .{shown}) catch return;
+    setStatus(a, status);
+    focusCompose(a);
 }
 
 fn focusCompose(a: *App) void {
@@ -1997,6 +2404,7 @@ fn updateDictation(a: *App) void {
 
 fn selectChat(a: *App, delta: i32, wrap: bool) void {
     if (a.chat_count == 0) return;
+    clearReply(a);
     var next: i32 = @intCast(a.selected_chat);
     next += delta;
     const count: i32 = @intCast(a.chat_count);
@@ -2030,13 +2438,13 @@ fn scrollToSelectedMessage(a: *App) void {
     _ = win.GetClientRect(canvas, &client);
     const bubble_width = std.math.clamp(@divTrunc((client.right - client.left) * 7, 10), 280, 620);
     var total_height: i32 = 18;
-    for (a.messages[0..a.message_count]) |*message| total_height += measureMessage(hdc, a, message, bubble_width) + 8;
+    for (a.messages[0..a.message_count], 0..) |*message, index| total_height += measureMessage(hdc, a, message, bubble_width, showSenderName(a, index)) + 8;
     a.max_scroll = @max(0, total_height - (client.bottom - client.top));
     var y = client.bottom - 14 + a.scroll_y;
     var index = a.message_count;
     while (index > 0) {
         index -= 1;
-        const height = measureMessage(hdc, a, &a.messages[index], bubble_width);
+        const height = measureMessage(hdc, a, &a.messages[index], bubble_width, showSenderName(a, index));
         y -= height + 8;
         if (index != selected) continue;
         if (y < client.top + 8) a.scroll_y += client.top + 8 - y;
@@ -2164,6 +2572,8 @@ fn handleCanvasClick(a: *App, hwnd: win.HWND, x: i32, y: i32) void {
                 downloadMedia(a, index, false);
             } else if (isAudio(item)) {
                 handleAudioClick(a, item, x);
+            } else if (std.ascii.eqlIgnoreCase(item.media_type.slice(), "video")) {
+                playVideoInline(a, item);
             } else if (!isGif(item)) {
                 // GIFs already animate in place; popping them out to
                 // an external player was unwanted.
@@ -2308,9 +2718,11 @@ fn openUrlWide(a: *App, url: [*:0]const u16) void {
 fn openReactionMenu(a: *App, x: i32, y: i32) void {
     const menu = win.CreatePopupMenu() orelse return;
     defer _ = win.DestroyMenu(menu);
+    _ = win.AppendMenuW(menu, win.MF_STRING, command_reply, lit("Reply                Ctrl+Shift+R"));
+    _ = win.AppendMenuW(menu, win.MF_SEPARATOR, 0, null);
     addReactionItems(menu);
     const choice = win.TrackPopupMenu(menu, win.TPM_RETURNCMD | win.TPM_NONOTIFY, x, y, 0, a.hwnd.?, null);
-    reactToSelected(a, @intCast(choice));
+    if (choice == command_reply) startReply(a) else reactToSelected(a, @intCast(choice));
 }
 
 fn openReactionMenuForSelected(a: *App) void {
@@ -2429,6 +2841,7 @@ fn buildPaletteItems(a: *App) void {
     appendPalette(a, "Toggle unread chats", "U", command_unread);
     appendPalette(a, if (a.show_archived) "Show inbox chats" else "Show archived chats", "", command_archived);
     appendPalette(a, if (a.show_archived) "Unarchive selected chat" else "Archive selected chat", "Ctrl+E", command_archive);
+    appendPalette(a, "Reply to selected message", "Ctrl+Shift+R", command_reply);
     appendPalette(a, "React to message: 👍 Like", "", reaction_like);
     appendPalette(a, "React to message: ❤️ Love", "", reaction_love);
     appendPalette(a, "React to message: 😂 Laugh", "", reaction_laugh);
@@ -2438,6 +2851,7 @@ fn buildPaletteItems(a: *App) void {
     appendPalette(a, "Remove reaction", "", reaction_remove);
     appendPalette(a, "Refresh", "R", command_refresh);
     appendPalette(a, "Restart live sync", "S", command_sync);
+    appendPalette(a, "Open video in external player", "", command_open_video_external);
     appendPalette(a, "Quit Messages", "Q", command_quit);
 }
 
@@ -2747,6 +3161,7 @@ fn runCommand(a: *App, command: u16) void {
             refreshMessages(a);
         },
         command_archive => archiveSelectedChat(a),
+        command_reply => startReply(a),
         command_archived => {
             a.show_archived = !a.show_archived;
             refreshChats(a);
@@ -2796,6 +3211,23 @@ fn runCommand(a: *App, command: u16) void {
         command_sync => {
             stopSync(a);
             startSync(a);
+        },
+        command_open_video_external => {
+            const selected = a.selected_message orelse {
+                setStatus(a, "Select a video first");
+                return;
+            };
+            if (selected >= a.message_count) return;
+            const message = &a.messages[selected];
+            if (!std.ascii.eqlIgnoreCase(message.media_type.slice(), "video")) {
+                setStatus(a, "Select a video first");
+                return;
+            }
+            if (message.local_path.len == 0) {
+                setStatus(a, "The video is still downloading");
+                return;
+            }
+            openMedia(a, message);
         },
         command_quit => {
             if (a.hwnd) |hwnd| _ = win.PostMessageW(hwnd, win.WM_CLOSE, 0, 0);
@@ -3217,9 +3649,22 @@ fn transcriptRender(hdc: win.HDC, a: *App, message: *const Message, shown: c_int
     return y - top;
 }
 
-fn measureMessage(hdc: win.HDC, a: *App, message: *const Message, width: i32) i32 {
+// Consecutive messages from the same sender hide the name header to save space.
+fn showSenderName(a: *App, index: usize) bool {
+    if (index == 0) return true;
+    const message = &a.messages[index];
+    const previous = &a.messages[index - 1];
+    if (message.from_me != previous.from_me) return true;
+    if (message.sender_jid.len > 0 and previous.sender_jid.len > 0)
+        return !std.mem.eql(u8, message.sender_jid.slice(), previous.sender_jid.slice());
+    if (message.sender.len == 0 or previous.sender.len == 0) return true;
+    return !std.mem.eql(u16, message.sender.slice(), previous.sender.slice());
+}
+
+fn measureMessage(hdc: win.HDC, a: *App, message: *const Message, width: i32, show_sender: bool) i32 {
     _ = win.SelectObject(hdc, @ptrCast(a.font.?));
-    var height = wrapMixedSink(hdc, a, if (message.text.len > 0) message.text.ptr() else lit(" "), if (message.text.len > 0) @intCast(message.text.len) else 1, width - 28, false, 0, 0, message) + 42;
+    const header_height: i32 = if (show_sender) 42 else 22;
+    var height = wrapMixedSink(hdc, a, if (message.text.len > 0) message.text.ptr() else lit(" "), if (message.text.len > 0) @intCast(message.text.len) else 1, width - 28, false, 0, 0, message) + header_height;
     if (message.bitmap_height > 0) {
         height += message.bitmap_height + 8;
     } else if (message.media_type.len > 0) height += 54;
@@ -3230,7 +3675,66 @@ fn measureMessage(hdc: win.HDC, a: *App, message: *const Message, width: i32) i3
         height += transcriptRender(hdc, a, message, shown, width - 28, false, 0, 0) + 22;
     }
     if (message.reaction.len > 0) height += 18;
-    return @max(height, 58);
+    const min_height: i32 = if (show_sender) 58 else 38;
+    return @max(height, min_height);
+}
+
+const SenderColor = struct { r: u8, g: u8, b: u8 };
+
+const sender_palette = [_]SenderColor{
+    .{ .r = 0, .g = 168, .b = 132 },
+    .{ .r = 83, .g = 189, .b = 235 },
+    .{ .r = 235, .g = 140, .b = 84 },
+    .{ .r = 178, .g = 132, .b = 235 },
+    .{ .r = 235, .g = 195, .b = 84 },
+    .{ .r = 235, .g = 110, .b = 150 },
+};
+
+// Stable per-sender color so the same person keeps one color within a chat.
+fn senderColorFor(seed: []const u8) SenderColor {
+    if (seed.len == 0) return sender_palette[0];
+    var hash: u32 = 2166136261;
+    for (seed) |byte| {
+        hash ^= byte;
+        hash = hash *% 16777619;
+    }
+    return sender_palette[hash % sender_palette.len];
+}
+
+// First grapheme-ish chunk of a UTF-16 name: pairs up surrogate halves so an
+// emoji initial does not render as a lone surrogate.
+fn senderInitial(sender: []const u16) []const u16 {
+    if (sender.len == 0) return sender;
+    const first = sender[0];
+    if (first >= 0xd800 and first <= 0xdbff and sender.len > 1 and sender[1] >= 0xdc00 and sender[1] <= 0xdfff)
+        return sender[0..2];
+    return sender[0..1];
+}
+
+fn drawSenderAvatar(hdc: win.HDC, a: *App, x: i32, top: i32, message: *const Message) void {
+    // Seed the color from the jid; fall back to the first name code unit when
+    // the jid is missing (both are stable per person).
+    const seed = if (message.sender_jid.len > 0)
+        message.sender_jid.slice()
+    else blk: {
+        const units = message.sender.slice();
+        break :blk std.mem.sliceAsBytes(units[0..@min(units.len, 2)]);
+    };
+    const tint = senderColorFor(seed);
+    const circle_brush = win.CreateSolidBrush(rgb(tint.r, tint.g, tint.b)) orelse return;
+    defer _ = win.DeleteObject(circle_brush);
+    const old_brush = win.SelectObject(hdc, circle_brush);
+    const old_pen = win.SelectObject(hdc, win.GetStockObject(win.NULL_PEN));
+    _ = win.Ellipse(hdc, x, top, x + 30, top + 30);
+    _ = win.SelectObject(hdc, old_brush);
+    _ = win.SelectObject(hdc, old_pen);
+    const initial = senderInitial(message.sender.slice());
+    const old_font = win.SelectObject(hdc, @ptrCast(a.font_bold.?));
+    const old_color = win.SetTextColor(hdc, color_text);
+    var rect = win.RECT{ .left = x, .top = top, .right = x + 30, .bottom = top + 30 };
+    _ = win.DrawTextW(hdc, @ptrCast(initial.ptr), @intCast(initial.len), &rect, win.DT_CENTER | win.DT_SINGLELINE | win.DT_VCENTER);
+    _ = win.SetTextColor(hdc, old_color);
+    _ = win.SelectObject(hdc, old_font);
 }
 
 fn drawCanvas(hwnd: win.HWND, a: *App) void {
@@ -3263,8 +3767,15 @@ fn drawCanvas(hwnd: win.HWND, a: *App) void {
     _ = win.SetBkMode(hdc, win.TRANSPARENT);
     const available_width = client.right - client.left;
     const bubble_width = std.math.clamp(@divTrunc(available_width * 7, 10), 280, 620);
+    const chat_jid = if (a.displayed_jid.len > 0)
+        a.displayed_jid.slice()
+    else if (a.chat_count > 0 and a.selected_chat < a.chat_count)
+        a.chats[a.selected_chat].jid.slice()
+    else
+        "";
+    const in_group = std.mem.endsWith(u8, chat_jid, "@g.us");
     var total_height: i32 = 18;
-    for (a.messages[0..a.message_count]) |*message| total_height += measureMessage(hdc, a, message, bubble_width) + 8;
+    for (a.messages[0..a.message_count], 0..) |*message, index| total_height += measureMessage(hdc, a, message, bubble_width, showSenderName(a, index)) + 8;
     a.max_scroll = @max(0, total_height - (client.bottom - client.top));
     a.scroll_y = std.math.clamp(a.scroll_y, 0, a.max_scroll);
     var y = client.bottom - 14 + a.scroll_y;
@@ -3276,14 +3787,15 @@ fn drawCanvas(hwnd: win.HWND, a: *App) void {
         message.bubble_hit = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
         message.link_count = 0;
         message.word_count = 0;
-        const estimated_height = measureMessage(hdc, a, message, bubble_width);
+        const show_sender = showSenderName(a, index);
+        const estimated_height = measureMessage(hdc, a, message, bubble_width, show_sender);
         y -= estimated_height + 8;
         if (y > client.bottom or y + estimated_height < client.top) continue;
         ensureBitmap(a, message);
-        const height = measureMessage(hdc, a, message, bubble_width);
+        const height = measureMessage(hdc, a, message, bubble_width, show_sender);
         y -= height - estimated_height;
         if (y > client.bottom or y + height < client.top) continue;
-        const left = if (message.from_me) client.right - bubble_width - 24 else 24;
+        const left: i32 = if (message.from_me) client.right - bubble_width - 24 else if (in_group) 62 else 24;
         const right = left + bubble_width;
         message.bubble_hit = .{ .left = left, .top = y, .right = right, .bottom = y + height };
         const brush = win.CreateSolidBrush(if (message.from_me) color_outgoing else color_incoming) orelse continue;
@@ -3297,17 +3809,21 @@ fn drawCanvas(hwnd: win.HWND, a: *App) void {
         if (selection_pen) |pen| _ = win.DeleteObject(pen);
         _ = win.DeleteObject(brush);
 
-        _ = win.SelectObject(hdc, @ptrCast(a.font_bold.?));
-        _ = win.SetTextColor(hdc, if (message.from_me) color_text else rgb(83, 189, 235));
-        var sender_rect = win.RECT{ .left = left + 12, .top = y + 8, .right = right - 52, .bottom = y + 28 };
-        const sender_text = message.sender.slice();
-        if (containsEmoji(sender_text)) {
-            const line_h = textLineHeight(hdc, a.font_bold.?);
-            _ = drawMixedLine(hdc, a.font_bold.?, a.font_emoji orelse a.font_bold.?, sender_text, left + 12, y + 8 + @divTrunc(20 - line_h, 2));
-        } else {
-            _ = win.DrawTextW(hdc, message.sender.ptr(), @intCast(message.sender.len), &sender_rect, win.DT_LEFT | win.DT_SINGLELINE | win.DT_END_ELLIPSIS);
+        var text_top = y + 8;
+        if (show_sender) {
+            _ = win.SelectObject(hdc, @ptrCast(a.font_bold.?));
+            _ = win.SetTextColor(hdc, if (message.from_me) color_text else rgb(83, 189, 235));
+            var sender_rect = win.RECT{ .left = left + 12, .top = y + 8, .right = right - 52, .bottom = y + 28 };
+            const sender_text = message.sender.slice();
+            if (containsEmoji(sender_text)) {
+                const line_h = textLineHeight(hdc, a.font_bold.?);
+                _ = drawMixedLine(hdc, a.font_bold.?, a.font_emoji orelse a.font_bold.?, sender_text, left + 12, y + 8 + @divTrunc(20 - line_h, 2));
+            } else {
+                _ = win.DrawTextW(hdc, message.sender.ptr(), @intCast(message.sender.len), &sender_rect, win.DT_LEFT | win.DT_SINGLELINE | win.DT_END_ELLIPSIS);
+            }
+            text_top = y + 28;
         }
-        var text_top = y + 28;
+        if (show_sender and in_group and !message.from_me and message.sender.len > 0) drawSenderAvatar(hdc, a, left - 38, y + 8, message);
         if (message.bitmap) |bitmap| {
             const image_left = left + @divTrunc(bubble_width - message.bitmap_width, 2);
             const image_top = text_top + 4;
@@ -3320,10 +3836,26 @@ fn drawCanvas(hwnd: win.HWND, a: *App) void {
             }
             message.media_hit = .{ .left = image_left, .top = image_top, .right = image_left + message.bitmap_width, .bottom = image_top + message.bitmap_height };
             if (std.ascii.eqlIgnoreCase(message.media_type.slice(), "video")) {
-                _ = win.SelectObject(hdc, @ptrCast(a.font_bold.?));
-                _ = win.SetTextColor(hdc, color_text);
-                var play_rect = message.media_hit;
-                _ = win.DrawTextW(hdc, lit("▶"), -1, &play_rect, win.DT_CENTER | win.DT_SINGLELINE | win.DT_VCENTER);
+                // Keep the play button inside the thumbnail; tiny thumbnails
+                // shrink it, and a zero-size bitmap draws nothing.
+                const radius = @min(26, @min(@divTrunc(message.bitmap_width, 2), @divTrunc(message.bitmap_height, 2)));
+                if (radius > 4) {
+                    const center_x = image_left + @divTrunc(message.bitmap_width, 2);
+                    const center_y = image_top + @divTrunc(message.bitmap_height, 2);
+                    const button_brush = win.CreateSolidBrush(color_bg) orelse null;
+                    const button_pen = win.CreatePen(win.PS_SOLID, 2, color_accent);
+                    const old_pen2 = win.SelectObject(hdc, button_pen);
+                    const old_brush2 = win.SelectObject(hdc, if (button_brush) |bb| @ptrCast(bb) else win.GetStockObject(win.BLACK_BRUSH));
+                    _ = win.Ellipse(hdc, center_x - radius, center_y - radius, center_x + radius, center_y + radius);
+                    _ = win.SelectObject(hdc, old_brush2);
+                    _ = win.SelectObject(hdc, old_pen2);
+                    if (button_pen) |pen| _ = win.DeleteObject(pen);
+                    if (button_brush) |dead_brush| _ = win.DeleteObject(dead_brush);
+                    _ = win.SelectObject(hdc, @ptrCast(a.font_bold.?));
+                    _ = win.SetTextColor(hdc, color_text);
+                    var play_rect = win.RECT{ .left = center_x - radius, .top = center_y - radius, .right = center_x + radius, .bottom = center_y + radius };
+                    _ = win.DrawTextW(hdc, lit("▶"), -1, &play_rect, win.DT_CENTER | win.DT_SINGLELINE | win.DT_VCENTER);
+                }
             }
             text_top += message.bitmap_height + 8;
         } else if (isAudio(message)) {
@@ -3387,6 +3919,12 @@ fn drawCanvas(hwnd: win.HWND, a: *App) void {
                     _ = win.DeleteObject(filled_brush);
                 }
                 _ = win.DeleteObject(track_brush);
+                if (!active and a.played_set.wasPlayed(message.id.slice())) {
+                    _ = win.SelectObject(hdc, @ptrCast(a.font_small.?));
+                    _ = win.SetTextColor(hdc, color_muted);
+                    var played_rect = win.RECT{ .left = right - 60, .top = strip_top, .right = right - 10, .bottom = strip_top + 42 };
+                    _ = win.DrawTextW(hdc, lit("✓ played"), -1, &played_rect, win.DT_RIGHT | win.DT_SINGLELINE | win.DT_VCENTER);
+                }
                 if (active and a.audio_duration_ms > 0) {
                     var time_buffer: [24]u8 = undefined;
                     var position_buffer: [16]u8 = undefined;
@@ -3550,12 +4088,14 @@ fn canvasProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win
                         _ = win.ClientToScreen(hwnd, &point);
                         const menu = win.CreatePopupMenu() orelse return 0;
                         defer _ = win.DestroyMenu(menu);
+                        _ = win.AppendMenuW(menu, win.MF_STRING, command_reply, lit("Reply"));
+                        _ = win.AppendMenuW(menu, win.MF_SEPARATOR, 0, null);
                         _ = win.AppendMenuW(menu, win.MF_STRING, command_copy_selection, lit("Copy selection"));
                         _ = win.AppendMenuW(menu, win.MF_STRING, command_copy_text, lit("Copy message text"));
                         if (item.transcript.len > 0) _ = win.AppendMenuW(menu, win.MF_STRING, command_copy_transcript, lit("Copy transcript"));
                         if (item.link_count > 0) _ = win.AppendMenuW(menu, win.MF_STRING, command_copy_link, lit("Copy link address"));
                         const choice = win.TrackPopupMenu(menu, win.TPM_RETURNCMD | win.TPM_NONOTIFY, point.x, point.y, 0, a.hwnd.?, null);
-                        reactToSelected(a, @intCast(choice));
+                        if (choice == command_reply) startReply(a) else reactToSelected(a, @intCast(choice));
                         return 0;
                     }
                 }
@@ -3576,7 +4116,6 @@ fn canvasProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win
         else => return win.DefWindowProcW(hwnd, message, wparam, lparam),
     }
 }
-
 fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.LPARAM) callconv(.winapi) win.LRESULT {
     const a = app_ptr orelse return win.DefWindowProcW(hwnd, message, wparam, lparam);
     switch (message) {
@@ -3600,7 +4139,9 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
             a.send = win.CreateWindowExW(0, lit("BUTTON"), lit("Send"), win.WS_CHILD | win.WS_VISIBLE | win.WS_TABSTOP | win.BS_PUSHBUTTON, 0, 0, 0, 0, hwnd, controlId(id_send), a.instance, null);
             a.emoji_btn = win.CreateWindowExW(0, lit("BUTTON"), lit("😊"), win.WS_CHILD | win.WS_VISIBLE | win.WS_TABSTOP | win.BS_PUSHBUTTON, 0, 0, 0, 0, hwnd, controlId(id_emoji), a.instance, null);
             a.status = win.CreateWindowExW(0, lit("STATIC"), lit("Loading..."), win.WS_CHILD | win.WS_VISIBLE | win.SS_LEFT, 0, 0, 0, 0, hwnd, controlId(id_status), a.instance, null);
+            createTooltips(a, hwnd);
             recreateFonts(a);
+            createTooltips(a, hwnd);
             if (a.search) |search| _ = win.SendMessageW(search, win.EM_SETCUEBANNER, 1, @bitCast(@intFromPtr(lit("Search chats  Ctrl+F"))));
             if (a.chats_hwnd) |list| _ = win.SendMessageW(list, win.LB_SETITEMHEIGHT, 0, 64);
             _ = win.SetTimer(hwnd, timer_refresh, 1000, null);
@@ -3683,7 +4224,7 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
                     }
                     retryPendingDownload(a);
                     autoDownloadNextMedia(a);
-                    requestSelectedAvatar(a);
+                    requestAvatar(a, a.selected_chat);
                 }
             } else if (wparam == timer_search) {
                 _ = win.KillTimer(hwnd, timer_search);
@@ -3727,6 +4268,7 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
             return 0;
         },
         win.WM_DESTROY => {
+            closePlayer(a);
             _ = win.KillTimer(hwnd, timer_refresh);
             _ = win.KillTimer(hwnd, timer_search);
             _ = win.KillTimer(hwnd, timer_animation);
@@ -3939,6 +4481,10 @@ fn handleKeyboard(a: *App, message: *const win.MSG) bool {
         focusCompose(a);
         return true;
     }
+    if (control and shift and key == 'R') {
+        startReply(a);
+        return true;
+    }
     if (a.compose) |compose| {
         if (focus == compose) {
             if (key == win.VK_RETURN and !shift) {
@@ -3946,6 +4492,11 @@ fn handleKeyboard(a: *App, message: *const win.MSG) bool {
                 return true;
             }
             if (key == win.VK_ESCAPE) {
+                if (a.reply_to.len > 0) {
+                    clearReply(a);
+                    setStatus(a, "Reply cancelled");
+                    return true;
+                }
                 if (a.chats_hwnd) |list| _ = win.SetFocus(list);
                 return true;
             }
@@ -4002,6 +4553,59 @@ fn jumpToLatestMessage(a: *App) void {
     if (a.canvas) |canvas| _ = win.InvalidateRect(canvas, null, win.TRUE);
 }
 
+fn findPlayedPath(init: std.process.Init, allocator: std.mem.Allocator) []u8 {
+    const local = init.environ_map.get("LOCALAPPDATA") orelse return &.{};
+    const dir = std.fs.path.join(allocator, &.{ local, "Messages" }) catch return &.{};
+    const cwd = std.Io.Dir.cwd();
+    cwd.createDirPath(init.io, dir) catch {};
+    const path = std.fs.path.join(allocator, &.{ dir, "played.txt" }) catch {
+        allocator.free(dir);
+        return &.{};
+    };
+    allocator.free(dir);
+    return path;
+}
+
+fn loadPlayed(a: *App) void {
+    if (a.played_path.len == 0) return;
+    const wide = std.unicode.utf8ToUtf16LeAllocZ(a.allocator, a.played_path) catch return;
+    defer a.allocator.free(wide);
+    // Read only the tail of the append-only store: the newest entries are
+    // at the end and the read is capped to keep startup bounded.
+    const handle = win.CreateFileW(wide.ptr, win.GENERIC_READ, win.FILE_SHARE_READ, null, win.OPEN_EXISTING, win.FILE_ATTRIBUTE_NORMAL, null);
+    if (handle == win.INVALID_HANDLE_VALUE or handle == null) return;
+    defer _ = win.CloseHandle(handle);
+    var size: win.LARGE_INTEGER = undefined;
+    if (win.GetFileSizeEx(handle, &size) == 0 or size.QuadPart <= 0) return;
+    const capped: i64 = @min(size.QuadPart, 128 * 1024);
+    const distance: win.LARGE_INTEGER = .{ .QuadPart = -capped };
+    if (win.SetFilePointerEx(handle, distance, null, win.FILE_END) == 0) return;
+    const buffer = a.allocator.alloc(u8, @intCast(capped)) catch return;
+    defer a.allocator.free(buffer);
+    var total: usize = 0;
+    while (total < buffer.len) {
+        var got: win.DWORD = 0;
+        if (win.ReadFile(handle, buffer.ptr + total, @intCast(buffer.len - total), &got, null) == 0) break;
+        if (got == 0) break;
+        total += got;
+    }
+    a.played_set.load(buffer[0..total]);
+}
+
+fn markPlayed(a: *App, id: []const u8) void {
+    if (a.played_path.len == 0) return;
+    var line_buffer: [40]u8 = undefined;
+    const line = a.played_set.mark(id, &line_buffer) orelse return;
+    const wide = std.unicode.utf8ToUtf16LeAllocZ(a.allocator, a.played_path) catch return;
+    defer a.allocator.free(wide);
+    // True append: a crash mid-write can never truncate existing history.
+    const handle = win.CreateFileW(wide.ptr, win.FILE_APPEND_DATA, win.FILE_SHARE_READ, null, win.OPEN_ALWAYS, win.FILE_ATTRIBUTE_NORMAL, null);
+    if (handle == win.INVALID_HANDLE_VALUE or handle == null) return;
+    defer _ = win.CloseHandle(handle);
+    var written: win.DWORD = 0;
+    _ = win.WriteFile(handle, line.ptr, @intCast(line.len), &written, null);
+}
+
 fn findWacli(init: std.process.Init, allocator: std.mem.Allocator) ![]u8 {
     const local = init.environ_map.get("LOCALAPPDATA") orelse return error.MissingLocalAppData;
     return std.fs.path.join(allocator, &.{ local, "Programs", "wacli", "wacli.exe" });
@@ -4051,6 +4655,14 @@ fn bundledFilePath(comptime filename: []const u8) WideText(519) {
     return result;
 }
 
+// LoadImageW with the name argument passed as an integer (MAKEINTRESOURCE),
+// avoiding translate-c's aligned LPCWSTR pointer for resource ids.
+extern "user32" fn LoadImageW(instance: win.HINSTANCE, icon_name: usize, icon_type: u32, cx: i32, cy: i32, load_flags: u32) callconv(.c) win.HICON;
+
+fn LoadAppIcon(instance: win.HINSTANCE, cx: i32, cy: i32, flags: u32) win.HICON {
+    return LoadImageW(instance, 1, win.IMAGE_ICON, cx, cy, flags);
+}
+
 pub fn main(init: std.process.Init) !void {
     const instance = win.GetModuleHandleW(null) orelse return error.NoModuleHandle;
     const wacli_path = try findWacli(init, init.gpa);
@@ -4074,6 +4686,8 @@ pub fn main(init: std.process.Init) !void {
     }
     if (openrouter_model.len == 0) openrouter_model = "openai/gpt-5.6-luna";
     var app = App{ .allocator = init.gpa, .io = init.io, .instance = instance, .wacli_path = wacli_path, .avatar_dir = avatar_dir, .deepgram_configured = deepgram_key.len > 0, .deepgram_key = deepgram_key, .openrouter_key = openrouter_key, .openrouter_model = openrouter_model, .openrouter_configured = openrouter_key.len > 0, .dictation_language = loadDictationLanguage(), .font_scale = loadFontScale() };
+    app.played_path = findPlayedPath(init, init.gpa);
+    loadPlayed(&app);
     app.store_watch_path.set(init.gpa, store_watch_path);
     app_ptr = &app;
     defer app_ptr = null;
@@ -4107,6 +4721,14 @@ pub fn main(init: std.process.Init) !void {
     _ = win.InitCommonControlsEx(&controls);
 
     const cursor = win.LoadCursorW(null, @ptrFromInt(32512));
+    // Resource id 1 in assets/app.rc; same icon serves the title bar and taskbar.
+    const icon_big = LoadAppIcon(instance, 0, 0, win.LR_DEFAULTSIZE | win.LR_SHARED);
+    const icon_small = LoadAppIcon(
+        instance,
+        win.GetSystemMetrics(win.SM_CXSMICON),
+        win.GetSystemMetrics(win.SM_CYSMICON),
+        win.LR_SHARED,
+    );
     var canvas_class = win.WNDCLASSEXW{
         .cbSize = @sizeOf(win.WNDCLASSEXW),
         .style = win.CS_HREDRAW | win.CS_VREDRAW,
@@ -4114,12 +4736,12 @@ pub fn main(init: std.process.Init) !void {
         .cbClsExtra = 0,
         .cbWndExtra = 0,
         .hInstance = instance,
-        .hIcon = null,
+        .hIcon = icon_big,
         .hCursor = cursor,
         .hbrBackground = null,
         .lpszMenuName = null,
         .lpszClassName = lit("WacliMessageCanvas"),
-        .hIconSm = null,
+        .hIconSm = icon_small,
     };
     if (win.RegisterClassExW(&canvas_class) == 0) return error.RegisterCanvasClassFailed;
 
@@ -4130,12 +4752,12 @@ pub fn main(init: std.process.Init) !void {
         .cbClsExtra = 0,
         .cbWndExtra = 0,
         .hInstance = instance,
-        .hIcon = null,
+        .hIcon = icon_big,
         .hCursor = cursor,
         .hbrBackground = null,
         .lpszMenuName = null,
         .lpszClassName = lit("MessagesZig"),
-        .hIconSm = null,
+        .hIconSm = icon_small,
     };
     if (win.RegisterClassExW(&main_class) == 0) return error.RegisterMainClassFailed;
 
@@ -4146,12 +4768,12 @@ pub fn main(init: std.process.Init) !void {
         .cbClsExtra = 0,
         .cbWndExtra = 0,
         .hInstance = instance,
-        .hIcon = null,
+        .hIcon = icon_big,
         .hCursor = cursor,
         .hbrBackground = null,
         .lpszMenuName = null,
         .lpszClassName = lit("MessagesPalette"),
-        .hIconSm = null,
+        .hIconSm = icon_small,
     };
     if (win.RegisterClassExW(&palette_class) == 0) return error.RegisterPaletteClassFailed;
 
@@ -4531,4 +5153,43 @@ fn relaunchIntoUpdate(a: *App) void {
     } else {
         setStatus(a, "Update installed - restart the app to finish");
     }
+}
+
+test "sender name shows only at the start of a same-sender run" {
+    var a: App = undefined;
+    a.message_count = 3;
+    a.messages[0] = .{ .sender_jid = .{}, .sender = .{} };
+    a.messages[0].sender_jid.set("111@g.us");
+    a.messages[1] = .{ .sender_jid = .{}, .sender = .{} };
+    a.messages[1].sender_jid.set("111@g.us");
+    a.messages[2] = .{ .sender_jid = .{}, .sender = .{} };
+    a.messages[2].sender_jid.set("222@g.us");
+
+    try std.testing.expect(showSenderName(&a, 0));
+    try std.testing.expect(!showSenderName(&a, 1));
+    try std.testing.expect(showSenderName(&a, 2));
+
+    // Same display name but a different sender jid must still show.
+    const testing = std.testing;
+    a.messages[2].sender_jid.set("111@g.us");
+    a.messages[2].sender.set(testing.allocator, "Same Name");
+    a.messages[1].sender_jid.set("999@g.us");
+    a.messages[1].sender.set(testing.allocator, "Same Name");
+    try std.testing.expect(showSenderName(&a, 2));
+
+    // Without jids the display name decides.
+    a.messages[2].sender_jid.set("");
+    a.messages[1].sender_jid.set("");
+    try std.testing.expect(!showSenderName(&a, 2));
+
+    // Switching direction (own vs incoming) always shows the name.
+    a.messages[2].sender_jid.set("111@g.us");
+    a.messages[2].sender.set(testing.allocator, "");
+    a.messages[1].sender_jid.set("");
+    a.messages[1].sender.set(testing.allocator, "");
+    a.messages[1].from_me = true;
+    try std.testing.expect(showSenderName(&a, 2));
+    a.messages[1].from_me = false;
+    a.messages[1].sender_jid.set("111@g.us");
+    try std.testing.expect(!showSenderName(&a, 2));
 }

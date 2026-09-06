@@ -1,13 +1,14 @@
-# Tag vX.Y.Z on main -> build Messages.exe on GitHub runners -> publish a GitHub Release.
+# Tag vX.Y.Z on main -> build Messages.exe, package zip + per-user MSI on GitHub
+# runners, smoke-test the MSI on a real Windows runner, publish a GitHub Release.
 name: release
 on:
   push:
     tags: ["v*"]
 permissions:
-  contents: write
+  contents: read
 jobs:
-  release:
-    name: release
+  build:
+    name: build
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -23,16 +24,89 @@ jobs:
           esac
       - name: Build
         run: zig build -Dtarget=x86_64-windows-gnu --release=small -Dversion="${GITHUB_REF_NAME#v}"
-      - name: Package
+      - name: Package zip
         run: |
           cd zig-out/bin
           zip -r "${GITHUB_WORKSPACE}/Messages-${GITHUB_REF_NAME}.zip" Messages.exe *.ttf *LICENSE*
-          cd "${GITHUB_WORKSPACE}" && sha256sum "Messages-${GITHUB_REF_NAME}.zip" > SHA256SUMS.txt
+      - name: Package MSI
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq wixl wixl-data
+          version="${GITHUB_REF_NAME#v}"
+          # MSI ProductVersion must be exactly three numeric components; refuse
+          # anything else instead of building an installer that cannot upgrade.
+          echo "${version}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'
+          wixl -D "Version=${version}" -D "BinDir=${GITHUB_WORKSPACE}/zig-out/bin/" \
+            -o "Messages-${GITHUB_REF_NAME}.msi" assets/installer.wxs
+      - name: Checksums
+        run: |
+          sha256sum "Messages-${GITHUB_REF_NAME}.zip" "Messages-${GITHUB_REF_NAME}.msi" > SHA256SUMS.txt
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-bundle
+          path: |
+            Messages-*.zip
+            Messages-*.msi
+            SHA256SUMS.txt
+
+  smoke:
+    name: msi smoke test
+    needs: build
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: release-bundle
+      - name: Install silently
+        shell: pwsh
+        run: |
+          $msi = (Get-ChildItem Messages-*.msi).FullName
+          # Call msiexec directly: Start-Process -PassThru uses ShellExecute and
+          # leaves ExitCode null on Windows PowerShell 5.1, so the exit status
+          # was unreadable. /L*V keeps a full log to diagnose any real failure.
+          & msiexec /i $msi /qn /norestart /L*V install.log | Out-Null
+          $code = $LASTEXITCODE
+          if ($code -ne 0) {
+            Get-Content install.log -Tail 40
+            throw "msiexec install failed: $code"
+          }
+      - name: Verify install
+        shell: pwsh
+        run: |
+          $exe = "$env:LOCALAPPDATA\Programs\Messages\Messages.exe"
+          $lnk = "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Messages.lnk"
+          if (-not (Test-Path $exe)) { throw "missing $exe" }
+          if (-not (Test-Path "$env:LOCALAPPDATA\Programs\Messages\IBMPlexSans-Regular.ttf")) { throw "missing bundled font" }
+          if (-not (Test-Path $lnk)) { throw "missing Start menu shortcut $lnk" }
+      - name: Uninstall silently
+        shell: pwsh
+        run: |
+          $msi = (Get-ChildItem Messages-*.msi).FullName
+          & msiexec /x $msi /qn /norestart | Out-Null
+          $code = $LASTEXITCODE
+          if ($code -ne 0) { throw "msiexec uninstall failed: $code" }
+          if (Test-Path "$env:LOCALAPPDATA\Programs\Messages\Messages.exe") { throw "exe left behind after uninstall" }
+          if (Test-Path "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Messages.lnk") { throw "shortcut left behind after uninstall" }
+
+  release:
+    name: release
+    needs: [build, smoke]
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: release-bundle
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           # Re-run safe: first create publishes with assets attached (atomic);
           # on a re-run create fails because the release exists, so clobber-upload instead.
-          gh release create "${GITHUB_REF_NAME}" "Messages-${GITHUB_REF_NAME}.zip" SHA256SUMS.txt --repo "${GITHUB_REPOSITORY}" --verify-tag --generate-notes \
-            || gh release upload "${GITHUB_REF_NAME}" "Messages-${GITHUB_REF_NAME}.zip" SHA256SUMS.txt --repo "${GITHUB_REPOSITORY}" --clobber
+          gh release create "${GITHUB_REF_NAME}" Messages-*.zip Messages-*.msi SHA256SUMS.txt --repo "${GITHUB_REPOSITORY}" --verify-tag --generate-notes \
+            || gh release upload "${GITHUB_REF_NAME}" Messages-*.zip Messages-*.msi SHA256SUMS.txt --repo "${GITHUB_REPOSITORY}" --clobber
