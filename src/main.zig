@@ -708,9 +708,13 @@ fn queueMarkRead(a: *App, jid: []const u8) void {
     for (a.pending_markreads[0..a.pending_markread_count]) |*pending| {
         if (std.mem.eql(u8, pending.slice(), jid)) return;
     }
-    // ponytail: 4-slot cap; a full queue drops the oldest unread chats'
-    // mark-read (they still show read locally until the next sync).
-    if (a.pending_markread_count >= a.pending_markreads.len) return;
+    // ponytail: 4-slot cap; when full the oldest queued mark-read is dropped
+    // (a later visit or the next sync re-marks it on the server).
+    if (a.pending_markread_count >= a.pending_markreads.len) {
+        var shift: usize = 1;
+        while (shift < a.pending_markreads.len) : (shift += 1) a.pending_markreads[shift - 1] = a.pending_markreads[shift];
+        a.pending_markread_count -= 1;
+    }
     a.pending_markreads[a.pending_markread_count].set(jid);
     a.pending_markread_count += 1;
 }
