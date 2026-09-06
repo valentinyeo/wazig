@@ -4,6 +4,7 @@ const avatar = @import("avatar.zig");
 const avatar_mask = @import("avatar_mask.zig");
 const dictation = @import("dictation.zig");
 const played = @import("played.zig");
+const compose_layout = @import("compose_layout.zig");
 const webp_detect = @import("webp.zig");
 
 const webp = @cImport({
@@ -255,6 +256,11 @@ const App = struct {
     chats_hwnd: ?win.HWND = null,
     canvas: ?win.HWND = null,
     compose: ?win.HWND = null,
+    compose_dragged: i32 = 0,
+    compose_dragging: bool = false,
+    compose_client_width: i32 = 0,
+    compose_client_height: i32 = 0,
+    compose_strip_top: i32 = 0,
     send: ?win.HWND = null,
     emoji_btn: ?win.HWND = null,
     dictate: ?win.HWND = null,
@@ -461,6 +467,34 @@ fn saveDictationLanguage(language: dictation.Language) void {
     defer _ = win.RegCloseKey(key);
     const value: win.DWORD = @intFromEnum(language);
     _ = win.RegSetValueExW(key, lit("DictationLanguage"), 0, win.REG_DWORD, @ptrCast(&value), @sizeOf(win.DWORD));
+}
+
+/// Dragged composer height is persisted in 96-DPI logical pixels and rescaled
+/// for the current monitor so it keeps the same physical size across screens.
+fn loadComposeDragged(hwnd: win.HWND) i32 {
+    var value: win.DWORD = 0;
+    var size: win.DWORD = @sizeOf(win.DWORD);
+    if (win.RegGetValueW(winHandle(win.HKEY, 0x80000001), lit("Software\\Messages"), lit("ComposeMinHeight"), win.RRF_RT_REG_DWORD, null, &value, &size) != win.ERROR_SUCCESS) return 0;
+    var saved_dpi: win.DWORD = 96;
+    var dpi_size: win.DWORD = @sizeOf(win.DWORD);
+    if (win.RegGetValueW(winHandle(win.HKEY, 0x80000001), lit("Software\\Messages"), lit("ComposeDpi"), win.RRF_RT_REG_DWORD, null, &saved_dpi, &dpi_size) != win.ERROR_SUCCESS or saved_dpi < 96) saved_dpi = 96;
+    const dpi: i32 = @intCast(win.GetDpiForWindow(hwnd));
+    if (dpi <= 0) return 0;
+    const logical: i32 = @intCast(value);
+    return std.math.clamp(@divTrunc(logical * dpi, @as(i32, @intCast(saved_dpi))), 0, 400);
+}
+
+fn saveComposeDragged(hwnd: win.HWND, dragged: i32) void {
+    var key: win.HKEY = null;
+    var disposition: win.DWORD = 0;
+    if (win.RegCreateKeyExW(winHandle(win.HKEY, 0x80000001), lit("Software\\Messages"), 0, null, 0, win.KEY_SET_VALUE, null, &key, &disposition) != win.ERROR_SUCCESS) return;
+    defer _ = win.RegCloseKey(key);
+    const dpi: i32 = @intCast(win.GetDpiForWindow(hwnd));
+    const logical: i32 = if (dpi > 0) @divTrunc(dragged * 96, dpi) else dragged;
+    var stored: win.DWORD = @intCast(std.math.clamp(logical, 0, 400));
+    _ = win.RegSetValueExW(key, lit("ComposeMinHeight"), 0, win.REG_DWORD, @ptrCast(&stored), @sizeOf(win.DWORD));
+    var saved_dpi: win.DWORD = 96;
+    _ = win.RegSetValueExW(key, lit("ComposeDpi"), 0, win.REG_DWORD, @ptrCast(&saved_dpi), @sizeOf(win.DWORD));
 }
 
 fn saveFontScale(scale: i32) void {
@@ -3243,12 +3277,57 @@ fn runCommand(a: *App, command: u16) void {
     }
 }
 
+fn composerNonClientY(compose: win.HWND) i32 {
+    var rc_win: win.RECT = undefined;
+    var rc_cli: win.RECT = undefined;
+    _ = win.GetWindowRect(compose, &rc_win);
+    _ = win.GetClientRect(compose, &rc_cli);
+    return (rc_win.bottom - rc_win.top) - (rc_cli.bottom - rc_cli.top);
+}
+
+/// Height the composer content needs at the edit's current width.
+fn composerContentHeight(a: *App) i32 {
+    const compose = a.compose orelse return compose_layout.edit_min_height;
+    var fmt: win.RECT = undefined;
+    _ = win.SendMessageW(compose, win.EM_GETRECT, 0, @bitCast(@intFromPtr(&fmt)));
+    var rc_cli: win.RECT = undefined;
+    _ = win.GetClientRect(compose, &rc_cli);
+    const margins = (fmt.top - rc_cli.top) + (rc_cli.bottom - fmt.bottom);
+    const hdc = win.GetDC(compose);
+    defer _ = win.ReleaseDC(compose, hdc);
+    const line_h = textLineHeight(hdc, a.font.?);
+    const lines: i32 = @intCast(win.SendMessageW(compose, win.EM_GETLINECOUNT, 0, 0));
+    return @max(compose_layout.edit_min_height, lines * line_h + margins + composerNonClientY(compose));
+}
+
+fn updateComposeScrollbar(a: *App, edit_height: i32) void {
+    const compose = a.compose orelse return;
+    const style = win.GetWindowLongPtrW(compose, win.GWL_STYLE);
+    const needs = composerContentHeight(a) > edit_height;
+    const want_style: isize = if (needs) style | @as(isize, @bitCast(@as(usize, win.WS_VSCROLL))) else style & ~@as(isize, @bitCast(@as(usize, win.WS_VSCROLL)));
+    if (want_style != style) {
+        _ = win.SetWindowLongPtrW(compose, win.GWL_STYLE, want_style);
+        _ = win.SetWindowPos(compose, null, 0, 0, 0, 0, win.SWP_FRAMECHANGED | win.SWP_NOMOVE | win.SWP_NOSIZE | win.SWP_NOZORDER | win.SWP_NOACTIVATE);
+    }
+}
+
 fn layout(a: *App, width: i32, height: i32) void {
+    a.compose_client_width = width;
+    a.compose_client_height = height;
     const left_width = std.math.clamp(@divTrunc(width, 3), 280, 390);
     const header_height: i32 = 0;
     const search_height: i32 = 48;
     const status_height: i32 = 26;
-    const compose_height: i32 = 66;
+    var sizes = compose_layout.compute(a.compose_dragged, composerContentHeight(a), height);
+    // Width may change with the new height only via the scrollbar; measure once
+    // more after sizing so the wrap count reflects the final width.
+    if (a.compose) |hwnd| {
+        _ = win.MoveWindow(hwnd, left_width + 14, height - 11 - sizes.edit_height, width - left_width - 258, sizes.edit_height, win.TRUE);
+        sizes = compose_layout.compute(a.compose_dragged, composerContentHeight(a), height);
+        _ = win.MoveWindow(hwnd, left_width + 14, height - 11 - sizes.edit_height, width - left_width - 258, sizes.edit_height, win.TRUE);
+        updateComposeScrollbar(a, sizes.edit_height);
+    }
+    a.compose_strip_top = height - sizes.strip_height;
     if (a.search) |hwnd| {
         _ = win.MoveWindow(hwnd, 12, header_height + 8, left_width - 24, 34, win.TRUE);
         // Child EDIT controls can't use DWM corner rounding, so clip to a rounded region instead.
@@ -3259,11 +3338,11 @@ fn layout(a: *App, width: i32, height: i32) void {
     }
     if (a.chats_hwnd) |hwnd| _ = win.MoveWindow(hwnd, 0, header_height + search_height, left_width, height - header_height - search_height - status_height, win.TRUE);
     if (a.status) |hwnd| _ = win.MoveWindow(hwnd, 12, height - status_height, left_width - 24, status_height, win.TRUE);
-    if (a.canvas) |hwnd| _ = win.MoveWindow(hwnd, left_width + 1, header_height, width - left_width - 1, height - header_height - compose_height, win.TRUE);
-    if (a.compose) |hwnd| _ = win.MoveWindow(hwnd, left_width + 14, height - compose_height + 11, width - left_width - 258, 44, win.TRUE);
-    if (a.emoji_btn) |hwnd| _ = win.MoveWindow(hwnd, width - 236, height - compose_height + 11, 44, 44, win.TRUE);
-    if (a.dictate) |hwnd| _ = win.MoveWindow(hwnd, width - 176, height - compose_height + 11, 84, 44, win.TRUE);
-    if (a.send) |hwnd| _ = win.MoveWindow(hwnd, width - 82, height - compose_height + 11, 68, 44, win.TRUE);
+    if (a.canvas) |hwnd| _ = win.MoveWindow(hwnd, left_width + 1, header_height, width - left_width - 1, height - header_height - sizes.strip_height, win.TRUE);
+    if (a.emoji_btn) |hwnd| _ = win.MoveWindow(hwnd, width - 236, height - 55, 44, 44, win.TRUE);
+    if (a.dictate) |hwnd| _ = win.MoveWindow(hwnd, width - 176, height - 55, 84, 44, win.TRUE);
+    if (a.send) |hwnd| _ = win.MoveWindow(hwnd, width - 82, height - 55, 68, 44, win.TRUE);
+    if (a.hwnd) |main_hwnd| _ = win.InvalidateRect(main_hwnd, null, win.TRUE);
 }
 
 fn loadAvatarBitmap(a: *App, path: [*:0]const u16) ?win.HBITMAP {
@@ -4167,7 +4246,7 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
             a.search = win.CreateWindowExW(0, lit("EDIT"), null, win.WS_CHILD | win.WS_VISIBLE | win.WS_TABSTOP | win.ES_AUTOHSCROLL, 0, 0, 0, 0, hwnd, controlId(id_search), a.instance, null);
             a.chats_hwnd = win.CreateWindowExW(0, lit("LISTBOX"), null, win.WS_CHILD | win.WS_VISIBLE | win.WS_TABSTOP | win.WS_VSCROLL | win.LBS_NOTIFY | win.LBS_OWNERDRAWFIXED | win.LBS_NOINTEGRALHEIGHT, 0, 0, 0, 0, hwnd, controlId(id_chats), a.instance, null);
             a.canvas = win.CreateWindowExW(0, lit("WacliMessageCanvas"), null, win.WS_CHILD | win.WS_VISIBLE | win.WS_TABSTOP, 0, 0, 0, 0, hwnd, controlId(id_canvas), a.instance, null);
-            a.compose = win.CreateWindowExW(0, lit("EDIT"), null, win.WS_CHILD | win.WS_VISIBLE | win.WS_TABSTOP | win.ES_MULTILINE | win.ES_AUTOVSCROLL | win.WS_VSCROLL, 0, 0, 0, 0, hwnd, controlId(id_compose), a.instance, null);
+            a.compose = win.CreateWindowExW(0, lit("EDIT"), null, win.WS_CHILD | win.WS_VISIBLE | win.WS_TABSTOP | win.ES_MULTILINE | win.ES_AUTOVSCROLL, 0, 0, 0, 0, hwnd, controlId(id_compose), a.instance, null);
             a.dictate = win.CreateWindowExW(0, lit("BUTTON"), lit("Dictate"), win.WS_CHILD | win.WS_VISIBLE | win.WS_TABSTOP | win.BS_PUSHBUTTON, 0, 0, 0, 0, hwnd, controlId(id_dictate), a.instance, null);
             a.send = win.CreateWindowExW(0, lit("BUTTON"), lit("Send"), win.WS_CHILD | win.WS_VISIBLE | win.WS_TABSTOP | win.BS_PUSHBUTTON, 0, 0, 0, 0, hwnd, controlId(id_send), a.instance, null);
             a.emoji_btn = win.CreateWindowExW(0, lit("BUTTON"), lit("😊"), win.WS_CHILD | win.WS_VISIBLE | win.WS_TABSTOP | win.BS_PUSHBUTTON, 0, 0, 0, 0, hwnd, controlId(id_emoji), a.instance, null);
@@ -4177,6 +4256,10 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
             createTooltips(a, hwnd);
             if (a.search) |search| _ = win.SendMessageW(search, win.EM_SETCUEBANNER, 1, @bitCast(@intFromPtr(lit("Search chats  Ctrl+F"))));
             if (a.chats_hwnd) |list| _ = win.SendMessageW(list, win.LB_SETITEMHEIGHT, 0, 64);
+            a.compose_dragged = loadComposeDragged(hwnd);
+            var rc_create: win.RECT = undefined;
+            _ = win.GetClientRect(hwnd, &rc_create);
+            layout(a, rc_create.right, rc_create.bottom);
             _ = win.SetTimer(hwnd, timer_refresh, 1000, null);
             _ = win.SetTimer(hwnd, timer_animation, 120, null);
             _ = win.SetTimer(hwnd, timer_update_check, update_check_interval_ms, null);
@@ -4201,12 +4284,65 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
             const left_width = std.math.clamp(@divTrunc(client.right, 3), 280, 390);
             var left_rect = win.RECT{ .left = 0, .top = 0, .right = left_width, .bottom = client.bottom };
             _ = win.FillRect(hdc, &left_rect, a.brush_panel.?);
-            var composer_rect = win.RECT{ .left = left_width + 1, .top = client.bottom - 66, .right = client.right, .bottom = client.bottom };
+            var composer_rect = win.RECT{ .left = left_width + 1, .top = a.compose_strip_top, .right = client.right, .bottom = client.bottom };
             _ = win.FillRect(hdc, &composer_rect, a.brush_raised.?);
+            // Drag-handle affordance: a short grip line centered on the strip's top padding.
+            if (a.compose != null) {
+                const cx = @divTrunc(left_width + 1 + client.right, 2);
+                var grip = win.RECT{ .left = cx - 22, .top = a.compose_strip_top + 4, .right = cx + 22, .bottom = a.compose_strip_top + 6 };
+                _ = win.FillRect(hdc, &grip, a.brush_panel.?);
+            }
             _ = win.EndPaint(hwnd, &paint);
             return 0;
         },
         win.WM_ERASEBKGND => return 1,
+        win.WM_SETCURSOR => {
+            // Sizing cursor over the composer's top drag band (parent-owned padding).
+            if (a.compose != null) {
+                var pt: win.POINT = undefined;
+                _ = win.GetCursorPos(&pt);
+                _ = win.ScreenToClient(hwnd, &pt);
+                if (pt.y >= a.compose_strip_top and pt.y < a.compose_strip_top + 11 and pt.x > 0) {
+                    // IDC_SIZENS = MAKEINTRESOURCE(32646); the macro doesn't translate.
+                    _ = win.SetCursor(win.LoadCursorW(null, @as([*:0]const u16, @ptrFromInt(32646))));
+                    return 1;
+                }
+            }
+            return win.DefWindowProcW(hwnd, message, wparam, lparam);
+        },
+        win.WM_LBUTTONDOWN => {
+            if (a.compose != null) {
+                const y: i32 = @as(i16, @bitCast(hiword(@as(usize, @bitCast(lparam)))));
+                if (y >= a.compose_strip_top and y < a.compose_strip_top + 11) {
+                    a.compose_dragging = true;
+                    _ = win.SetCapture(hwnd);
+                    return 0;
+                }
+            }
+            return win.DefWindowProcW(hwnd, message, wparam, lparam);
+        },
+        win.WM_MOUSEMOVE => {
+            if (a.compose_dragging) {
+                const y: i32 = @as(i16, @bitCast(hiword(@as(usize, @bitCast(lparam)))));
+                a.compose_dragged = std.math.clamp(a.compose_client_height - 11 - y, 44, 400);
+                layout(a, a.compose_client_width, a.compose_client_height);
+                return 0;
+            }
+            return win.DefWindowProcW(hwnd, message, wparam, lparam);
+        },
+        win.WM_LBUTTONUP => {
+            if (a.compose_dragging) {
+                a.compose_dragging = false;
+                _ = win.ReleaseCapture();
+                if (a.compose_dragged > 44) saveComposeDragged(hwnd, a.compose_dragged);
+                return 0;
+            }
+            return win.DefWindowProcW(hwnd, message, wparam, lparam);
+        },
+        win.WM_CAPTURECHANGED => {
+            a.compose_dragging = false;
+            return 0;
+        },
         win.WM_DRAWITEM => {
             const item: *win.DRAWITEMSTRUCT = winHandle(*win.DRAWITEMSTRUCT, @as(usize, @bitCast(lparam)));
             if (item.CtlID == id_chats) drawChat(a, item);
@@ -4230,6 +4366,8 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
                 runCommand(a, command_dictate);
             } else if (id == id_emoji and notification == win.BN_CLICKED) {
                 openEmojiMenu(a);
+            } else if (id == id_compose and notification == win.EN_CHANGE) {
+                layout(a, a.compose_client_width, a.compose_client_height);
             } else if (id == id_search and notification == win.EN_CHANGE) {
                 _ = win.KillTimer(hwnd, timer_search);
                 _ = win.SetTimer(hwnd, timer_search, 240, null);
