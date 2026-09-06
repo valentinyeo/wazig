@@ -4,6 +4,7 @@ const avatar = @import("avatar.zig");
 const avatar_mask = @import("avatar_mask.zig");
 const dictation = @import("dictation.zig");
 const played = @import("played.zig");
+const chat_order = @import("chat_order.zig");
 const compose_layout = @import("compose_layout.zig");
 const media_age = @import("media_age.zig");
 const webp_detect = @import("webp.zig");
@@ -104,6 +105,8 @@ const command_accounts_reconnect = 2039;
 const command_accounts_add = 2040;
 const command_accounts_remove = 2041;
 const command_accounts_remove_confirm = 2042;
+const command_pin = 2043;
+const max_pins = 16;
 const reaction_like = 3001;
 const reaction_love = 3002;
 const reaction_laugh = 3003;
@@ -490,6 +493,9 @@ const App = struct {
     pending_read_count: usize = 0,
     pending_download_jid: Utf8Text(191) = .{},
     pending_download_id: Utf8Text(191) = .{},
+    pins: [max_pins]Utf8Text(191) = [_]Utf8Text(191){.{}} ** max_pins,
+    pin_count: usize = 0,
+    pins_loaded: bool = false,
     send_child: ?std.process.Child = null,
     pending_sends: [max_pending_sends]PendingSend = [_]PendingSend{.{}} ** max_pending_sends,
     pending_send_count: usize = 0,
@@ -707,6 +713,92 @@ fn loadDictationLanguage() dictation.Language {
     const result = win.RegGetValueW(winHandle(win.HKEY, 0x80000001), lit("Software\\Messages"), lit("DictationLanguage"), win.RRF_RT_REG_DWORD, null, &value, &size);
     if (result != win.ERROR_SUCCESS or value > 2) return .automatic;
     return @enumFromInt(value);
+}
+
+// Pinned chats are stored locally as newline-separated jids under
+// Software\Messages\PinnedChats. Pinning never touches WhatsApp's own pin.
+fn isChatPinned(a: *const App, jid: []const u8) bool {
+    for (a.pins[0..a.pin_count]) |pin| {
+        if (std.mem.eql(u8, pin.slice(), jid)) return true;
+    }
+    return false;
+}
+
+fn addPin(a: *App, jid: []const u8) void {
+    if (jid.len == 0 or jid.len > 190 or a.pin_count >= a.pins.len) return;
+    if (isChatPinned(a, jid)) return;
+    a.pins[a.pin_count].set(jid);
+    a.pin_count += 1;
+}
+
+/// Returns false when the registry value does not exist yet (first launch).
+fn loadPins(a: *App) bool {
+    const stored = loadRegistryString(a.allocator, lit("PinnedChats")) orelse return false;
+    defer a.allocator.free(stored);
+    var lines = std.mem.tokenizeScalar(u8, stored, '\n');
+    while (lines.next()) |jid| addPin(a, jid);
+    return true;
+}
+
+fn savePins(a: *App) bool {
+    var key: win.HKEY = null;
+    var disposition: win.DWORD = 0;
+    if (win.RegCreateKeyExW(winHandle(win.HKEY, 0x80000001), lit("Software\\Messages"), 0, null, 0, win.KEY_SET_VALUE, null, &key, &disposition) != win.ERROR_SUCCESS) return false;
+    defer _ = win.RegCloseKey(key);
+    var wide: [max_pins * 200]u16 = undefined;
+    var len: usize = 0;
+    for (a.pins[0..a.pin_count]) |pin| {
+        if (len + pin.len + 2 > wide.len) break;
+        if (len > 0) {
+            wide[len] = '\n';
+            len += 1;
+        }
+        const written = std.unicode.utf8ToUtf16Le(wide[len..], pin.slice()) catch continue;
+        len += written;
+    }
+    wide[len] = 0;
+    return win.RegSetValueExW(key, lit("PinnedChats"), 0, win.REG_SZ, @ptrCast(&wide), @intCast((len + 1) * 2)) == win.ERROR_SUCCESS;
+}
+
+fn togglePinSelected(a: *App) void {
+    if (a.selected_chat >= a.chat_count) {
+        setStatus(a, "Select a chat to pin");
+        return;
+    }
+    const jid = a.chats[a.selected_chat].jid.slice();
+    if (isChatPinned(a, jid)) {
+        var index: usize = 0;
+        while (index < a.pin_count) : (index += 1) {
+            if (std.mem.eql(u8, a.pins[index].slice(), jid)) break;
+        }
+        if (index < a.pin_count) {
+            while (index + 1 < a.pin_count) : (index += 1) a.pins[index] = a.pins[index + 1];
+            a.pin_count -= 1;
+        }
+        if (!savePins(a)) {
+            // Roll the in-memory list back so it still matches the registry.
+            addPin(a, jid);
+            setStatus(a, "Could not save pin");
+            return;
+        }
+        setStatus(a, "Chat unpinned");
+    } else {
+        if (a.pin_count >= a.pins.len) {
+            setStatus(a, "Pin limit reached (16 chats)");
+            return;
+        }
+        const before = a.pin_count;
+        addPin(a, jid);
+        if (a.pin_count == before) return;
+        if (!savePins(a)) {
+            // Roll the in-memory list back so it still matches the registry.
+            a.pin_count -= 1;
+            setStatus(a, "Could not save pin");
+            return;
+        }
+        setStatus(a, "Chat pinned to top");
+    }
+    refreshChats(a);
 }
 
 fn saveDictationLanguage(language: dictation.Language) void {
@@ -1172,6 +1264,22 @@ fn applyChats(a: *App, raw: []const u8) void {
         .array => |items| items,
         else => return,
     };
+    if (!a.pins_loaded) {
+        a.pins_loaded = true;
+        if (!loadPins(a)) {
+            // First launch: import the pins the user already made inside
+            // WhatsApp; after this the app's own pin list is the source of
+            // truth and later WhatsApp-side pins are ignored.
+            for (data.items) |item| {
+                const object = switch (item) {
+                    .object => |o| o,
+                    else => continue,
+                };
+                if (getBool(object, "pinned")) addPin(a, getString(object, "jid"));
+            }
+            _ = savePins(a);
+        }
+    }
     var selected_jid: [192]u8 = [_]u8{0} ** 192;
     var selected_len: usize = 0;
     if (a.selected_chat < a.chat_count) {
@@ -1226,11 +1334,17 @@ fn applyChats(a: *App, raw: []const u8) void {
     while (i < a.chat_count) : (i += 1) {
         var j = i;
         while (j > 0) : (j -= 1) {
-            // Ties in the timestamp fall back to the jid so the order is fully
-            // deterministic no matter what order wacli returned this time.
+            // Pinned chats come first; ties in the timestamp fall back to the
+            // jid so the order is fully deterministic no matter what order
+            // wacli returned this time.
             const by_time = std.mem.order(u8, a.chats[j - 1].timestamp.slice(), a.chats[j].timestamp.slice());
-            const should_move = by_time == .lt or
-                (by_time == .eq and std.mem.order(u8, a.chats[j - 1].jid.slice(), a.chats[j].jid.slice()) == .gt);
+            const jid_order = std.mem.order(u8, a.chats[j - 1].jid.slice(), a.chats[j].jid.slice());
+            const should_move = chat_order.shouldMoveUp(
+                isChatPinned(a, a.chats[j - 1].jid.slice()),
+                isChatPinned(a, a.chats[j].jid.slice()),
+                by_time,
+                jid_order,
+            );
             if (!should_move) break;
             const temporary = a.chats[j - 1];
             a.chats[j - 1] = a.chats[j];
@@ -4577,6 +4691,7 @@ fn buildPaletteItems(a: *App) void {
     appendPalette(a, "Make text larger", "Ctrl++", command_font_larger);
     appendPalette(a, "Reset text size", "Ctrl+0", command_font_reset);
     appendPalette(a, "Toggle unread chats", "U", command_unread);
+    appendPalette(a, if (a.selected_chat < a.chat_count and isChatPinned(a, a.chats[a.selected_chat].jid.slice())) "Unpin selected chat" else "Pin chat to top", "", command_pin);
     appendPalette(a, if (a.show_archived) "Show inbox chats" else "Show archived chats", "", command_archived);
     appendPalette(a, if (a.show_archived) "Unarchive selected chat" else "Archive selected chat", "Ctrl+E", command_archive);
     appendPalette(a, "Reply to selected message", "Ctrl+Shift+R", command_reply);
@@ -5084,6 +5199,7 @@ fn runCommand(a: *App, command: u16) void {
             refreshMessages(a);
         },
         command_archive => archiveSelectedChat(a),
+        command_pin => togglePinSelected(a),
         command_reply => startReply(a),
         command_archived => {
             a.show_archived = !a.show_archived;
@@ -5629,8 +5745,13 @@ fn drawChat(a: *App, item: *win.DRAWITEMSTRUCT) void {
 
     _ = win.SelectObject(item.hDC, @ptrCast(a.font_bold.?));
     _ = win.SetTextColor(item.hDC, color_text);
-    var name_rect = win.RECT{ .left = item.rcItem.left + 66, .top = item.rcItem.top + 10, .right = item.rcItem.right - 54, .bottom = item.rcItem.top + 34 };
+    const pinned_chat = isChatPinned(a, chat.jid.slice());
+    var name_rect = win.RECT{ .left = item.rcItem.left + 66, .top = item.rcItem.top + 10, .right = item.rcItem.right - (if (pinned_chat) @as(i32, 78) else 54), .bottom = item.rcItem.top + 34 };
     _ = win.DrawTextW(item.hDC, chat.name.ptr(), @intCast(chat.name.len), &name_rect, win.DT_LEFT | win.DT_SINGLELINE | win.DT_END_ELLIPSIS | win.DT_VCENTER);
+    if (pinned_chat) {
+        const pin_glyph = [_]u16{ 0xD83D, 0xDCCC }; // 📌
+        _ = drawMixedLine(item.hDC, a.font_bold.?, a.font_emoji orelse a.font_bold.?, &pin_glyph, item.rcItem.right - 76, item.rcItem.top + 12);
+    }
     _ = win.SelectObject(item.hDC, @ptrCast(a.font_small.?));
     _ = win.SetTextColor(item.hDC, color_muted);
     var time_rect = win.RECT{ .left = item.rcItem.right - 52, .top = item.rcItem.top + 10, .right = item.rcItem.right - 10, .bottom = item.rcItem.top + 32 };
