@@ -41,6 +41,17 @@ Use `Win+.` in the composer for the Windows emoji picker. Right-click a message 
 Install Zig 0.16, then run:
 
 ```powershell
+## Slack
+
+Slack workspaces connect through the Web API plus a Socket Mode websocket
+(`src/slack_win.zig`), no runtime involved. Create an app from
+`slack-app-manifest.yml` at https://api.slack.com/apps, then enter the user
+token (xoxp-) and app token (xapp-) once via Ctrl+K > "Set up Slack...".
+Tokens are stored DPAPI-encrypted in the registry. Channels and DMs appear in
+the sidebar, messages arrive live, text replies (threads inline) and image
+attachments send, and file attachments download to
+`%LOCALAPPDATA%\Messages\slack`.
+
 zig build --release=small
 ```
 

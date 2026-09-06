@@ -3,6 +3,8 @@ const audio = @import("audio.zig");
 const avatar = @import("avatar.zig");
 const avatar_mask = @import("avatar_mask.zig");
 const dictation = @import("dictation.zig");
+const slack = @import("slack.zig");
+const slack_win = @import("slack_win.zig");
 const played = @import("played.zig");
 const chat_order = @import("chat_order.zig");
 const compose_layout = @import("compose_layout.zig");
@@ -42,6 +44,8 @@ const command_telegram_login = 2025;
 const command_telegram_logout = 2026;
 const wm_update_ready = win.WM_APP + 2;
 const wm_wacli_done = win.WM_APP + 3;
+const wm_slack_event = win.WM_APP + 4;
+const wm_slack_reload = win.WM_APP + 5;
 const wacli_queue_size = 8;
 const max_wacli_args = 16;
 const wacli_arg_cap = 512;
@@ -107,6 +111,9 @@ const command_accounts_remove = 2041;
 const command_accounts_remove_confirm = 2042;
 const command_pin = 2043;
 const max_pins = 16;
+const command_slack_setup = 2046;
+const command_slack_disconnect = 2047;
+const command_slack_attach = 2048;
 const reaction_like = 3001;
 const reaction_love = 3002;
 const reaction_laugh = 3003;
@@ -309,7 +316,7 @@ const Message = struct {
 // posts a WacliResult pointer back with wm_wacli_done; the UI thread parses
 // and applies it. Jobs carry a generation token so a stale answer can never
 // overwrite a newer view.
-const WacliJobKind = enum(u8) { chats, groups, messages, reaction };
+const WacliJobKind = enum(u8) { chats, groups, messages, reaction, slack_workspace, slack_users, slack_history, slack_replies, slack_send, slack_attach, slack_download, slack_auth };
 const wacli_kind_count = @typeInfo(WacliJobKind).@"enum".fields.len;
 
 const WacliJob = struct {
@@ -376,6 +383,11 @@ fn freeMediaSlot(a: *App) ?*MediaDownload {
     for (&a.media_downloads) |*slot| if (slot.child == null) return slot;
     return null;
 }
+
+const SlackUser = struct {
+    id: Utf8Text(32) = .{},
+    name: Utf8Text(128) = .{},
+};
 
 const App = struct {
     allocator: std.mem.Allocator,
@@ -550,6 +562,22 @@ const App = struct {
     wacli_queue_len: usize = 0,
     wacli_quit: bool = false,
     wacli_pending: [wacli_kind_count]u32 = [_]u32{0} ** wacli_kind_count,
+    slack_tokens: ?slack_win.Tokens = null,
+    slack_stop: std.atomic.Value(bool) = .init(false),
+    slack_connected: std.atomic.Value(bool) = .init(false),
+    slack_event_pending: std.atomic.Value(usize) = .init(0),
+    slack_socket_thread: ?std.Thread = null,
+    slack_log: slack.Log = .{},
+    slack_log_mutex: std.Io.Mutex = .init,
+    slack_user_id: Utf8Text(32) = .{},
+    slack_setup_window: ?win.HWND = null,
+    slack_chats: [max_chats]Chat = [_]Chat{.{}} ** max_chats,
+    slack_chat_count: usize = 0,
+    slack_users: [512]SlackUser = [_]SlackUser{.{}} ** 512,
+    slack_user_count: usize = 0,
+    slack_attach: WideText(519) = .{},
+    slack_attach_jid: Utf8Text(191) = .{},
+    slack_media_dir: []u8 = &.{},
     messages_gen: u64 = 0,
     chats_gen: u64 = 0,
     chats_pending_flags: u8 = 0,
@@ -1051,6 +1079,31 @@ fn wacliRunJob(a: *App, job: WacliJob) void {
         return;
     };
     result.* = .{ .kind = job.kind, .gen = job.gen, .jid = job.jid, .msg_id = job.msg_id, .extra = job.extra };
+    switch (job.kind) {
+        .slack_workspace, .slack_users, .slack_history, .slack_replies, .slack_send, .slack_attach, .slack_download, .slack_auth => {
+            var slack_args: [max_wacli_args][]const u8 = undefined;
+            var slack_count: usize = 0;
+            while (slack_count < job.arg_count) : (slack_count += 1) slack_args[slack_count] = job.args[slack_count].slice();
+            const kind: slack_win.JobKind = switch (job.kind) {
+                .slack_workspace => .workspace,
+                .slack_users => .users,
+                .slack_history => .history,
+                .slack_replies => .replies,
+                .slack_send => .send_text,
+                .slack_attach => .send_image,
+                .slack_auth => .auth,
+                else => .download,
+            };
+            result.data = slack_win.runJob(a.allocator, slackContext(a), kind, slack_args[0..slack_count]) catch |err| blk: {
+                result.ok = false;
+                result.extra.set(@errorName(err));
+                break :blk &.{};
+            };
+            wacliPost(a, result);
+            return;
+        },
+        else => {},
+    }
     const run = std.process.run(a.allocator, a.io, .{
         .argv = argv[0..count],
         .stdout_limit = .limited(8 * 1024 * 1024),
@@ -1692,6 +1745,539 @@ fn tdlibSmoke(io: std.Io) u8 {
     return 1;
 }
 
+// --- Slack provider (WAZI-55) ---
+
+fn slackConfigured(a: *App) bool {
+    return a.slack_tokens != null;
+}
+
+fn slackContext(a: *App) slack_win.JobContext {
+    return .{ .user_token = if (a.slack_tokens) |t| t.user else "", .media_dir = a.slack_media_dir, .io = a.io };
+}
+
+fn slackUserName(a: *App, user_id: []const u8) ?[]const u8 {
+    for (a.slack_users[0..a.slack_user_count]) |*user| {
+        if (std.mem.eql(u8, user.id.slice(), user_id)) return user.name.slice();
+    }
+    return null;
+}
+
+fn slackChatById(a: *App, channel_id: []const u8) ?*Chat {
+    for (a.slack_chats[0..a.slack_chat_count]) |*chat| {
+        if (std.mem.eql(u8, chat.jid.slice(), channel_id)) return chat;
+    }
+    return null;
+}
+
+fn selectedChatIsSlack(a: *App) bool {
+    if (a.selected_chat >= a.chat_count) return false;
+    return a.chats[a.selected_chat].provider == .slack;
+}
+
+/// Move the accumulated Slack workspace page into a.slack_chats / a.slack_users.
+fn applySlackWorkspace(a: *App, raw: []const u8) void {
+    var parsed = std.json.parseFromSlice(std.json.Value, a.allocator, raw, .{}) catch return;
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |object| object,
+        else => return,
+    };
+    const list = switch (root.get("channels") orelse return) {
+        .array => |items| items,
+        else => return,
+    };
+    for (list.items) |item| {
+        const object = switch (item) {
+            .object => |object| object,
+            else => continue,
+        };
+        const id = getString(object, "id");
+        if (id.len == 0) continue;
+        const is_im = id[0] == 'D';
+        var name: []const u8 = getString(object, "name");
+        if (is_im) {
+            const user_id = getString(object, "user");
+            name = slackUserName(a, user_id) orelse user_id;
+        }
+        if (name.len == 0) continue;
+        var chat = Chat{ .provider = .slack };
+        chat.jid.set(id);
+        const hash_prefix = id[0] == 'C' or id[0] == 'G';
+        const shown = if (hash_prefix) std.fmt.allocPrint(a.allocator, "#{s}", .{name}) catch a.allocator.dupe(u8, name) catch continue else a.allocator.dupe(u8, name) catch continue;
+        defer a.allocator.free(shown);
+        // Upsert: a later page or refresh must not duplicate a channel.
+        if (slackChatById(a, id)) |existing| {
+            existing.name.set(a.allocator, shown);
+            continue;
+        }
+        chat.name.set(a.allocator, shown);
+        chat.kind.set(a.allocator, if (is_im) "Slack DM" else "Slack channel");
+        chat.timestamp.set("");
+        if (a.slack_chat_count >= a.slack_chats.len) break;
+        a.slack_chats[a.slack_chat_count] = chat;
+        a.slack_chat_count += 1;
+    }
+}
+
+fn applySlackUsers(a: *App, raw: []const u8) void {
+    var parsed = std.json.parseFromSlice(std.json.Value, a.allocator, raw, .{}) catch return;
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |object| object,
+        else => return,
+    };
+    const list = switch (root.get("members") orelse return) {
+        .array => |items| items,
+        else => return,
+    };
+    for (list.items) |item| {
+        const object = switch (item) {
+            .object => |object| object,
+            else => continue,
+        };
+        const id = getString(object, "id");
+        if (id.len == 0) continue;
+        var name = getString(object, "real_name");
+        if (name.len == 0) {
+            const profile = switch (object.get("profile") orelse continue) {
+                .object => |profile_object| profile_object,
+                else => continue,
+            };
+            name = getString(profile, "display_name");
+            if (name.len == 0) name = getString(profile, "real_name");
+        }
+        var known = false;
+        for (a.slack_users[0..a.slack_user_count]) |*user| {
+            if (std.mem.eql(u8, user.id.slice(), id)) {
+                if (name.len > 0) user.name.set(name);
+                known = true;
+            }
+        }
+        if (known or a.slack_user_count >= a.slack_users.len) continue;
+        var user = SlackUser{};
+        user.id.set(id);
+        user.name.set(name);
+        a.slack_users[a.slack_user_count] = user;
+        a.slack_user_count += 1;
+    }
+}
+
+fn refreshSlackWorkspace(a: *App) void {
+    if (!slackConfigured(a)) return;
+    var job = WacliJob{ .kind = .slack_workspace };
+    wacliJobArgs(&job, &.{ "public_channel,private_channel,im", "" });
+    wacliEnqueue(a, job, false);
+    var users_job = WacliJob{ .kind = .slack_users };
+    wacliJobArgs(&users_job, &.{""});
+    wacliEnqueue(a, users_job, false);
+}
+
+fn refreshSlackHistory(a: *App) void {
+    if (!selectedChatIsSlack(a)) return;
+    const chat = &a.chats[a.selected_chat];
+    a.messages_gen += 1;
+    var job = WacliJob{ .kind = .slack_history, .gen = a.messages_gen };
+    job.jid.set(chat.jid.slice());
+    wacliJobArgs(&job, &.{chat.jid.slice()});
+    wacliEnqueue(a, job, true);
+}
+
+fn slackMediaKind(mime: []const u8) []const u8 {
+    if (std.mem.startsWith(u8, mime, "image/")) return "image";
+    if (std.mem.startsWith(u8, mime, "video/")) return "video";
+    if (std.mem.startsWith(u8, mime, "audio/")) return "audio";
+    return "file";
+}
+
+fn buildSlackMessage(a: *App, item: slack.HistoryItem) Message {
+    var message = Message{};
+    message.id.set(item.ts);
+    message.sender_jid.set(item.user);
+    const from_me = a.slack_user_id.len > 0 and std.mem.eql(u8, item.user, a.slack_user_id.slice());
+    message.from_me = from_me;
+    const name = if (from_me) "You" else (slackUserName(a, item.user) orelse (if (item.user.len > 0) item.user else "Slack"));
+    message.sender.set(a.allocator, name);
+    const text = if (item.text.len > 0) item.text else item.file_name;
+    const is_thread_reply = item.thread_ts.len > 0 and !std.mem.eql(u8, item.thread_ts, item.ts);
+    if (is_thread_reply and text.len + 4 <= slack.max_text) {
+        var threaded: [slack.max_text + 4]u8 = undefined;
+        const rendered = std.fmt.bufPrint(&threaded, "\u{21a9} {s}", .{text}) catch text;
+        message.text.set(a.allocator, rendered);
+    } else {
+        message.text.set(a.allocator, text);
+    }
+    formatSlackTime(&message.time, a.allocator, item.ts);
+    if (item.file_url.len > 0) {
+        message.media_type.set(slackMediaKind(item.file_mime));
+        message.mime_type.set(item.file_mime);
+        message.filename.set(a.allocator, item.file_name);
+    }
+    return message;
+}
+
+/// Slack timestamps are unix seconds with a fraction; convert to local
+/// HH:MM. (WhatsApp paths use ISO strings via formatTime.)
+fn formatSlackTime(target: *WideText(15), allocator: std.mem.Allocator, ts: []const u8) void {
+    const dot = std.mem.indexOfScalar(u8, ts, '.') orelse ts.len;
+    const seconds = std.fmt.parseInt(i64, ts[0..dot], 10) catch {
+        target.set(allocator, "");
+        return;
+    };
+    // Slack-supplied values are untrusted; keep the FILETIME math in range.
+    if (seconds < 0 or seconds > 100_000_000_000) {
+        target.set(allocator, "");
+        return;
+    }
+    // Windows FILETIME epoch is 1601; unix epoch offset in 100ns ticks.
+    const ticks: i64 = (seconds + 11644473600) * 10_000_000;
+    var ft = win.FILETIME{ .dwLowDateTime = @truncate(@as(u64, @bitCast(ticks))), .dwHighDateTime = @truncate(@as(u64, @bitCast(ticks)) >> 32) };
+    var utc = std.mem.zeroes(win.SYSTEMTIME);
+    if (win.FileTimeToSystemTime(&ft, &utc) == 0) {
+        target.set(allocator, "");
+        return;
+    }
+    var local = std.mem.zeroes(win.SYSTEMTIME);
+    if (win.SystemTimeToTzSpecificLocalTime(null, &utc, &local) == 0) {
+        target.set(allocator, "");
+        return;
+    }
+    var buffer: [8]u8 = undefined;
+    const rendered = std.fmt.bufPrint(&buffer, "{d:0>2}:{d:0>2}", .{ local.wHour, local.wMinute }) catch return;
+    target.set(allocator, rendered);
+}
+
+fn applySlackHistory(a: *App, raw: []const u8) void {
+    var parsed = std.json.parseFromSlice(std.json.Value, a.allocator, raw, .{}) catch return;
+    defer parsed.deinit();
+    if (a.selected_chat >= a.chat_count) return;
+    const chat = &a.chats[a.selected_chat];
+    if (chat.provider != .slack) return;
+    const root = switch (parsed.value) {
+        .object => |object| object,
+        else => return,
+    };
+    const list = switch (root.get("messages") orelse return) {
+        .array => |items| items,
+        else => return,
+    };
+    var selected_id = Utf8Text(191){};
+    if (a.selected_message) |selected| {
+        if (selected < a.message_count) selected_id.set(a.messages[selected].id.slice());
+    }
+    clearMessages(a);
+    a.selected_message = null;
+    var reply_parents: [8]Utf8Text(64) = [_]Utf8Text(64){.{}} ** 8;
+    var reply_parent_count: usize = 0;
+    var item_index: usize = list.items.len;
+    var count: usize = 0;
+    while (item_index > 0 and count < max_messages) {
+        item_index -= 1;
+        const item = slack.readHistoryItem(list.items[item_index]) orelse continue;
+        const message = buildSlackMessage(a, item);
+        a.messages[a.message_count] = message;
+        a.message_count += 1;
+        count += 1;
+        if (item.reply_count > 0 and reply_parent_count < reply_parents.len) {
+            reply_parents[reply_parent_count].set(item.ts);
+            reply_parent_count += 1;
+        }
+        if (item.file_url.len > 0 and count <= 20) {
+            requestSlackDownload(a, chat.jid.slice(), item);
+        }
+    }
+    if (selected_id.len > 0) {
+        for (a.messages[0..a.message_count], 0..) |*message, index| {
+            if (std.mem.eql(u8, selected_id.slice(), message.id.slice())) {
+                a.selected_message = index;
+                break;
+            }
+        }
+    }
+    a.displayed_jid.set(chat.jid.slice());
+    a.displayed_timestamp.set(chat.timestamp.slice());
+    // Threads shown inline: fetch each parent's replies once.
+    for (reply_parents[0..reply_parent_count]) |parent| {
+        var job = WacliJob{ .kind = .slack_replies, .gen = a.messages_gen };
+        job.jid.set(chat.jid.slice());
+        job.msg_id.set(parent.slice());
+        wacliJobArgs(&job, &.{ chat.jid.slice(), parent.slice() });
+        wacliEnqueue(a, job, false);
+    }
+    if (a.canvas) |canvas| _ = win.InvalidateRect(canvas, null, win.TRUE);
+    if (a.chats_hwnd) |chats_list| _ = win.InvalidateRect(chats_list, null, win.TRUE);
+}
+
+/// Merge conversations.replies (parent + children) into the open chat.
+fn applySlackReplies(a: *App, raw: []const u8) void {
+    var parsed = std.json.parseFromSlice(std.json.Value, a.allocator, raw, .{}) catch return;
+    defer parsed.deinit();
+    if (a.selected_chat >= a.chat_count) return;
+    const chat = &a.chats[a.selected_chat];
+    if (chat.provider != .slack) return;
+    const root = switch (parsed.value) {
+        .object => |object| object,
+        else => return,
+    };
+    const list = switch (root.get("messages") orelse return) {
+        .array => |items| items,
+        else => return,
+    };
+    for (list.items) |item_value| {
+        const item = slack.readHistoryItem(item_value) orelse continue;
+        // Skip parent duplicates already rendered by history.
+        var known = false;
+        for (a.messages[0..a.message_count]) |*existing| {
+            if (std.mem.eql(u8, existing.id.slice(), item.ts)) known = true;
+        }
+        if (known) continue;
+        const message = buildSlackMessage(a, item);
+        insertSlackMessageSorted(a, message);
+    }
+    if (a.canvas) |canvas| _ = win.InvalidateRect(canvas, null, win.TRUE);
+}
+
+fn insertSlackMessageSorted(a: *App, message: Message) void {
+    if (a.message_count >= max_messages) return;
+    var index: usize = a.message_count;
+    while (index > 0 and slack.compareTs(a.messages[index - 1].id.slice(), message.id.slice()) == .gt) : (index -= 1) {
+        a.messages[index] = a.messages[index - 1];
+    }
+    a.messages[index] = message;
+    a.message_count += 1;
+}
+
+fn requestSlackDownload(a: *App, channel: []const u8, item: slack.HistoryItem) void {
+    if (item.file_id.len == 0 or item.file_url.len == 0) return;
+    var job = WacliJob{ .kind = .slack_download };
+    job.jid.set(channel);
+    job.msg_id.set(item.ts);
+    wacliJobArgs(&job, &.{ item.file_url, item.file_id, item.file_name, channel, item.ts });
+    wacliEnqueue(a, job, false);
+}
+
+/// A live Socket Mode event: dedup, update the chat list, and merge into the
+/// open conversation.
+fn applySlackEvent(a: *App, event: *slack_win.Event) void {
+    defer slack_win.destroyEvent(event);
+    a.slack_log_mutex.lockUncancelable(a.io);
+    const fresh = a.slack_log.mark(event.channelSlice(), event.tsSlice());
+    a.slack_log_mutex.unlock(a.io);
+    if (!fresh) return;
+
+    const channel = event.channelSlice();
+    const is_open = a.selected_chat < a.chat_count and
+        std.mem.eql(u8, a.chats[a.selected_chat].jid.slice(), channel) and
+        a.chats[a.selected_chat].provider == .slack;
+    const from_me = a.slack_user_id.len > 0 and std.mem.eql(u8, event.userSlice(), a.slack_user_id.slice());
+    if (slackChatById(a, channel)) |chat| {
+        chat.timestamp.set(event.tsSlice());
+        if (!from_me and !is_open) {
+            chat.unread = true;
+            chat.unread_count += 1;
+        }
+    }
+    if (is_open) {
+        var item = slack.HistoryItem{
+            .ts = event.tsSlice(),
+            .user = event.userSlice(),
+            .text = event.textSlice(),
+            .thread_ts = event.threadTsSlice(),
+            .file_id = event.fileIdSlice(),
+            .file_url = event.fileUrlSlice(),
+            .file_name = event.fileNameSlice(),
+            .file_mime = event.fileMimeSlice(),
+            .file_size = event.file_size,
+        };
+        _ = &item;
+        const message = buildSlackMessage(a, item);
+        insertSlackMessageSorted(a, message);
+        if (item.file_url.len > 0) requestSlackDownload(a, channel, item);
+        if (a.canvas) |canvas| _ = win.InvalidateRect(canvas, null, win.TRUE);
+    } else {
+        refreshChats(a);
+    }
+}
+
+fn loadSlackTokens(a: *App) void {
+    if (a.slack_tokens) |tokens| {
+        a.allocator.free(tokens.user);
+        a.allocator.free(tokens.app);
+        a.slack_tokens = null;
+    }
+    a.slack_tokens = slack_win.loadTokens(a.allocator);
+    if (a.slack_tokens == null) return;
+    const job = WacliJob{ .kind = .slack_auth };
+    wacliEnqueue(a, job, false);
+}
+
+// --- Slack token dialog (masked entry, DPAPI-stored on save) ---
+
+const id_slack_user_edit = 100;
+const id_slack_app_edit = 101;
+const id_slack_save = 102;
+const id_slack_cancel = 103;
+
+const OPENFILENAMEW = extern struct {
+    lStructSize: win.DWORD,
+    hwndOwner: win.HWND,
+    hInstance: win.HINSTANCE,
+    lpstrFilter: ?[*:0]const u16,
+    lpstrCustomFilter: ?[*:0]u16,
+    nMaxCustFilter: win.DWORD,
+    nFilterIndex: win.DWORD,
+    lpstrFile: ?[*:0]u16,
+    nMaxFile: win.DWORD,
+    lpstrFileTitle: ?[*:0]u16,
+    nMaxFileTitle: win.DWORD,
+    lpstrInitialDir: ?[*:0]const u16,
+    lpstrTitle: ?[*:0]const u16,
+    Flags: win.DWORD,
+    nFileOffset: u16,
+    nFileExtension: u16,
+    lpstrDefExt: ?[*:0]const u16,
+    lCustData: win.LPARAM,
+    lpfnHook: ?*anyopaque,
+    lpTemplateName: ?[*:0]const u16,
+    pvReserved: ?*anyopaque,
+    dwReserved: win.DWORD,
+    FlagsEx: win.DWORD,
+};
+
+extern "comdlg32" fn GetOpenFileNameW(ofn: *OPENFILENAMEW) win.BOOL;
+
+fn pickImageFile(a: *App) ?WideText(519) {
+    var buffer: [519]u16 = [_]u16{0} ** 519;
+    var ofn = std.mem.zeroes(OPENFILENAMEW);
+    ofn.lStructSize = @sizeOf(OPENFILENAMEW);
+    ofn.hwndOwner = a.hwnd orelse return null;
+    ofn.lpstrFilter = lit("Images\x00*.png;*.jpg;*.jpeg;*.gif;*.webp\x00All files\x00*.*\x00");
+    ofn.lpstrFile = @ptrCast(&buffer);
+    ofn.nMaxFile = buffer.len;
+    ofn.Flags = 0x00000800 | 0x00001000 | 0x00000008; // path + file must exist, no dir change
+    if (GetOpenFileNameW(&ofn) == 0) return null;
+    const chosen = std.unicode.utf16LeToUtf8Alloc(a.allocator, std.mem.span(@as([*:0]const u16, @ptrCast(&buffer)))) catch return null;
+    defer a.allocator.free(chosen);
+    var result = WideText(519){};
+    result.set(a.allocator, chosen);
+    return result;
+}
+
+fn slackSetupProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.LPARAM) callconv(.winapi) isize {
+    const a = app_ptr orelse return win.DefWindowProcW(hwnd, message, @bitCast(wparam), @bitCast(lparam));
+    switch (message) {
+        win.WM_CREATE => {
+            _ = win.CreateWindowExW(0, lit("STATIC"), lit("User token (xoxp-)"), win.WS_CHILD | win.WS_VISIBLE, 16, 16, 360, 20, hwnd, null, a.instance, null);
+            _ = win.CreateWindowExW(0, lit("EDIT"), null, win.WS_CHILD | win.WS_VISIBLE | win.WS_BORDER | win.ES_AUTOHSCROLL | win.ES_PASSWORD, 16, 38, 360, 26, hwnd, controlId(id_slack_user_edit), a.instance, null);
+            _ = win.CreateWindowExW(0, lit("STATIC"), lit("App token (xapp-) for Socket Mode"), win.WS_CHILD | win.WS_VISIBLE, 16, 74, 360, 20, hwnd, null, a.instance, null);
+            _ = win.CreateWindowExW(0, lit("EDIT"), null, win.WS_CHILD | win.WS_VISIBLE | win.WS_BORDER | win.ES_AUTOHSCROLL | win.ES_PASSWORD, 16, 96, 360, 26, hwnd, controlId(id_slack_app_edit), a.instance, null);
+            _ = win.CreateWindowExW(0, lit("BUTTON"), lit("Save"), win.WS_CHILD | win.WS_VISIBLE | win.BS_DEFPUSHBUTTON, 16, 136, 90, 30, hwnd, controlId(id_slack_save), a.instance, null);
+            _ = win.CreateWindowExW(0, lit("BUTTON"), lit("Cancel"), win.WS_CHILD | win.WS_VISIBLE | win.BS_PUSHBUTTON, 116, 136, 90, 30, hwnd, controlId(id_slack_cancel), a.instance, null);
+            return 0;
+        },
+        win.WM_COMMAND => {
+            const id = loword(wparam);
+            if (id == id_slack_cancel) {
+                _ = win.DestroyWindow(hwnd);
+                return 0;
+            }
+            if (id != id_slack_save) return 0;
+            var user_wide: [512]u16 = [_]u16{0} ** 512;
+            var app_wide: [512]u16 = [_]u16{0} ** 512;
+            const user_len: usize = @intCast(win.GetDlgItemTextW(hwnd, id_slack_user_edit, &user_wide, user_wide.len));
+            const app_len: usize = @intCast(win.GetDlgItemTextW(hwnd, id_slack_app_edit, &app_wide, app_wide.len));
+            const user = std.unicode.utf16LeToUtf8Alloc(a.allocator, user_wide[0..user_len]) catch return 0;
+            defer a.allocator.free(user);
+            const app = std.unicode.utf16LeToUtf8Alloc(a.allocator, app_wide[0..app_len]) catch return 0;
+            defer a.allocator.free(app);
+            if (!slack_win.isUserToken(user) or !slack_win.isAppToken(app)) {
+                setStatus(a, "Slack tokens must start with xoxp- and xapp-");
+                return 0;
+            }
+            if (!slack_win.saveTokens(user, app)) {
+                setStatus(a, "Could not store Slack tokens");
+                return 0;
+            }
+            _ = win.DestroyWindow(hwnd);
+            if (a.hwnd) |main_hwnd| _ = win.PostMessageW(main_hwnd, wm_slack_reload, 0, 0);
+            return 0;
+        },
+        win.WM_CLOSE => {
+            _ = win.DestroyWindow(hwnd);
+            return 0;
+        },
+        win.WM_NCDESTROY => {
+            a.slack_setup_window = null;
+            if (a.hwnd) |main_hwnd| {
+                _ = win.EnableWindow(main_hwnd, 1);
+                _ = win.SetFocus(main_hwnd);
+            }
+            return 0;
+        },
+        else => {},
+    }
+    return win.DefWindowProcW(hwnd, message, wparam, lparam);
+}
+
+fn openSlackSetup(a: *App) void {
+    if (a.slack_setup_window != null) {
+        if (a.slack_setup_window) |setup| _ = win.SetFocus(setup);
+        return;
+    }
+    if (a.hwnd) |main_hwnd| _ = win.EnableWindow(main_hwnd, 0);
+    const wnd = win.CreateWindowExW(
+        win.WS_EX_DLGMODALFRAME,
+        lit("SlackSetup"),
+        lit("Sign in to Slack"),
+        win.WS_OVERLAPPED | win.WS_CAPTION | win.WS_SYSMENU,
+        200,
+        200,
+        410,
+        215,
+        a.hwnd orelse return,
+        null,
+        a.instance,
+        null,
+    ) orelse {
+        if (a.hwnd) |main_hwnd| _ = win.EnableWindow(main_hwnd, 1);
+        return;
+    };
+    a.slack_setup_window = wnd;
+    _ = win.ShowWindow(wnd, win.SW_SHOW);
+    var msg: win.MSG = undefined;
+    while (true) {
+        const got = win.GetMessageW(&msg, null, 0, 0);
+        if (got == 0) {
+            // A quit issued while the dialog is up must still close the app.
+            _ = win.PostQuitMessage(@intCast(msg.wParam));
+            break;
+        }
+        if (got < 0) break;
+        _ = win.TranslateMessage(&msg);
+        _ = win.DispatchMessageW(&msg);
+        if (a.slack_setup_window == null) break;
+    }
+}
+
+/// Start (or restart after token entry) the Socket Mode session.
+fn startSlackSocket(a: *App) void {
+    if (!slackConfigured(a) or a.slack_socket_thread != null) return;
+    const tokens = a.slack_tokens.?;
+    a.slack_stop.store(false, .release);
+    const config = slack_win.SocketConfig{
+        .user_token = tokens.user,
+        .app_token = tokens.app,
+        .stop = &a.slack_stop,
+        .connected = &a.slack_connected,
+        .sink = .{
+            .hwnd = if (a.hwnd) |hwnd| hwnd else return,
+            .message_id = wm_slack_event,
+            .queue = &a.slack_event_pending,
+        },
+    };
+    a.slack_socket_thread = std.Thread.spawn(.{ .stack_size = 1024 * 1024 }, slack_win.socketThreadMain, .{config}) catch null;
+    if (a.slack_socket_thread == null) setStatus(a, "Slack connection failed to start");
+}
+
 fn markChatRead(a: *App) void {
     if (!a.user_viewed or a.selected_chat >= a.chat_count) return;
     const chat = &a.chats[a.selected_chat];
@@ -1706,6 +2292,14 @@ fn markChatRead(a: *App) void {
         }
         chat.unread = false;
         chat.unread_count = 0;
+        return;
+    }
+    if (chat.provider == .slack) {
+        // v1 ceiling: Slack read state is local-only; upgrade path adds
+        // conversations.mark via the socket-connected app token.
+        chat.unread = false;
+        chat.unread_count = 0;
+        if (a.chats_hwnd) |list| _ = win.InvalidateRect(list, null, win.TRUE);
         return;
     }
     if (!chat.unread and chat.unread_count == 0) return;
@@ -3789,6 +4383,7 @@ fn sendMessage(a: *App) void {
     // caption. The JID guard keeps it from ever landing in another chat if
     // selection state and the staged image ever disagree.
     var staged_file: []const u8 = "";
+    var attach_path_buffer: [1600]u8 = undefined;
     if (a.staged_image.path.len > 0) {
         if (std.mem.eql(u8, a.staged_image.jid.slice(), a.chats[a.selected_chat].jid.slice())) {
             staged_file = a.staged_image.path.slice();
@@ -3835,6 +4430,41 @@ fn sendMessage(a: *App) void {
             focusCompose(a);
             setStatus(a, "Sent");
         } else setStatus(a, "Telegram refused the message");
+        return;
+    }
+    if (selectedChatIsSlack(a)) {
+        const chat = &a.chats[a.selected_chat];
+        // A pasted image (WAZI-37) or the palette-picked file goes out as a
+        // Slack file attachment; typed text rides along as the caption.
+        var attach: []const u8 = "";
+        if (a.slack_attach.len > 0) {
+            // Same guard as the staged paste: the attach belongs to the chat
+            // it was picked in and must never land in another conversation.
+            if (std.mem.eql(u8, a.slack_attach_jid.slice(), chat.jid.slice())) {
+                const attach_len = std.unicode.utf16LeToUtf8(&attach_path_buffer, a.slack_attach.slice()) catch 0;
+                attach = attach_path_buffer[0..attach_len];
+            } else setStatus(a, "Attached image dropped: chat changed");
+            a.slack_attach.set(a.allocator, "");
+            a.slack_attach_jid.set("");
+        } else if (staged_file.len > 0) {
+            attach = staged_file;
+            releaseStagedImage(a);
+        }
+        if (attach.len > 0) {
+            var job = WacliJob{ .kind = .slack_attach };
+            wacliJobArgs(&job, &.{ chat.jid.slice(), a.reply_to.slice(), attach, text });
+            wacliEnqueue(a, job, false);
+        } else {
+            var job = WacliJob{ .kind = .slack_send };
+            wacliJobArgs(&job, &.{ chat.jid.slice(), text, a.reply_to.slice() });
+            wacliEnqueue(a, job, false);
+        }
+        clearReply(a);
+        a.user_viewed = true;
+        _ = win.SetWindowTextW(a.compose.?, lit(""));
+        layout(a, a.compose_client_width, a.compose_client_height);
+        setStatus(a, "Sending to Slack...");
+        focusCompose(a);
         return;
     }
 
@@ -4748,6 +5378,9 @@ fn buildPaletteItems(a: *App) void {
         appendPalette(a, "Add Telegram account", "", command_telegram_login);
     }
     appendPalette(a, "Open video in external player", "", command_open_video_external);
+    appendPalette(a, "Attach image to send", "", command_slack_attach);
+    appendPalette(a, "Set up Slack...", "", command_slack_setup);
+    appendPalette(a, "Disconnect Slack", "", command_slack_disconnect);
     appendPalette(a, "Quit Messages", "Q", command_quit);
 }
 
@@ -5292,6 +5925,36 @@ fn runCommand(a: *App, command: u16) void {
         command_telegram_logout => {
             if (a.telegram) |client| client.logOut();
             setStatus(a, "Logging out of Telegram...");
+        },
+        command_slack_setup => {
+            openSlackSetup(a);
+        },
+        command_slack_disconnect => {
+            slack_win.clearTokens();
+            a.slack_stop.store(true, .release);
+            // ponytail: the socket thread cannot be joined while it blocks in
+            // a receive, so it is detached and the token bytes it still
+            // borrows stay allocated until process exit; upgrade path is a
+            // stored socket handle closed here to unblock the receive.
+            if (a.slack_socket_thread) |thread| thread.detach();
+            a.slack_socket_thread = null;
+            a.slack_tokens = null;
+            a.slack_user_id.set("");
+            a.slack_chat_count = 0;
+            a.slack_user_count = 0;
+            refreshChats(a);
+            setStatus(a, "Slack disconnected");
+        },
+        command_slack_attach => {
+            if (!selectedChatIsSlack(a)) {
+                setStatus(a, "Open a Slack chat first");
+                return;
+            }
+            if (pickImageFile(a)) |path| {
+                a.slack_attach = path;
+                a.slack_attach_jid.set(a.chats[a.selected_chat].jid.slice());
+                setStatus(a, "Image attached - press Send");
+            }
         },
         command_open_video_external => {
             const selected = a.selected_message orelse {
@@ -6582,7 +7245,71 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
                     }
                 },
                 .reaction => applyReaction(a, result),
+                .slack_workspace => if (result.ok) {
+                    applySlackWorkspace(a, result.data);
+                    refreshChats(a);
+                } else if (slackConfigured(a)) setStatus(a, "Unable to read Slack channels"),
+                .slack_users => if (result.ok) {
+                    applySlackUsers(a, result.data);
+                    refreshChats(a);
+                },
+                .slack_auth => if (result.ok) {
+                    var parsed = std.json.parseFromSlice(std.json.Value, a.allocator, result.data, .{}) catch return 0;
+                    defer parsed.deinit();
+                    const root = switch (parsed.value) {
+                        .object => |object| object,
+                        else => return 0,
+                    };
+                    a.slack_user_id.set(getString(root, "user_id"));
+                    const team = getString(root, "team");
+                    var status_buffer: [96]u8 = undefined;
+                    setStatus(a, std.fmt.bufPrint(&status_buffer, "Slack connected: {s}", .{if (team.len > 0) team else "workspace"}) catch "Slack connected");
+                } else setStatus(a, "Slack tokens are not valid"),
+                .slack_history => {
+                    // Generation + channel guards: a stale answer must never
+                    // repaint over a newer chat (same rule as wacli reads).
+                    if (!result.ok) {
+                        setStatus(a, "Unable to read Slack history");
+                    } else if (result.gen == a.messages_gen and selectedChatIsSlack(a) and
+                        std.mem.eql(u8, a.chats[a.selected_chat].jid.slice(), result.jid.slice()))
+                    {
+                        applySlackHistory(a, result.data);
+                    }
+                },
+                .slack_replies => {
+                    if (result.ok and result.gen == a.messages_gen and selectedChatIsSlack(a) and
+                        std.mem.eql(u8, a.chats[a.selected_chat].jid.slice(), result.jid.slice()))
+                    {
+                        applySlackReplies(a, result.data);
+                    }
+                },
+                .slack_send => setStatus(a, if (result.ok) "Sent" else "Slack send failed"),
+                .slack_attach => setStatus(a, if (result.ok) "Image sent" else "Slack image send failed"),
+                .slack_download => {
+                    if (result.ok) {
+                        const ts = result.msg_id.slice();
+                        for (a.messages[0..a.message_count]) |*stored| {
+                            if (std.mem.eql(u8, stored.id.slice(), ts)) {
+                                stored.local_path.set(a.allocator, result.data);
+                                if (a.canvas) |canvas| _ = win.InvalidateRect(canvas, null, win.TRUE);
+                                break;
+                            }
+                        }
+                    }
+                },
             }
+            return 0;
+        },
+        wm_slack_event => {
+            const event: *slack_win.Event = @ptrFromInt(@as(usize, @bitCast(lparam)));
+            _ = a.slack_event_pending.fetchSub(1, .acq_rel);
+            applySlackEvent(a, event);
+            return 0;
+        },
+        wm_slack_reload => {
+            loadSlackTokens(a);
+            refreshSlackWorkspace(a);
+            startSlackSocket(a);
             return 0;
         },
         win.WM_CREATE => {
@@ -6625,6 +7352,11 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
             _ = storeChanged(a);
             startSync(a);
             startUpdateCheck(hwnd);
+            loadSlackTokens(a);
+            if (slackConfigured(a)) {
+                refreshSlackWorkspace(a);
+                startSlackSocket(a);
+            }
             return 0;
         },
         win.WM_SIZE => {
@@ -6879,6 +7611,10 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
             a.archive_child = null;
             if (a.read_child) |*child| child.kill(a.io);
             a.read_child = null;
+            // ponytail: the Socket Mode thread stops at its next frame or at
+            // process exit, whichever comes first; upgrade path is a stored
+            // socket handle closed here to unblock the receive immediately.
+            a.slack_stop.store(true, .release);
             stopSync(a);
             if (a.sync_job) |job| _ = win.CloseHandle(job);
             a.sync_job = null;
@@ -7300,6 +8036,17 @@ fn createStoreWatchPath(init: std.process.Init, allocator: std.mem.Allocator) ![
     return std.fs.path.join(allocator, &.{ home, ".wacli", "wacli.db-wal" });
 }
 
+fn createSlackMediaDirectory(init: std.process.Init, allocator: std.mem.Allocator) ![]u8 {
+    const local = init.environ_map.get("LOCALAPPDATA") orelse return error.MissingLocalAppData;
+    const messages_dir = try std.fs.path.join(allocator, &.{ local, "Messages" });
+    defer allocator.free(messages_dir);
+    const slack_dir = try std.fs.path.join(allocator, &.{ messages_dir, "slack" });
+    const slack_wide = try std.unicode.utf8ToUtf16LeAllocZ(allocator, slack_dir);
+    defer allocator.free(slack_wide);
+    _ = win.CreateDirectoryW(slack_wide.ptr, null);
+    return slack_dir;
+}
+
 fn createAvatarDirectory(init: std.process.Init, allocator: std.mem.Allocator) ![]u8 {
     const local = init.environ_map.get("LOCALAPPDATA") orelse return error.MissingLocalAppData;
     const messages_dir = try std.fs.path.join(allocator, &.{ local, "Messages" });
@@ -7351,6 +8098,8 @@ pub fn main(init: std.process.Init) !void {
     defer init.gpa.free(wacli_path);
     const avatar_dir = try createAvatarDirectory(init, init.gpa);
     defer init.gpa.free(avatar_dir);
+    const slack_media_dir = try createSlackMediaDirectory(init, init.gpa);
+    defer init.gpa.free(slack_media_dir);
     const store_watch_path = try createStoreWatchPath(init, init.gpa);
     defer init.gpa.free(store_watch_path);
     // store_watch_path is <home>\.wacli\wacli.db-wal; the parent is the
@@ -7370,7 +8119,7 @@ pub fn main(init: std.process.Init) !void {
         }
     }
     if (openrouter_model.len == 0) openrouter_model = "openai/gpt-5.6-luna";
-    var app = App{ .allocator = init.gpa, .io = init.io, .instance = instance, .wacli_path = wacli_path, .avatar_dir = avatar_dir, .deepgram_configured = deepgram_key.len > 0, .deepgram_key = deepgram_key, .openrouter_key = openrouter_key, .openrouter_model = openrouter_model, .openrouter_configured = openrouter_key.len > 0, .dictation_language = loadDictationLanguage(), .font_scale = loadFontScale() };
+    var app = App{ .allocator = init.gpa, .io = init.io, .instance = instance, .wacli_path = wacli_path, .avatar_dir = avatar_dir, .slack_media_dir = slack_media_dir, .deepgram_configured = deepgram_key.len > 0, .deepgram_key = deepgram_key, .openrouter_key = openrouter_key, .openrouter_model = openrouter_model, .openrouter_configured = openrouter_key.len > 0, .dictation_language = loadDictationLanguage(), .font_scale = loadFontScale() };
     app.wacli_dir.set(wacli_dir);
     loadEmojiRecents(&app);
     if (init.environ_map.get("LOCALAPPDATA")) |local| {
@@ -7472,6 +8221,13 @@ pub fn main(init: std.process.Init) !void {
         .hIconSm = icon_small,
     };
     if (win.RegisterClassExW(&palette_class) == 0) return error.RegisterPaletteClassFailed;
+
+    var slack_class = std.mem.zeroes(win.WNDCLASSEXW);
+    slack_class.cbSize = @sizeOf(win.WNDCLASSEXW);
+    slack_class.lpfnWndProc = slackSetupProc;
+    slack_class.hInstance = instance;
+    slack_class.lpszClassName = lit("SlackSetup");
+    if (win.RegisterClassExW(&slack_class) == 0) return error.RegisterSlackClassFailed;
 
     var emoji_class = win.WNDCLASSEXW{
         .cbSize = @sizeOf(win.WNDCLASSEXW),

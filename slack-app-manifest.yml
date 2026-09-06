@@ -1,0 +1,40 @@
+# Slack app manifest for the Wazig Messages client (WAZI-55).
+# Create the app at https://api.slack.com/apps > "From an app manifest",
+# then install it to the workspace and copy:
+#   - the user token (xoxp-) for Web API calls
+#   - the app-level token (xapp-) for Socket Mode
+# Both go into the app via Ctrl+K > "Set up Slack...".
+display_information:
+  name: Messages
+  description: Slack in the Wazig Messages desktop client
+  background_color: "#1F2328"
+features:
+  bot_user:
+    display_name: Messages
+    always_online: false
+oauth_config:
+  user_token_scopes:
+    - channels:history
+    - channels:read
+    - groups:history
+    - groups:read
+    - im:history
+    - im:read
+    - mpim:history
+    - mpim:read
+    - users:read
+    - files:read
+    - files:write
+    - chat:write
+settings:
+  socket_mode:
+    enabled: true
+  event_subscriptions:
+    user_events:
+      - message.channels
+      - message.groups
+      - message.im
+      - message.mpim
+  org_deploy_enabled: false
+  is_hosted: false
+  token_management_enabled: false
