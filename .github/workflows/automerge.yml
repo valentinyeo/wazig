@@ -1,0 +1,43 @@
+# Merge green, low-risk agent PRs by itself so they don't pile up in AI Review.
+# Runs only from the default-branch copy (workflow_run / schedule / dispatch), never
+# from a PR's own copy. Skips: drafts, `hold` label, edits to this file, red or
+# missing `ci`, merge conflicts. Size and workflow edits are not gates: rollback is
+# the safety net, a person is never the default blocker.
+name: automerge
+on:
+  workflow_run:
+    workflows: ["ci"]
+    types: [completed]
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+concurrency:
+  group: automerge
+  cancel-in-progress: false
+permissions:
+  contents: write
+  pull-requests: write
+  checks: read
+jobs:
+  automerge:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Merge green low-risk PRs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -uo pipefail
+          for pr in $(gh pr list -R "$REPO" --state open --json number -q '.[].number'); do
+            info=$(gh pr view "$pr" -R "$REPO" --json isDraft,labels,additions,deletions,files,mergeable,statusCheckRollup)
+            reason=$(echo "$info" | jq -r '
+              if .isDraft then "draft"
+              elif ([.labels[].name] | index("hold")) then "hold label"
+              elif ([.files[].path] | index(".github/workflows/automerge.yml")) then "edits automerge itself"
+              elif .mergeable != "MERGEABLE" then "not mergeable (\(.mergeable))"
+              elif ([.statusCheckRollup[] | select(.name == "ci" and .conclusion == "SUCCESS")] | length) == 0 then "ci not green"
+              else "" end')
+            if [ -n "$reason" ]; then echo "#$pr: skip ($reason)"; continue; fi
+            if gh pr merge "$pr" -R "$REPO" --squash --delete-branch; then echo "#$pr: merged"; else echo "#$pr: merge failed"; fi
+          done
