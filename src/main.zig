@@ -2991,7 +2991,9 @@ fn reactToSelected(a: *App, command: u16) void {
     job.msg_id.set(message.id.slice());
     job.extra.set(emoji);
     wacliJobArgs(&job, args[0..count]);
-    wacliEnqueue(a, job, true);
+    // FIFO, not urgent: two quick reactions (add then remove) must reach the
+    // server in the order the user made them.
+    wacliEnqueue(a, job, false);
 }
 
 fn applyReaction(a: *App, result: *WacliResult) void {
