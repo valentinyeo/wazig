@@ -57,8 +57,15 @@ jobs:
         shell: pwsh
         run: |
           $msi = (Get-ChildItem Messages-*.msi).FullName
-          Start-Process msiexec -ArgumentList "/i", "`"$msi`"", "/qn", "/norestart" -Wait -PassThru |
-            ForEach-Object { if ($_.ExitCode -ne 0) { throw "msiexec install failed: $($_.ExitCode)" } }
+          # Call msiexec directly: Start-Process -PassThru uses ShellExecute and
+          # leaves ExitCode null on Windows PowerShell 5.1, so the exit status
+          # was unreadable. /L*V keeps a full log to diagnose any real failure.
+          & msiexec /i $msi /qn /norestart /L*V install.log | Out-Null
+          $code = $LASTEXITCODE
+          if ($code -ne 0) {
+            Get-Content install.log -Tail 40
+            throw "msiexec install failed: $code"
+          }
       - name: Verify install
         shell: pwsh
         run: |
@@ -71,8 +78,9 @@ jobs:
         shell: pwsh
         run: |
           $msi = (Get-ChildItem Messages-*.msi).FullName
-          Start-Process msiexec -ArgumentList "/x", "`"$msi`"", "/qn", "/norestart" -Wait -PassThru |
-            ForEach-Object { if ($_.ExitCode -ne 0) { throw "msiexec uninstall failed: $($_.ExitCode)" } }
+          & msiexec /x $msi /qn /norestart | Out-Null
+          $code = $LASTEXITCODE
+          if ($code -ne 0) { throw "msiexec uninstall failed: $code" }
           if (Test-Path "$env:LOCALAPPDATA\Programs\Messages\Messages.exe") { throw "exe left behind after uninstall" }
           if (Test-Path "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Messages.lnk") { throw "shortcut left behind after uninstall" }
 
