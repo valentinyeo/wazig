@@ -70,8 +70,10 @@ jobs:
         id: tdcache
         uses: actions/cache@v4
         with:
-          path: /tmp/tdlib-install
-          key: tdlib-${{ env.TDLIB_COMMIT }}-v1
+          path: |
+            /tmp/tdlib-install
+            /tmp/tdbuild-prefix
+          key: tdlib-${{ env.TDLIB_COMMIT }}-${{ hashFiles('.github/workflows/ci.yml') }}
 
       - name: Build TDLib
         if: steps.tdcache.outputs.cache-hit != 'true'
@@ -81,7 +83,7 @@ jobs:
           git clone --depth 1 https://github.com/madler/zlib.git /tmp/zlibsrc
           (cd /tmp/zlibsrc && CC=x86_64-w64-mingw32-gcc ./configure --static --prefix="$P" && make -j$(nproc) install)
           git clone --depth 1 --branch openssl-3.3.2 https://github.com/openssl/openssl.git /tmp/opensslsrc
-          (cd /tmp/opensslsrc && ./Configure mingw64 no-shared no-tests no-docs --prefix="$P" --cross-compile-prefix=x86_64-w64-mingw32- && make -j$(nproc) -s install_sw)
+          (cd /tmp/opensslsrc && ./Configure mingw64 no-shared no-tests no-docs --libdir=lib --prefix="$P" --cross-compile-prefix=x86_64-w64-mingw32- && make -j$(nproc) -s install_sw && cp -n "$P/lib64"/*.a "$P/lib/" 2>/dev/null || true)
           git clone https://github.com/tdlib/td.git /tmp/tdsrc
           (cd /tmp/tdsrc && git checkout "$TDLIB_COMMIT")
           cmake -S /tmp/tdsrc -B /tmp/tdsrc/build -G Ninja \
@@ -91,26 +93,26 @@ jobs:
             -DOPENSSL_ROOT_DIR="$P" \
             -DZLIB_INCLUDE_DIR="$P/include" \
             -DZLIB_LIBRARY="$P/lib/libz.a" \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
             -DCMAKE_INSTALL_PREFIX:PATH=/tmp/tdlib-install \
-            -DTD_ENABLE_JNI=OFF
-          cmake --build /tmp/tdsrc/build --target tdjson_static install
+            -DTD_ENABLE_JNI=OFF \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON
+          cmake --build /tmp/tdsrc/build --target tdjson_static install -j$(nproc)
 
-      - name: Build with Telegram
-        env:
-          TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
-          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+      # Placeholder credentials: this artifact exists for the Windows smoke
+      # test only, and workflow artifacts are readable by anyone with repo
+      # access, so the real API credentials are compiled in exclusively by
+      # release.yml.
+      - name: Build with Telegram (placeholder credentials)
         run: |
-          if [ -z "$TELEGRAM_API_ID" ]; then
-            echo "::warning::TELEGRAM_API_ID secret missing: Telegram login is disabled in this build"
-          fi
           zig build -Dtarget=x86_64-windows-gnu --release=small \
             -Dtdlib=/tmp/tdlib-install \
-            -Dtelegram-api-id="${TELEGRAM_API_ID:-1}" \
-            -Dtelegram-api-hash="${TELEGRAM_API_HASH:-smoke}"
+            -Dtelegram-api-id=1 \
+            -Dtelegram-api-hash=smoke-placeholder
 
       - name: Exe size report
         run: |
-          du -h zig-out/bin/Messages.exe || du -h zig-out/bin/messages.exe
+          du -h zig-out/bin/Messages.exe
 
       - name: Upload Telegram build artifact
         uses: actions/upload-artifact@v4

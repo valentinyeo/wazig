@@ -29,14 +29,16 @@ const max_tracked_chats = 128;
 
 pub const Client = struct {
     allocator: std.mem.Allocator,
-    client: *anyopaque,
+    io: std.Io,
+    client: ?*anyopaque = null,
     thread: ?std.Thread = null,
-    queue_mutex: std.Thread.Mutex = .{},
+    queue_mutex: std.Io.Mutex = .init,
     queue: std.ArrayList(Event) = .empty,
     dropped_events: u64 = 0,
-    state_mutex: std.Thread.Mutex = .{},
-    chats: std.AutoHashMap(i64, ChatInfo) = .empty,
-    history: std.AutoHashMap(i64, std.ArrayList(Msg)) = .empty,
+    state_mutex: std.Io.Mutex = .init,
+    chats: std.AutoHashMap(i64, ChatInfo),
+    history: std.AutoHashMap(i64, std.ArrayList(Msg)),
+    users: std.AutoHashMap(i64, []u8),
     auth: AuthState = .unknown,
     api_id: i32,
     api_hash: []u8,
@@ -45,33 +47,31 @@ pub const Client = struct {
     stopping: std.atomic.Value(bool) = .init(false),
     parameters_sent: bool = false,
 
-    pub fn create(allocator: std.mem.Allocator, api_id: i32, api_hash: []const u8, base_dir: []const u8) ?*Client {
+    pub fn create(allocator: std.mem.Allocator, io: std.Io, api_id: i32, api_hash: []const u8, base_dir: []const u8) ?*Client {
         const self = allocator.create(Client) catch return null;
+        errdefer allocator.destroy(self);
         self.* = .{
             .allocator = allocator,
-            .client = undefined,
+            .io = io,
             .api_id = api_id,
-            .api_hash = allocator.dupe(u8, api_hash) catch {
-                allocator.destroy(self);
-                return null;
-            },
-            .database_dir = std.fmt.allocPrint(allocator, "{s}\\td", .{base_dir}) catch {
-                allocator.free(api_hash);
-                allocator.destroy(self);
-                return null;
-            },
-            .files_dir = std.fmt.allocPrint(allocator, "{s}\\files", .{base_dir}) catch {
-                allocator.destroy(self);
-                return null;
-            },
+            .api_hash = undefined,
+            .database_dir = undefined,
+            .files_dir = undefined,
+            .chats = std.AutoHashMap(i64, ChatInfo).init(allocator),
+            .history = std.AutoHashMap(i64, std.ArrayList(Msg)).init(allocator),
+            .users = std.AutoHashMap(i64, []u8).init(allocator),
         };
-        std.fs.cwd().makePath(self.database_dir) catch {};
-        std.fs.cwd().makePath(self.files_dir) catch {};
-        const raw = c.td_json_client_create() orelse {
-            self.destroy();
-            return null;
-        };
-        self.client = raw;
+        self.api_hash = allocator.dupe(u8, api_hash) catch return null;
+        errdefer allocator.free(self.api_hash);
+        self.database_dir = std.fmt.allocPrint(allocator, "{s}\\td", .{base_dir}) catch return null;
+        errdefer allocator.free(self.database_dir);
+        self.files_dir = std.fmt.allocPrint(allocator, "{s}\\files", .{base_dir}) catch return null;
+        errdefer allocator.free(self.files_dir);
+        ensureDirectory(self.allocator, self.database_dir);
+        ensureDirectory(self.allocator, self.files_dir);
+        self.client = c.td_json_client_create() orelse return null;
+        // ponytail: a failed thread spawn leaves TDLib running without a
+        // receive pump; upgrade path: retry the spawn or fail create().
         self.thread = std.Thread.spawn(.{}, receiveLoop, .{self}) catch null;
         return self;
     }
@@ -83,13 +83,16 @@ pub const Client = struct {
         self.queue.deinit(self.allocator);
         var chat_iterator = self.chats.iterator();
         while (chat_iterator.next()) |entry| entry.value_ptr.deinit(self.allocator);
-        self.chats.deinit(self.allocator);
+        self.chats.deinit();
+        var user_iterator = self.users.iterator();
+        while (user_iterator.next()) |entry| self.allocator.free(entry.value_ptr.*);
+        self.users.deinit();
         var history_iterator = self.history.iterator();
         while (history_iterator.next()) |entry| {
             for (entry.value_ptr.items) |*msg| msg.deinit(self.allocator);
             entry.value_ptr.deinit(self.allocator);
         }
-        self.history.deinit(self.allocator);
+        self.history.deinit();
         self.allocator.free(self.api_hash);
         self.allocator.free(self.database_dir);
         self.allocator.free(self.files_dir);
@@ -99,107 +102,117 @@ pub const Client = struct {
     /// Returns one queued event, or null. The caller owns the event and must
     /// call event.deinit(allocator).
     pub fn poll(self: *Client) ?Event {
-        self.queue_mutex.lock();
-        defer self.queue_mutex.unlock();
+        self.queue_mutex.lockUncancelable(self.io);
+        defer self.queue_mutex.unlock(self.io);
         if (self.queue.items.len == 0) return null;
         const event = self.queue.orderedRemove(0);
         return event;
     }
 
     pub fn authState(self: *Client) AuthState {
-        self.state_mutex.lock();
-        defer self.state_mutex.unlock();
+        self.state_mutex.lockUncancelable(self.io);
+        defer self.state_mutex.unlock(self.io);
         return self.auth;
     }
 
     pub fn authPhone(self: *Client, phone: []const u8) void {
-        self.sendObject(.{ .type = "setAuthenticationPhoneNumber", .phone_number = phone, .allow_flash_call = false, .is_current_phone_number = true });
+        self.sendFields(.{ .type = "setAuthenticationPhoneNumber", .phone_number = phone, .allow_flash_call = false, .is_current_phone_number = true });
     }
 
     pub fn authCode(self: *Client, code: []const u8) void {
-        self.sendObject(.{ .type = "checkAuthenticationCode", .code = code });
+        self.sendFields(.{ .type = "checkAuthenticationCode", .code = code });
     }
 
     pub fn authPassword(self: *Client, password: []const u8) void {
-        self.sendObject(.{ .type = "checkAuthenticationPassword", .password = password });
+        self.sendFields(.{ .type = "checkAuthenticationPassword", .password = password });
     }
 
     pub fn requestChats(self: *Client) void {
-        self.sendObject(.{ .type = "getChats", .limit = 100 });
+        self.sendFields(.{ .type = "getChats", .limit = 100 });
     }
 
     pub fn requestHistory(self: *Client, chat_id: i64) void {
-        self.sendObject(.{ .type = "getChatHistory", .chat_id = chat_id, .limit = max_history_per_chat });
+        self.sendFields(.{ .type = "getChatHistory", .chat_id = chat_id, .limit = max_history_per_chat });
     }
 
     pub fn sendText(self: *Client, chat_id: i64, text: []const u8) bool {
         // Read-only guard for Telegram groups: the UI disables the composer,
         // but every send path funnels through here as the second gate.
-        self.state_mutex.lock();
+        self.state_mutex.lockUncancelable(self.io);
         const info = self.chats.get(chat_id);
-        self.state_mutex.unlock();
+        self.state_mutex.unlock(self.io);
         if (info) |chat| {
             if (chat.is_group or chat.is_channel) return false;
         }
-        var content = std.json.ObjectMap.init(self.allocator);
-        defer content.deinit();
-        content.put("@type", .{ .string = "inputMessageText" }) catch return false;
-        var formatted = std.json.ObjectMap.init(self.allocator);
-        defer formatted.deinit();
-        formatted.put("@type", .{ .string = "formattedText" }) catch return false;
-        formatted.put("text", .{ .string = text }) catch return false;
-        content.put("text", .{ .object = formatted }) catch return false;
-        var request = std.json.ObjectMap.init(self.allocator);
-        defer request.deinit();
-        request.put("@type", .{ .string = "sendMessage" }) catch return false;
-        request.put("chat_id", .{ .integer = chat_id }) catch return false;
-        request.put("input_message_content", .{ .object = content }) catch return false;
-        self.sendJson(.{ .object = request });
+        var allocating = std.Io.Writer.Allocating.init(self.allocator);
+        defer allocating.deinit();
+        var json = std.json.Stringify{ .writer = &allocating.writer };
+        json.beginObject() catch return false;
+        json.objectField("@type") catch return false;
+        json.write("sendMessage") catch return false;
+        json.objectField("chat_id") catch return false;
+        json.write(chat_id) catch return false;
+        json.objectField("input_message_content") catch return false;
+        json.beginObject() catch return false;
+        json.objectField("@type") catch return false;
+        json.write("inputMessageText") catch return false;
+        json.objectField("text") catch return false;
+        json.beginObject() catch return false;
+        json.objectField("@type") catch return false;
+        json.write("formattedText") catch return false;
+        json.objectField("text") catch return false;
+        json.write(text) catch return false;
+        json.endObject() catch return false;
+        json.endObject() catch return false;
+        json.endObject() catch return false;
+        self.sendAllocated(&allocating);
         return true;
     }
 
     pub fn markRead(self: *Client, chat_id: i64, message_id: i64) void {
-        var ids = std.json.Array.init(self.allocator);
-        defer ids.deinit();
-        ids.append(.{ .integer = message_id }) catch return;
-        var request = std.json.ObjectMap.init(self.allocator);
-        defer request.deinit();
-        request.put("@type", .{ .string = "viewMessages" }) catch return;
-        request.put("chat_id", .{ .integer = chat_id }) catch return;
-        request.put("message_ids", .{ .array = ids }) catch return;
-        request.put("force_read", .{ .bool = true }) catch return;
-        self.sendJson(.{ .object = request });
+        var allocating = std.Io.Writer.Allocating.init(self.allocator);
+        defer allocating.deinit();
+        var json = std.json.Stringify{ .writer = &allocating.writer };
+        json.beginObject() catch return;
+        json.objectField("@type") catch return;
+        json.write("viewMessages") catch return;
+        json.objectField("chat_id") catch return;
+        json.write(chat_id) catch return;
+        json.objectField("message_ids") catch return;
+        json.beginArray() catch return;
+        json.write(message_id) catch return;
+        json.endArray() catch return;
+        json.objectField("force_read") catch return;
+        json.write(true) catch return;
+        json.endObject() catch return;
+        self.sendAllocated(&allocating);
     }
 
     pub fn download(self: *Client, file_id: i32) void {
         if (file_id == 0) return;
-        self.sendObject(.{ .type = "downloadFile", .file_id = file_id, .priority = 32, .offset = 0, .limit = 0, .synchronous = false });
+        self.sendFields(.{ .type = "downloadFile", .file_id = file_id, .priority = 32, .offset = 0, .limit = 0, .synchronous = false });
     }
 
     pub fn logOut(self: *Client) void {
-        self.sendObject(.{ .type = "logOut" });
+        self.sendFields(.{ .type = "logOut" });
     }
 
     /// Owned copies of the tracked chats. Caller frees with freeChatSnapshot.
     pub fn chatSnapshot(self: *Client, allocator: std.mem.Allocator) []ChatInfo {
-        self.state_mutex.lock();
-        defer self.state_mutex.unlock();
+        self.state_mutex.lockUncancelable(self.io);
+        defer self.state_mutex.unlock(self.io);
         var list = std.ArrayList(ChatInfo).empty;
-        var iterator = self.chats.iterator();
-        while (iterator.next()) |entry| {
-            const copy = entry.value_ptr.*;
-            var info = copy;
-            info.title = allocator.dupe(u8, entry.value_ptr.title) catch continue;
-            list.append(allocator, info) catch {
-                allocator.free(info.title);
-                continue;
-            };
-        }
-        return list.toOwnedSlice(allocator) catch {
+        errdefer {
             for (list.items) |*item| item.deinit(allocator);
             list.deinit(allocator);
-            return &.{};
-        };
+        }
+        var iterator = self.chats.iterator();
+        while (iterator.next()) |entry| {
+            const info = entry.value_ptr.*;
+            list.append(allocator, info) catch return &.{};
+            list.items[list.items.len - 1].title = allocator.dupe(u8, entry.value_ptr.title) catch return &.{};
+        }
+        return list.toOwnedSlice(allocator) catch return &.{};
     }
 
     pub fn freeChatSnapshot(self: *Client, allocator: std.mem.Allocator, snapshot: []ChatInfo) void {
@@ -211,27 +224,23 @@ pub const Client = struct {
     /// Owned copies of the cached history for one chat, oldest first.
     /// Caller frees with freeHistorySnapshot.
     pub fn historySnapshot(self: *Client, allocator: std.mem.Allocator, chat_id: i64) []Msg {
-        self.state_mutex.lock();
-        defer self.state_mutex.unlock();
+        self.state_mutex.lockUncancelable(self.io);
+        defer self.state_mutex.unlock(self.io);
         const stored = self.history.getPtr(chat_id) orelse return &.{};
         var list = std.ArrayList(Msg).empty;
-        for (stored.items) |*msg| {
-            var copy = msg.*;
-            copy.sender_name = allocator.dupe(u8, msg.sender_name) catch continue;
-            copy.text = allocator.dupe(u8, msg.text) catch continue;
-            copy.timestamp = allocator.dupe(u8, msg.timestamp) catch continue;
-            copy.local_path = allocator.dupe(u8, msg.local_path) catch continue;
-            copy.mime = allocator.dupe(u8, msg.mime) catch continue;
-            list.append(allocator, copy) catch {
-                copy.deinit(allocator);
-                continue;
-            };
-        }
-        return list.toOwnedSlice(allocator) catch {
+        errdefer {
             for (list.items) |*item| item.deinit(allocator);
             list.deinit(allocator);
-            return &.{};
-        };
+        }
+        for (stored.items) |*msg| {
+            const copy = self.dupeMessage(msg) orelse return &.{};
+            list.append(allocator, copy) catch {
+                var dropped = copy;
+                dropped.deinit(allocator);
+                return &.{};
+            };
+        }
+        return list.toOwnedSlice(allocator) catch return &.{};
     }
 
     pub fn freeHistorySnapshot(self: *Client, allocator: std.mem.Allocator, snapshot: []Msg) void {
@@ -241,27 +250,25 @@ pub const Client = struct {
     }
 
     fn sendFields(self: *Client, fields: anytype) void {
-        var object = std.json.ObjectMap.init(self.allocator);
-        defer object.deinit();
+        var allocating = std.Io.Writer.Allocating.init(self.allocator);
+        defer allocating.deinit();
+        var json = std.json.Stringify{ .writer = &allocating.writer };
+        json.beginObject() catch return;
         inline for (std.meta.fields(@TypeOf(fields))) |field| {
-            const value = @field(fields, field.name);
-            const key = comptime mapKey(field.name);
-            switch (@TypeOf(value)) {
-                []const u8, []u8 => object.put(key, .{ .string = value }) catch return,
-                i32, i64, u32 => object.put(key, .{ .integer = value }) catch return,
-                bool => object.put(key, .{ .bool = value }) catch return,
-                else => @compileError("unsupported request field type"),
-            }
+            json.objectField(comptime mapKey(field.name)) catch return;
+            json.write(@field(fields, field.name)) catch return;
         }
-        self.sendJson(.{ .object = object });
+        json.endObject() catch return;
+        self.sendAllocated(&allocating);
     }
 
-    fn sendJson(self: *Client, value: std.json.Value) void {
-        const text = std.json.Stringify.valueAlloc(self.allocator, value, .{}) catch return;
+    fn sendAllocated(self: *Client, allocating: *std.Io.Writer.Allocating) void {
+        const text = allocating.toOwnedSlice() catch return;
         defer self.allocator.free(text);
         const zero_terminated = self.allocator.dupeZ(u8, text) catch return;
         defer self.allocator.free(zero_terminated);
-        c.td_json_client_send(self.client, zero_terminated.ptr);
+        const client = self.client orelse return;
+        c.td_json_client_send(client, zero_terminated.ptr);
     }
 
     fn sendTdlibParameters(self: *Client) void {
@@ -282,20 +289,20 @@ pub const Client = struct {
     }
 
     fn sendClose(self: *Client) void {
-        if (self.client == undefined) return;
-        var object = std.json.ObjectMap.init(self.allocator);
-        defer object.deinit();
-        object.put("@type", .{ .string = "close" }) catch return;
-        self.sendJson(.{ .object = object });
+        const client = self.client orelse return;
+        const request = self.allocator.dupeZ(u8, "{\"@type\":\"close\"}") catch return;
+        defer self.allocator.free(request);
+        c.td_json_client_send(client, request.ptr);
     }
 
     fn receiveLoop(self: *Client) void {
+        const client = self.client orelse return;
         while (!self.stopping.load(.acquire)) {
-            const raw = c.td_json_client_receive(self.client, 0.5) orelse continue;
+            const raw = c.td_json_client_receive(client, 0.5) orelse continue;
             const text = std.mem.span(raw);
             self.handleRaw(text);
         }
-        c.td_json_client_destroy(self.client);
+        c.td_json_client_destroy(client);
     }
 
     fn handleRaw(self: *Client, text: []const u8) void {
@@ -304,20 +311,36 @@ pub const Client = struct {
         for (events.items) |*event| {
             switch (event.*) {
                 .auth => |auth| {
-                    self.state_mutex.lock();
+                    self.state_mutex.lockUncancelable(self.io);
                     if (auth.state != .unknown) self.auth = auth.state;
-                    self.state_mutex.unlock();
+                    self.state_mutex.unlock(self.io);
                     if (auth.state == .wait_parameters and !self.parameters_sent) self.sendTdlibParameters();
                 },
                 .chat => |*info| {
                     self.applyChat(info);
                 },
                 .message => |*msg| {
+                    self.resolveSender(msg);
                     self.storeMessage(msg);
+                },
+                .user => |named| {
+                    self.state_mutex.lockUncancelable(self.io);
+                    const entry = self.users.getOrPut(named.user_id) catch {
+                        self.state_mutex.unlock(self.io);
+                        continue;
+                    };
+                    if (entry.found_existing) self.allocator.free(entry.value_ptr.*);
+                    const user_name = self.allocator.dupe(u8, named.name) catch {
+                        _ = self.users.remove(named.user_id);
+                        self.state_mutex.unlock(self.io);
+                        continue;
+                    };
+                    entry.value_ptr.* = user_name;
+                    self.state_mutex.unlock(self.io);
                 },
                 .file => |update| {
                     if (update.local_path.len > 0) {
-                        self.state_mutex.lock();
+                        self.state_mutex.lockUncancelable(self.io);
                         var history_iterator = self.history.iterator();
                         while (history_iterator.next()) |entry| {
                             for (entry.value_ptr.items) |*msg| {
@@ -326,7 +349,7 @@ pub const Client = struct {
                                 }
                             }
                         }
-                        self.state_mutex.unlock();
+                        self.state_mutex.unlock(self.io);
                     }
                 },
                 else => {},
@@ -335,8 +358,8 @@ pub const Client = struct {
         // The events were applied to client state (which made its own copies);
         // the queue hands the same owned events to the UI thread, which frees
         // them after applying them to widgets.
-        self.queue_mutex.lock();
-        defer self.queue_mutex.unlock();
+        self.queue_mutex.lockUncancelable(self.io);
+        defer self.queue_mutex.unlock(self.io);
         for (events.items) |event| {
             if (self.queue.items.len >= max_queued_events) {
                 self.dropped_events += 1;
@@ -349,15 +372,15 @@ pub const Client = struct {
                 dropped.deinit(self.allocator);
             };
         }
-        events.items = &.{};
-        events.capacity = 0;
     }
 
     fn applyChat(self: *Client, info: *ChatInfo) void {
-        self.state_mutex.lock();
-        defer self.state_mutex.unlock();
+        self.state_mutex.lockUncancelable(self.io);
+        defer self.state_mutex.unlock(self.io);
         if (self.chats.count() >= max_tracked_chats and !self.chats.contains(info.id)) return;
+        // The map owns its own title copy; the queued event keeps the original.
         const entry = self.chats.getOrPut(info.id) catch return;
+        const stored_title = self.allocator.dupe(u8, info.title) catch return;
         if (entry.found_existing) {
             const previous = entry.value_ptr.*;
             entry.value_ptr.* = info.*;
@@ -365,18 +388,20 @@ pub const Client = struct {
             // the title and last-message date we already know.
             if (info.title.len == 0) {
                 entry.value_ptr.title = previous.title;
+                self.allocator.free(stored_title);
             } else {
                 self.allocator.free(previous.title);
             }
             if (info.last_date == 0) entry.value_ptr.last_date = previous.last_date;
         } else {
             entry.value_ptr.* = info.*;
+            entry.value_ptr.title = stored_title;
         }
     }
 
     fn storeMessage(self: *Client, msg: *Msg) void {
-        self.state_mutex.lock();
-        defer self.state_mutex.unlock();
+        self.state_mutex.lockUncancelable(self.io);
+        defer self.state_mutex.unlock(self.io);
         const pointer = self.history.getOrPut(msg.chat_id) catch return;
         if (!pointer.found_existing) pointer.value_ptr.* = .empty;
         const list = pointer.value_ptr;
@@ -394,7 +419,8 @@ pub const Client = struct {
         }
         if (self.dupeMessage(msg)) |copy| {
             list.append(self.allocator, copy) catch {
-                copy.deinit(self.allocator);
+                var dropped = copy;
+                dropped.deinit(self.allocator);
                 return;
             };
         }
@@ -403,6 +429,18 @@ pub const Client = struct {
         while (list.items.len > max_history_per_chat) {
             var oldest = list.orderedRemove(0);
             oldest.deinit(self.allocator);
+        }
+    }
+
+    fn resolveSender(self: *Client, msg: *Msg) void {
+        if (msg.sender_user_id == 0) return;
+        self.state_mutex.lockUncancelable(self.io);
+        const name = self.users.get(msg.sender_user_id);
+        self.state_mutex.unlock(self.io);
+        if (name) |name_text| {
+            const copy = self.allocator.dupe(u8, name_text) catch return;
+            if (msg.sender_name.len > 0) self.allocator.free(msg.sender_name);
+            msg.sender_name = copy;
         }
     }
 
@@ -434,6 +472,14 @@ pub const Client = struct {
         return copy;
     }
 };
+
+extern "kernel32" fn CreateDirectoryW(lp_path_name: [*:0]const u16, lp_security_attributes: ?*anyopaque) callconv(.c) c_int;
+
+fn ensureDirectory(allocator: std.mem.Allocator, path: []const u8) void {
+    const wide = std.unicode.utf8ToUtf16LeAllocZ(allocator, path) catch return;
+    defer allocator.free(wide);
+    _ = CreateDirectoryW(wide.ptr, null);
+}
 
 fn mapKey(comptime name: []const u8) []const u8 {
     if (comptime std.mem.eql(u8, name, "type")) return "@type";

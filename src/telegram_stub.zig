@@ -1,6 +1,7 @@
 //! Compile-time stand-in for telegram.zig used whenever the build was not
-//! given -Dtdlib=<dir>. Exposes the identical Client API; create() succeeds
-//! but every client reports a disabled state and no events ever arrive.
+//! given -Dtdlib=<dir>. Exposes the identical Client API; create() returns
+//! null so callers know Telegram is unavailable, and the other methods are
+//! safe no-ops.
 
 const std = @import("std");
 const tj = @import("telegram_json.zig");
@@ -13,8 +14,9 @@ pub const Msg = tj.Msg;
 pub const ChatInfo = tj.ChatInfo;
 
 pub const Client = struct {
-    pub fn create(allocator: std.mem.Allocator, api_id: i32, api_hash: []const u8, base_dir: []const u8) ?*Client {
+    pub fn create(allocator: std.mem.Allocator, io: std.Io, api_id: i32, api_hash: []const u8, base_dir: []const u8) ?*Client {
         _ = allocator;
+        _ = io;
         _ = api_id;
         _ = api_hash;
         _ = base_dir;

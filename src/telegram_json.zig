@@ -47,6 +47,7 @@ pub const Msg = struct {
     local_path: []u8 = &.{},
     mime: []u8 = &.{},
     duration_ms: i32 = 0,
+    sender_user_id: i64 = 0,
     animated_sticker: bool = false,
 
     pub fn deinit(self: *Msg, allocator: std.mem.Allocator) void {
@@ -78,6 +79,8 @@ pub const Event = union(enum) {
     file: FileUpdate,
     conn: Connection,
     chats_synced,
+    chat_last_date: struct { chat_id: i64, timestamp: []u8 },
+    user: struct { user_id: i64, name: []u8 },
     ignored,
 
     pub fn deinit(self: *Event, allocator: std.mem.Allocator) void {
@@ -86,6 +89,8 @@ pub const Event = union(enum) {
             .chat => |*chat| chat.deinit(allocator),
             .message => |*msg| msg.deinit(allocator),
             .file => |file| if (file.local_path.len > 0) allocator.free(file.local_path),
+            .chat_last_date => |update| if (update.timestamp.len > 0) allocator.free(update.timestamp),
+            .user => |user| if (user.name.len > 0) allocator.free(user.name),
             else => {},
         }
     }
@@ -102,6 +107,10 @@ fn getString(object: std.json.ObjectMap, key: []const u8) []const u8 {
         .string => |s| s,
         else => "",
     };
+}
+
+fn clampI32(value: i64) i32 {
+    return @intCast(std.math.clamp(value, std.math.minInt(i32), std.math.maxInt(i32)));
 }
 
 fn getInt(object: std.json.ObjectMap, key: []const u8) i64 {
@@ -158,32 +167,17 @@ fn parseAuthState(type_name: []const u8) AuthState {
     return map.get(type_name) orelse .unknown;
 }
 
-fn parseSenderName(object: std.json.ObjectMap) []const u8 {
-    const sender = object.get("sender_id") orelse return "";
+fn senderUserId(object: std.json.ObjectMap) i64 {
+    const sender = object.get("sender_id") orelse return 0;
     switch (sender) {
         .object => |sender_object| {
-            const sender_type = getString(sender_object, "@type");
-            if (std.mem.eql(u8, sender_type, "messageSenderUser")) {
-                const user = sender_object.get("user_id");
-                if (user) |user_value| {
-                    switch (user_value) {
-                        .integer => |id| {
-                            var buffer: [24]u8 = undefined;
-                            const text = std.fmt.bufPrint(&buffer, "user {d}", .{id}) catch return "";
-                            // Names arrive later via user updates; the id is a
-                            // safe placeholder until then.
-                            _ = text;
-                            return "user";
-                        },
-                        else => {},
-                    }
-                }
-                return "user";
+            if (std.mem.eql(u8, getString(sender_object, "@type"), "messageSenderUser")) {
+                return getInt(sender_object, "user_id");
             }
-            return "group";
         },
-        else => return "",
+        else => {},
     }
+    return 0;
 }
 
 fn fileOf(object: std.json.ObjectMap, key: []const u8) ?std.json.ObjectMap {
@@ -196,9 +190,8 @@ fn fileOf(object: std.json.ObjectMap, key: []const u8) ?std.json.ObjectMap {
 
 fn fileIdOf(object: std.json.ObjectMap, key: []const u8) i32 {
     const file = fileOf(object, key) orelse return 0;
-    const id = getInt(file, "id");
-    if (id == 0 or id > std.math.maxInt(i32)) return 0;
-    return @intCast(id);
+    const id = clampI32(getInt(file, "id"));
+    return id;
 }
 
 fn localPathOf(file: std.json.ObjectMap) []const u8 {
@@ -209,12 +202,35 @@ fn localPathOf(file: std.json.ObjectMap) []const u8 {
     }
 }
 
-fn mimeOf(object: std.json.ObjectMap) []const u8 {
-    if (fileOf(object, "voice")) |voice| return getString(voice, "mime_type");
-    if (fileOf(object, "sticker")) |sticker| return getString(sticker, "mime_type");
-    if (fileOf(object, "document")) |document| return getString(document, "mime_type");
-    if (fileOf(object, "video")) |video| return getString(video, "mime_type");
+// TDLib nests one level: messageVoiceNote.voice is a voiceNote object whose
+// own "voice" field is the file, messageSticker.sticker is a sticker object,
+// and so on. fileOf only matches objects whose @type is exactly "file".
+fn mimeOf(content: std.json.ObjectMap) []const u8 {
+    // The mime type lives on the intermediate voiceNote/sticker/video object,
+    // not on the file it wraps.
+    for ([_][]const u8{ "voice", "sticker", "video", "document" }) |key| {
+        const value = content.get(key) orelse continue;
+        switch (value) {
+            .object => |media| return getString(media, "mime_type"),
+            else => {},
+        }
+    }
     return "";
+}
+
+fn nestedOf(object: std.json.ObjectMap, key: []const u8, outer_type: []const u8, inner_key: []const u8) ?std.json.ObjectMap {
+    const outer_value = object.get(key) orelse return null;
+    switch (outer_value) {
+        .object => |outer_object| {
+            if (!std.mem.eql(u8, getString(outer_object, "@type"), outer_type)) return null;
+            const inner = outer_object.get(inner_key) orelse return null;
+            return switch (inner) {
+                .object => |inner_object| if (std.mem.eql(u8, getString(inner_object, "@type"), "file")) inner_object else null,
+                else => null,
+            };
+        },
+        else => return null,
+    }
 }
 
 fn parseContent(allocator: std.mem.Allocator, message_object: std.json.ObjectMap, msg: *Msg) void {
@@ -236,7 +252,7 @@ fn parseContent(allocator: std.mem.Allocator, message_object: std.json.ObjectMap
     }
     if (std.mem.eql(u8, content_type, "messagePhoto")) {
         msg.media_kind = .photo;
-        msg.text = dupe(allocator, getString(content, "caption"));
+        msg.text = dupe(allocator, formattedText(content, "caption"));
         // Download the largest variant: TDLib sorts sizes ascending, so the
         // last entry with a file is the biggest.
         if (content.get("photo")) |sizes| {
@@ -262,18 +278,23 @@ fn parseContent(allocator: std.mem.Allocator, message_object: std.json.ObjectMap
         msg.media_kind = .voice;
         const seconds = getInt(content, "duration");
         msg.duration_ms = @intCast(seconds * 1000);
-        msg.file_id = fileIdOf(content, "voice");
+        if (nestedOf(content, "voice", "voiceNote", "voice")) |file| {
+            msg.file_id = clampI32(getInt(file, "id"));
+        }
         return;
     }
     if (std.mem.eql(u8, content_type, "messageSticker")) {
         msg.media_kind = .sticker;
         msg.animated_sticker = getBool(content, "is_animated") or getBool(content, "is_video");
-        msg.file_id = fileIdOf(content, "sticker");
+        if (nestedOf(content, "sticker", "sticker", "sticker")) |file| msg.file_id = clampI32(getInt(file, "id"));
         return;
     }
     if (std.mem.eql(u8, content_type, "messageVideo")) {
         msg.media_kind = .video;
-        msg.file_id = fileIdOf(content, "video");
+        msg.text = dupe(allocator, formattedText(content, "caption"));
+        if (nestedOf(content, "video", "video", "video")) |file| {
+            msg.file_id = clampI32(getInt(file, "id"));
+        }
         return;
     }
     if (std.mem.eql(u8, content_type, "messageDocument")) {
@@ -282,11 +303,21 @@ fn parseContent(allocator: std.mem.Allocator, message_object: std.json.ObjectMap
             else => return,
         };
         msg.media_kind = .document;
+        if (msg.text.len == 0) msg.text = dupe(allocator, formattedText(content, "caption"));
         if (msg.text.len == 0) msg.text = dupe(allocator, getString(document, "file_name"));
         msg.file_id = fileIdOf(document, "document");
         return;
     }
     msg.media_kind = .other;
+}
+
+fn formattedText(object: std.json.ObjectMap, key: []const u8) []const u8 {
+    const value = object.get(key) orelse return "";
+    switch (value) {
+        .object => |text_object| return getString(text_object, "text"),
+        .string => |text| return text,
+        else => return "",
+    }
 }
 
 fn getBool(object: std.json.ObjectMap, key: []const u8) bool {
@@ -317,12 +348,17 @@ pub fn parseMessage(allocator: std.mem.Allocator, value: std.json.Value) !?Msg {
             else => {},
         }
     }
-    const sender_name = parseSenderName(message_object);
+    // The real display name is resolved from updateUser by the client when
+    // one arrives; messages surface "user <id>" until then.
+    const user_id = senderUserId(message_object);
     if (msg.from_me) {
         msg.sender_name = dupe(allocator, "You");
-    } else if (sender_name.len > 0) {
-        msg.sender_name = dupe(allocator, sender_name);
+    } else if (user_id != 0) {
+        var id_buffer: [24]u8 = undefined;
+        const placeholder = std.fmt.bufPrint(&id_buffer, "user {d}", .{user_id}) catch "user";
+        msg.sender_name = dupe(allocator, placeholder);
     }
+    msg.sender_user_id = user_id;
     const date = getInt(message_object, "date");
     if (date != 0) {
         var timestamp_buffer: [20]u8 = undefined;
@@ -335,7 +371,7 @@ pub fn parseMessage(allocator: std.mem.Allocator, value: std.json.Value) !?Msg {
 
 fn parseFileUpdate(allocator: std.mem.Allocator, object: std.json.ObjectMap) !Event {
     const file = object;
-    var update = FileUpdate{ .file_id = @intCast(@min(getInt(file, "id"), std.math.maxInt(i32))) };
+    var update = FileUpdate{ .file_id = clampI32(getInt(file, "id")) };
     const local = file.get("local") orelse return .ignored;
     switch (local) {
         .object => |local_object| {
@@ -366,7 +402,7 @@ fn parseChat(allocator: std.mem.Allocator, object: std.json.ObjectMap) !Event {
         },
         else => {},
     }
-    info.unread_count = @intCast(getInt(object, "unread_count"));
+    info.unread_count = clampI32(getInt(object, "unread_count"));
     if (object.get("last_message")) |last| {
         switch (last) {
             .object => |last_object| info.last_date = getInt(last_object, "date"),
@@ -395,8 +431,12 @@ pub fn parseEvent(allocator: std.mem.Allocator, json_text: []const u8) !Event {
     }
     if (std.mem.eql(u8, type_name, "error")) {
         const message = getString(object, "message");
-        const safe = if (std.mem.indexOf(u8, message, "phone") != null or
-            std.mem.indexOf(u8, message, "code") != null) "Telegram rejected the input" else message;
+        var lower_buffer: [128]u8 = undefined;
+        const lowered = lower_buffer[0..@min(message.len, lower_buffer.len)];
+        for (message[0..lowered.len], 0..) |character, index| lowered[index] = std.ascii.toLower(character);
+        const safe = if (std.mem.indexOf(u8, lowered, "phone") != null or
+            std.mem.indexOf(u8, lowered, "code") != null or
+            std.mem.indexOf(u8, lowered, "password") != null) "Telegram rejected the input" else message;
         return .{ .auth = .{ .state = .unknown, .error_text = dupe(allocator, safe) } };
     }
     if (std.mem.eql(u8, type_name, "updateAuthorizationState")) {
@@ -422,6 +462,22 @@ pub fn parseEvent(allocator: std.mem.Allocator, json_text: []const u8) !Event {
         };
         switch (chat_value) {
             .object => |chat_object| return parseChat(allocator, chat_object),
+            else => return .ignored,
+        }
+    }
+    if (std.mem.eql(u8, type_name, "updateUser")) {
+        const user_value = object.get("user") orelse return .ignored;
+        switch (user_value) {
+            .object => |user_object| {
+                const user_id = getId(user_object, "id");
+                if (user_id == 0) return .ignored;
+                const first = getString(user_object, "first_name");
+                const last = getString(user_object, "last_name");
+                var name_buffer: [256]u8 = undefined;
+                const name = std.fmt.bufPrint(&name_buffer, "{s}{s}{s}", .{ first, if (last.len > 0 and first.len > 0) " " else "", last }) catch return .ignored;
+                if (name.len == 0) return .ignored;
+                return .{ .user = .{ .user_id = user_id, .name = dupe(allocator, name) } };
+            },
             else => return .ignored,
         }
     }
@@ -545,7 +601,7 @@ test "parses text message with timestamp" {
 
 test "parses voice note with file id and duration" {
     const event = try parseEvent(std.testing.allocator,
-        \\{"@type":"updateNewMessage","message":{"@type":"message","id":9,"chat_id":5,"date":1767139200,"content":{"@type":"messageVoiceNote","duration":12,"voice":{"@type":"file","id":777,"mime_type":"audio/ogg","local":{"@type":"localFile","path":""}}}}}
+        \\{"@type":"updateNewMessage","message":{"@type":"message","id":9,"chat_id":5,"date":1767139200,"content":{"@type":"messageVoiceNote","duration":12,"voice":{"@type":"voiceNote","duration":12,"mime_type":"audio/ogg","voice":{"@type":"file","id":777,"local":{"@type":"localFile","path":""}}}}}}
     );
     var moved = event;
     defer moved.deinit(std.testing.allocator);
@@ -575,8 +631,20 @@ test "formats timestamps" {
     try std.testing.expectEqualStrings("2026-09-06 13:34:39", formatTimestamp(&buffer, 1788701679));
 }
 
+test "parses photo caption and largest size" {
+    const event = try parseEvent(std.testing.allocator,
+        \\{"@type":"updateNewMessage","message":{"@type":"message","id":11,"chat_id":5,"date":1767139200,"content":{"@type":"messagePhoto","caption":{"@type":"formattedText","text":"look at this"},"photo":[{"@type":"photoSize","photo":{"@type":"file","id":50}},{"@type":"photoSize","photo":{"@type":"file","id":51}}]}}}
+    );
+    var moved = event;
+    defer moved.deinit(std.testing.allocator);
+    const msg = event.message;
+    try std.testing.expectEqual(MediaKind.photo, msg.media_kind);
+    try std.testing.expectEqualStrings("look at this", msg.text);
+    try std.testing.expectEqual(@as(i32, 51), msg.file_id);
+}
+
 test "error messages are sanitized" {
-    const event = try parseEvent(std.testing.allocator, "{\"@type\":\"error\",\"code\":400,\"message\":\"PHONE_CODE_INVALID: the code you entered\"}");
+    const event = try parseEvent(std.testing.allocator, "{\"@type\":\"error\",\"code\":400,\"message\":\"PHONE_CODE_INVALID\"}");
     var moved = event;
     defer moved.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("Telegram rejected the input", event.auth.error_text);

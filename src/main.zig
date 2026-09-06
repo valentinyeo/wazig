@@ -998,6 +998,17 @@ fn drainTelegram(a: *App) void {
                 a.tg_dirty = true;
                 client.requestChats();
             },
+            .chat_last_date => |last_message| {
+                var index: usize = 0;
+                while (index < a.tg_chat_count) : (index += 1) {
+                    if (a.tg_chats[index].id == last_message.chat_id) {
+                        a.tg_chats[index].timestamp.set(last_message.timestamp);
+                        a.tg_dirty = true;
+                        break;
+                    }
+                }
+            },
+            .user => {},
             .conn, .ignored => {},
         }
     }
@@ -1133,10 +1144,10 @@ fn handleTgLoginInput(a: *App) void {
     setStatus(a, "Telegram: checking with Telegram...");
 }
 
-fn tdlibSmoke() u8 {
+fn tdlibSmoke(io: std.Io) u8 {
     // Headless init check for CI: create the client, expect the first
     // authorization state within 20 seconds, then exit. No GUI, no login.
-    const client = tg.Client.create(std.heap.page_allocator, 1, "smoke", "tdlib-smoke") orelse return 1;
+    const client = tg.Client.create(std.heap.page_allocator, io, 1, "smoke", "tdlib-smoke") orelse return 1;
     defer client.destroy();
     var waited_ms: u32 = 0;
     while (waited_ms < 20_000) {
@@ -1145,7 +1156,7 @@ fn tdlibSmoke() u8 {
             defer event.deinit(std.heap.page_allocator);
             if (event == .auth) return 0;
         }
-        std.Thread.sleep(100 * std.time.ns_per_ms);
+        io.sleep(std.Io.Duration.fromMilliseconds(100), .awake) catch return 1;
         waited_ms += 100;
     }
     return 1;
@@ -5259,7 +5270,7 @@ pub fn main(init: std.process.Init) !void {
     while (argument_iterator.next()) |argument| {
         if (std.mem.eql(u8, argument, "--tdlib-smoke")) {
             if (!tg.enabled) std.process.exit(2);
-            std.process.exit(tdlibSmoke());
+            std.process.exit(tdlibSmoke(init.io));
         }
     }
     const instance = win.GetModuleHandleW(null) orelse return error.NoModuleHandle;
@@ -5286,7 +5297,7 @@ pub fn main(init: std.process.Init) !void {
     var app = App{ .allocator = init.gpa, .io = init.io, .instance = instance, .wacli_path = wacli_path, .avatar_dir = avatar_dir, .deepgram_configured = deepgram_key.len > 0, .deepgram_key = deepgram_key, .openrouter_key = openrouter_key, .openrouter_model = openrouter_model, .openrouter_configured = openrouter_key.len > 0, .dictation_language = loadDictationLanguage(), .font_scale = loadFontScale() };
     if (init.environ_map.get("LOCALAPPDATA")) |local| {
         if (std.fs.path.join(init.gpa, &.{ local, "Messages", "telegram" })) |telegram_dir| {
-            if (tg.Client.create(init.gpa, build_info.telegram_api_id, build_info.telegram_api_hash, telegram_dir)) |client| {
+            if (tg.Client.create(init.gpa, init.io, build_info.telegram_api_id, build_info.telegram_api_hash, telegram_dir)) |client| {
                 app.telegram = client;
             }
         } else |_| {}

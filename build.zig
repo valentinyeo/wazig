@@ -60,7 +60,7 @@ pub fn build(b: *std.Build) void {
     const telegram_api_hash = b.option([]const u8, "telegram-api-hash", "Telegram application api_hash (build-time, from CI secret)") orelse "";
     build_info.addOption(i32, "telegram_api_id", telegram_api_id);
     build_info.addOption([]const u8, "telegram_api_hash", telegram_api_hash);
-    if (td_enabled and telegram_api_id == 0 and (optimize == .ReleaseSmall or optimize == .ReleaseFast or optimize == .ReleaseSafe)) {
+    if (td_enabled and (telegram_api_id == 0 or telegram_api_hash.len == 0) and (optimize == .ReleaseSmall or optimize == .ReleaseFast or optimize == .ReleaseSafe)) {
         // A release build without credentials would ship a binary where the
         // Telegram login can never succeed: fail the build instead.
         std.debug.print("error: -Dtdlib requires -Dtelegram-api-id and -Dtelegram-api-hash in release builds\n", .{});
@@ -105,18 +105,33 @@ pub fn build(b: *std.Build) void {
     if (td_enabled) {
         exe.root_module.addIncludePath(.{ .cwd_relative = tdlib_dir });
         exe.root_module.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ tdlib_dir, "include" }) });
-        exe.root_module.addObjectFile(.{ .cwd_relative = b.pathJoin(&.{ tdlib_dir, "lib", "libtdjson_static.a" }) });
-        exe.root_module.addObjectFile(.{ .cwd_relative = b.pathJoin(&.{ tdlib_dir, "lib", "libtdclient.a" }) });
-        exe.root_module.addObjectFile(.{ .cwd_relative = b.pathJoin(&.{ tdlib_dir, "lib", "libtdcore.a" }) });
-        exe.root_module.addObjectFile(.{ .cwd_relative = b.pathJoin(&.{ tdlib_dir, "lib", "libtdactor.a" }) });
-        exe.root_module.addObjectFile(.{ .cwd_relative = b.pathJoin(&.{ tdlib_dir, "lib", "libtdapi.a" }) });
-        exe.root_module.addObjectFile(.{ .cwd_relative = b.pathJoin(&.{ tdlib_dir, "lib", "libtdutils.a" }) });
-        exe.root_module.addObjectFile(.{ .cwd_relative = b.pathJoin(&.{ tdlib_dir, "lib", "libtdnet.a" }) });
-        // TDLib needs C++ runtime and the Windows socket/crypto stack.
-        exe.root_module.link_libcpp = true;
-        for ([_][]const u8{ "ws2_32", "iphlpapi", "crypt32", "bcrypt", "advapi32", "userenv", "ncrypt", "cryptbase", "secur32" }) |library| {
+        // Order matters: each archive may reference symbols in the next.
+        const td_archives = [_][]const u8{
+            "libtdjson_static.a", "libtdjson_private.a", "libtdclient.a", "libtdcore.a",
+            "libtddb.a",          "libtdmtproto.a",      "libtdnet.a",    "libtdactor.a",
+            "libtdapi.a",         "libtdutils.a",        "libtdsqlite.a", "libtde2e.a",
+            // OpenSSL (static) and zlib are copied next to the TDLib archives.
+            "libssl.a",           "libcrypto.a",         "libz.a",
+        };
+        for (td_archives) |archive| {
+            const path = b.pathJoin(&.{ tdlib_dir, "lib", archive });
+            exe.root_module.addObjectFile(.{ .cwd_relative = path });
+        }
+        // TDLib is compiled with the mingw g++, so it needs the mingw
+        // libstdc++/libgcc (win32 threads variant) rather than zig's libc++.
+        const mingw_lib_dir = b.option([]const u8, "mingw-lib-dir", "Path to the mingw win32-threads gcc lib directory") orelse "/usr/lib/gcc/x86_64-w64-mingw32/13-win32";
+        exe.root_module.addObjectFile(.{ .cwd_relative = b.pathJoin(&.{ mingw_lib_dir, "libstdc++.a" }) });
+        exe.root_module.addObjectFile(.{ .cwd_relative = b.pathJoin(&.{ mingw_lib_dir, "libgcc_eh.a" }) });
+        exe.root_module.addObjectFile(.{ .cwd_relative = b.pathJoin(&.{ mingw_lib_dir, "libgcc.a" }) });
+        exe.root_module.addObjectFile(.{ .cwd_relative = b.pathJoin(&.{ mingw_lib_dir, "libgcc_s.a" }) });
+        // TDLib also needs the Windows socket/crypto stack.
+        exe.root_module.link_libc = true;
+        for ([_][]const u8{ "ws2_32", "iphlpapi", "crypt32", "bcrypt", "advapi32", "userenv", "ncrypt", "cryptbase", "secur32", "psapi" }) |library| {
             exe.root_module.linkSystemLibrary(library, .{});
         }
+        // Shims for the dllimport _vsnprintf/_timezone symbols the mingw-built
+        // TDLib/OpenSSL archives reference.
+        exe.root_module.addCSourceFile(.{ .file = b.path("src/tdlib_mingw_shims.c"), .flags = &.{"-std=gnu11"} });
     }
     b.installArtifact(exe);
 
