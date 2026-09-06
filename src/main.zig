@@ -335,7 +335,6 @@ const App = struct {
     displayed_timestamp: Utf8Text(47) = .{},
     store_watch_path: WideText(519) = .{},
     last_store_write: u64 = 0,
-    tooltips: ?win.HWND = null,
 };
 
 var app_ptr: ?*App = null;
@@ -403,6 +402,7 @@ fn createTooltips(a: *App, hwnd: win.HWND) void {
     addTooltip(tt, a.compose, lit("Message box  Enter sends · Shift+Enter new line"));
     addTooltip(tt, a.dictate, lit("Dictate  Ctrl+D"));
     addTooltip(tt, a.send, lit("Send message  Enter"));
+    addTooltip(tt, a.emoji_btn, lit("Emoji menu"));
 }
 
 fn loadRegistryString(allocator: std.mem.Allocator, name: [*:0]const u16) ?[]const u8 {
@@ -3430,7 +3430,7 @@ fn drawCanvas(hwnd: win.HWND, a: *App) void {
             }
             text_top = y + 28;
         }
-        if (in_group and !message.from_me and message.sender.len > 0) drawSenderAvatar(hdc, a, left - 38, y + 8, message);
+        if (show_sender and in_group and !message.from_me and message.sender.len > 0) drawSenderAvatar(hdc, a, left - 38, y + 8, message);
         if (message.bitmap) |bitmap| {
             const image_left = left + @divTrunc(bubble_width - message.bitmap_width, 2);
             const image_top = text_top + 4;
@@ -3698,45 +3698,6 @@ fn canvasProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win
         },
         else => return win.DefWindowProcW(hwnd, message, wparam, lparam),
     }
-}
-
-fn addTooltip(tt: win.HWND, tool: ?win.HWND, text: [*:0]const u16) void {
-    const target = tool orelse return;
-    var info = win.TOOLINFOW{
-        .cbSize = @sizeOf(win.TOOLINFOW),
-        .uFlags = win.TTF_IDISHWND | win.TTF_SUBCLASS,
-        .hwnd = win.GetParent(target),
-        .uId = @intFromPtr(target),
-        .lpszText = @constCast(text),
-    };
-    _ = win.SendMessageW(tt, win.TTM_ADDTOOLW, 0, @as(win.LPARAM, @bitCast(@intFromPtr(&info))));
-}
-
-fn createTooltips(a: *App, hwnd: win.HWND) void {
-    const tt = win.CreateWindowExW(
-        win.WS_EX_TOPMOST,
-        lit("tooltips_class32"),
-        null,
-        win.WS_POPUP | win.TTS_NOPREFIX,
-        0,
-        0,
-        0,
-        0,
-        hwnd,
-        null,
-        a.instance,
-        null,
-    ) orelse return;
-    a.tooltips = tt;
-    // TTM_SETMAXWIDTH (WM_USER + 24); not exposed by the commctrl.h import
-    _ = win.SendMessageW(tt, 0x400 + 24, 0, 260);
-    addTooltip(tt, a.search, lit("Search chats  Ctrl+F or /"));
-    addTooltip(tt, a.chats_hwnd, lit("Chats  ↑/↓ move · Enter to compose"));
-    addTooltip(tt, a.canvas, lit("Messages  Alt+J/K select · Ctrl+T transcript · Ctrl+P play voice"));
-    addTooltip(tt, a.compose, lit("Message box  Enter sends · Shift+Enter new line"));
-    addTooltip(tt, a.dictate, lit("Dictate  Ctrl+D"));
-    addTooltip(tt, a.send, lit("Send message  Enter"));
-    addTooltip(tt, a.emoji_btn, lit("Emoji menu"));
 }
 
 fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.LPARAM) callconv(.winapi) win.LRESULT {
