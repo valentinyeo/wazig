@@ -269,7 +269,7 @@ test pickAsset {
         \\}
     ;
     var parsed7: std.json.Parsed(std.json.Value) = undefined;
-try std.testing.expectEqual(@as(?Asset, null), try pickAsset(std.testing.allocator, two_assets, &parsed7));
+    try std.testing.expectEqual(@as(?Asset, null), try pickAsset(std.testing.allocator, two_assets, &parsed7));
     parsed7.deinit();
 }
 
