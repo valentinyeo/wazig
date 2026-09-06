@@ -1352,28 +1352,48 @@ fn avatarBusy(a: *const App) bool {
 }
 
 fn checkAvatarDownload(a: *App) void {
-    const session = a.avatar_session orelse return;
+    const session = a.avatar_session orelse {
+        requestNextAvatar(a);
+        return;
+    };
     const state = session.state();
-    if (state == .idle or state == .working) return;
-    if (a.avatar_active_index) |index| {
-        if (index < a.avatar_count) {
-            const entry = &a.avatars[index];
-            if (state == .ready) {
-                entry.bitmap = loadAvatarBitmap(a, entry.path.ptr());
-                entry.status = if (entry.bitmap != null) .ready else .unavailable;
-            } else entry.status = .unavailable;
+    if (state == .working) return;
+    if (state != .idle) {
+        if (a.avatar_active_index) |index| {
+            if (index < a.avatar_count) {
+                const entry = &a.avatars[index];
+                if (state == .ready) {
+                    entry.bitmap = loadAvatarBitmap(a, entry.path.ptr());
+                    entry.status = if (entry.bitmap != null) .ready else .unavailable;
+                } else entry.status = .unavailable;
+            }
         }
+        a.avatar_active_index = null;
+        session.reset();
+        startSync(a);
+        if (a.chats_hwnd) |list| _ = win.InvalidateRect(list, null, win.FALSE);
     }
-    a.avatar_active_index = null;
-    session.reset();
-    startSync(a);
-    if (a.chats_hwnd) |list| _ = win.InvalidateRect(list, null, win.FALSE);
+    requestNextAvatar(a);
 }
 
-fn requestSelectedAvatar(a: *App) void {
+// Fetch missing chat icons in list order, one per sync pause, so chats the
+// user never opened still get their picture (fetched once, cached on disk).
+// ponytail: a failed or picture-less chat is terminal until the app restarts
+// (status .unavailable), and there is no TTL refresh of cached icons;
+// upgrade path: retry counter with backoff plus a weekly file-age check.
+fn requestNextAvatar(a: *App) void {
+    for (a.chats[0..a.chat_count], 0..) |*chat, index| {
+        const entry = avatarForChat(a, chat.jid.slice()) orelse continue;
+        if (entry.status != .unknown or entry.path.len == 0) continue;
+        requestAvatar(a, index);
+        return;
+    }
+}
+
+fn requestAvatar(a: *App, chat_index: usize) void {
     if (a.read_child != null or a.pending_read_count > 0 or a.media_child != null or a.send_child != null or a.archive_child != null or a.pending_archive_count > 0 or avatarBusy(a)) return;
-    if (a.chat_count == 0 or a.selected_chat >= a.chat_count) return;
-    const entry = avatarForChat(a, a.chats[a.selected_chat].jid.slice()) orelse return;
+    if (a.chat_count == 0 or chat_index >= a.chat_count) return;
+    const entry = avatarForChat(a, a.chats[chat_index].jid.slice()) orelse return;
     if (entry.status != .unknown or entry.path.len == 0) return;
     var index: usize = 0;
     while (index < a.avatar_count and &a.avatars[index] != entry) : (index += 1) {}
@@ -3864,7 +3884,7 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
                     }
                     retryPendingDownload(a);
                     autoDownloadNextMedia(a);
-                    requestSelectedAvatar(a);
+                    requestAvatar(a, a.selected_chat);
                 }
             } else if (wparam == timer_search) {
                 _ = win.KillTimer(hwnd, timer_search);
