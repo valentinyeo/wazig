@@ -629,6 +629,13 @@ fn wacliJobArgs(job: *WacliJob, args: []const []const u8) void {
     for (args[0..job.arg_count], 0..) |argument, index| job.args[index].set(argument);
 }
 
+fn wacliPendingGet(a: *App, kind: WacliJobKind) u32 {
+    a.wacli_mutex.lockUncancelable(a.io);
+    const value = a.wacli_pending[@intFromEnum(kind)];
+    a.wacli_mutex.unlock(a.io);
+    return value;
+}
+
 fn wacliPendingSub(a: *App, kind: WacliJobKind) void {
     a.wacli_mutex.lockUncancelable(a.io);
     if (a.wacli_pending[@intFromEnum(kind)] > 0) a.wacli_pending[@intFromEnum(kind)] -= 1;
@@ -636,6 +643,7 @@ fn wacliPendingSub(a: *App, kind: WacliJobKind) void {
 }
 
 fn wacliEnqueue(a: *App, job: WacliJob, urgent: bool) void {
+    var dropped_reaction = false;
     a.wacli_mutex.lockUncancelable(a.io);
     if (a.wacli_queue_len >= a.wacli_queue.len) {
         // Superseded refreshes are droppable; reactions are dropped only as a
@@ -649,7 +657,7 @@ fn wacliEnqueue(a: *App, job: WacliJob, urgent: bool) void {
                 break;
             }
         }
-        if (a.wacli_queue[victim].kind == .reaction) setStatus(a, "Reaction queue is full; try again");
+        dropped_reaction = a.wacli_queue[victim].kind == .reaction;
         a.wacli_pending[@intFromEnum(a.wacli_queue[victim].kind)] -= 1;
         var shift = victim;
         while (shift + 1 < a.wacli_queue_len) : (shift += 1) a.wacli_queue[shift] = a.wacli_queue[shift + 1];
@@ -666,6 +674,7 @@ fn wacliEnqueue(a: *App, job: WacliJob, urgent: bool) void {
     a.wacli_pending[@intFromEnum(job.kind)] += 1;
     a.wacli_cond.signal(a.io);
     a.wacli_mutex.unlock(a.io);
+    if (dropped_reaction) setStatus(a, "Reaction queue is full; try again");
 }
 
 fn wacliShutdown(a: *App) void {
@@ -686,7 +695,9 @@ fn wacliWorkerMain(a: *App) void {
     while (true) {
         a.wacli_mutex.lockUncancelable(a.io);
         while (a.wacli_queue_len == 0 and !a.wacli_quit) a.wacli_cond.waitUncancelable(a.io, &a.wacli_mutex);
-        if (a.wacli_queue_len == 0) {
+        // Quit discards any remaining queued jobs: the window is going away
+        // and joining behind them would hang the close.
+        if (a.wacli_quit) {
             a.wacli_mutex.unlock(a.io);
             return;
         }
@@ -849,7 +860,7 @@ fn groupName(a: *const App, jid: []const u8) ?[]const u8 {
 }
 
 fn refreshGroups(a: *App) void {
-    if (a.wacli_pending[@intFromEnum(WacliJobKind.groups)] > 0) return;
+    if (wacliPendingGet(a, .groups) > 0) return;
     var job = WacliJob{ .kind = .groups };
     wacliJobArgs(&job, &.{ a.wacli_path, "--json", "--read-only", "groups", "list", "--limit", "1000" });
     wacliEnqueue(a, job, false);
@@ -885,10 +896,9 @@ fn applyGroups(a: *App, raw: []const u8) void {
 
 fn refreshChats(a: *App) void {
     const flags: u8 = (if (a.unread_only) @as(u8, 1) else 0) | (if (a.show_archived) @as(u8, 2) else 0);
-    const chats_kind = @intFromEnum(WacliJobKind.chats);
     // Skip only while an identical job is already queued; a queued job built
     // with different archive/unread flags is superseded by an urgent re-read.
-    if (a.wacli_pending[chats_kind] > 0 and a.chats_pending_flags == flags) return;
+    if (wacliPendingGet(a, .chats) > 0 and a.chats_pending_flags == flags) return;
     var job = WacliJob{ .kind = .chats };
     wacliJobArgs(&job, &.{
         a.wacli_path,                                           "--json", "--read-only", "chats", "list", "--limit", "250",
@@ -901,7 +911,7 @@ fn refreshChats(a: *App) void {
     }
     a.chats_gen += 1;
     job.gen = a.chats_gen;
-    wacliEnqueue(a, job, a.wacli_pending[chats_kind] > 0);
+    wacliEnqueue(a, job, wacliPendingGet(a, .chats) > 0);
     a.chats_pending_flags = flags;
 }
 
@@ -2426,7 +2436,9 @@ fn applyMessageData(a: *App, raw: []const u8, final: bool) void {
     // every time background refreshes redrew the conversation.
     if (chat_changed) a.scroll_y = 0;
     a.displayed_jid.set(chat.jid.slice());
-    a.displayed_timestamp.set(chat.timestamp.slice());
+    // Only a fresh result marks the view current: a cached paint must keep
+    // the old timestamp so a later store change still triggers a real read.
+    if (final) a.displayed_timestamp.set(chat.timestamp.slice());
     if (a.canvas) |canvas| _ = win.InvalidateRect(canvas, null, win.TRUE);
     if (final) markChatRead(a);
 }
@@ -2438,7 +2450,7 @@ fn startSync(a: *App) void {
     if (a.sync_child != null or a.read_child != null or a.pending_read_count > 0 or
         a.media_child != null or a.send_child != null or a.pending_send_count > 0 or
         a.archive_child != null or a.pending_archive_count > 0 or avatarBusy(a) or
-        a.wacli_pending[@intFromEnum(WacliJobKind.reaction)] > 0) return;
+        wacliPendingGet(a, .reaction) > 0) return;
     const child = std.process.spawn(a.io, .{
         .argv = &.{ a.wacli_path, "--events", "sync", "--follow", "--max-reconnect", "0", "--stale-threshold", "1m", "--refresh-contacts", "--refresh-groups", "--download-media" },
         .stdin = .ignore,
