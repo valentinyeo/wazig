@@ -50,6 +50,23 @@ pub fn build(b: *std.Build) void {
     const build_info = b.addOptions();
     build_info.addOption([]const u8, "version", version);
 
+    // Telegram (TDLib) support: -Dtdlib=<dir> points at a directory holding
+    // include/td/... and the static tdjson_static libraries. Without it the
+    // build compiles src/telegram_stub.zig instead and Telegram stays off.
+    const tdlib_dir = b.option([]const u8, "tdlib", "Path to a built TDLib static install") orelse "";
+    const td_enabled = tdlib_dir.len > 0;
+    build_info.addOption(bool, "td_enabled", td_enabled);
+    const telegram_api_id = b.option(i32, "telegram-api-id", "Telegram application api_id (build-time, from CI secret)") orelse 0;
+    const telegram_api_hash = b.option([]const u8, "telegram-api-hash", "Telegram application api_hash (build-time, from CI secret)") orelse "";
+    build_info.addOption(i32, "telegram_api_id", telegram_api_id);
+    build_info.addOption([]const u8, "telegram_api_hash", telegram_api_hash);
+    if (td_enabled and telegram_api_id == 0 and (optimize == .ReleaseSmall or optimize == .ReleaseFast or optimize == .ReleaseSafe)) {
+        // A release build without credentials would ship a binary where the
+        // Telegram login can never succeed: fail the build instead.
+        std.debug.print("error: -Dtdlib requires -Dtelegram-api-id and -Dtelegram-api-hash in release builds\n", .{});
+        std.process.exit(1);
+    }
+
     const exe = b.addExecutable(.{
         .name = "Messages",
         .root_module = b.createModule(.{
@@ -85,6 +102,22 @@ pub fn build(b: *std.Build) void {
         exe.root_module.linkSystemLibrary(library, .{});
     }
     exe.root_module.addWin32ResourceFile(.{ .file = b.path("assets/app.rc") });
+    if (td_enabled) {
+        exe.root_module.addIncludePath(.{ .cwd_relative = tdlib_dir });
+        exe.root_module.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ tdlib_dir, "include" }) });
+        exe.root_module.addObjectFile(.{ .cwd_relative = b.pathJoin(&.{ tdlib_dir, "lib", "libtdjson_static.a" }) });
+        exe.root_module.addObjectFile(.{ .cwd_relative = b.pathJoin(&.{ tdlib_dir, "lib", "libtdclient.a" }) });
+        exe.root_module.addObjectFile(.{ .cwd_relative = b.pathJoin(&.{ tdlib_dir, "lib", "libtdcore.a" }) });
+        exe.root_module.addObjectFile(.{ .cwd_relative = b.pathJoin(&.{ tdlib_dir, "lib", "libtdactor.a" }) });
+        exe.root_module.addObjectFile(.{ .cwd_relative = b.pathJoin(&.{ tdlib_dir, "lib", "libtdapi.a" }) });
+        exe.root_module.addObjectFile(.{ .cwd_relative = b.pathJoin(&.{ tdlib_dir, "lib", "libtdutils.a" }) });
+        exe.root_module.addObjectFile(.{ .cwd_relative = b.pathJoin(&.{ tdlib_dir, "lib", "libtdnet.a" }) });
+        // TDLib needs C++ runtime and the Windows socket/crypto stack.
+        exe.root_module.link_libcpp = true;
+        for ([_][]const u8{ "ws2_32", "iphlpapi", "crypt32", "bcrypt", "advapi32", "userenv", "ncrypt", "cryptbase", "secur32" }) |library| {
+            exe.root_module.linkSystemLibrary(library, .{});
+        }
+    }
     b.installArtifact(exe);
 
     b.installFile("assets/IBMPlexSans-Regular.ttf", "bin/IBMPlexSans-Regular.ttf");
@@ -93,7 +126,7 @@ pub fn build(b: *std.Build) void {
 
     // Tests live in Windows-free modules so they run on any host.
     const test_step = b.step("test", "Run unit tests");
-    for ([_][]const u8{ "src/emoji_picker.zig", "src/played.zig", "src/update.zig", "src/avatar_mask.zig", "src/compose_layout.zig" }) |test_root| {
+    for ([_][]const u8{ "src/emoji_picker.zig", "src/played.zig", "src/update.zig", "src/avatar_mask.zig", "src/compose_layout.zig", "src/telegram_json.zig" }) |test_root| {
         const tests = b.addTest(.{
             .root_module = b.createModule(.{
                 .root_source_file = b.path(test_root),

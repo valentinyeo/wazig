@@ -44,3 +44,96 @@ jobs:
         with:
           name: Messages-windows-x86_64
           path: zig-out/bin/
+
+  # Builds TDLib for Windows once and links the Telegram-enabled binary.
+  # The install dir is cached, so the expensive C++ build runs only when the
+  # pinned TDLib commit or the script changes.
+  tdlib:
+    name: tdlib
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      TDLIB_COMMIT: d1085f9cebc5a62379991ae1652673954f229c1f
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++-mingw-w64-x86-64 gperf php-cli cmake ninja-build
+
+      - name: Restore TDLib
+        id: tdcache
+        uses: actions/cache@v4
+        with:
+          path: /tmp/tdlib-install
+          key: tdlib-${{ env.TDLIB_COMMIT }}-v1
+
+      - name: Build TDLib
+        if: steps.tdcache.outputs.cache-hit != 'true'
+        run: |
+          P=/tmp/tdbuild-prefix
+          mkdir -p "$P" /tmp/tdlib-install
+          git clone --depth 1 https://github.com/madler/zlib.git /tmp/zlibsrc
+          (cd /tmp/zlibsrc && CC=x86_64-w64-mingw32-gcc ./configure --static --prefix="$P" && make -j$(nproc) install)
+          git clone --depth 1 --branch openssl-3.3.2 https://github.com/openssl/openssl.git /tmp/opensslsrc
+          (cd /tmp/opensslsrc && ./Configure mingw64 no-shared no-tests no-docs --prefix="$P" --cross-compile-prefix=x86_64-w64-mingw32- && make -j$(nproc) -s install_sw)
+          git clone https://github.com/tdlib/td.git /tmp/tdsrc
+          (cd /tmp/tdsrc && git checkout "$TDLIB_COMMIT")
+          cmake -S /tmp/tdsrc -B /tmp/tdsrc/build -G Ninja \
+            -DCMAKE_CXX_COMPILER=x86_64-w64-mingw32-g++ \
+            -DCMAKE_C_COMPILER=x86_64-w64-mingw32-gcc \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DOPENSSL_ROOT_DIR="$P" \
+            -DZLIB_INCLUDE_DIR="$P/include" \
+            -DZLIB_LIBRARY="$P/lib/libz.a" \
+            -DCMAKE_INSTALL_PREFIX:PATH=/tmp/tdlib-install \
+            -DTD_ENABLE_JNI=OFF
+          cmake --build /tmp/tdsrc/build --target tdjson_static install
+
+      - name: Build with Telegram
+        env:
+          TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+        run: |
+          if [ -z "$TELEGRAM_API_ID" ]; then
+            echo "::warning::TELEGRAM_API_ID secret missing: Telegram login is disabled in this build"
+          fi
+          zig build -Dtarget=x86_64-windows-gnu --release=small \
+            -Dtdlib=/tmp/tdlib-install \
+            -Dtelegram-api-id="${TELEGRAM_API_ID:-1}" \
+            -Dtelegram-api-hash="${TELEGRAM_API_HASH:-smoke}"
+
+      - name: Exe size report
+        run: |
+          du -h zig-out/bin/Messages.exe || du -h zig-out/bin/messages.exe
+
+      - name: Upload Telegram build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Messages-windows-x86_64-telegram
+          path: zig-out/bin/
+
+  # Runs the Telegram-enabled exe headlessly on a real Windows machine to
+  # prove TDLib loads, opens its database and reaches the first auth state.
+  windows-smoke:
+    name: windows-smoke
+    runs-on: windows-latest
+    needs: tdlib
+    timeout-minutes: 10
+    steps:
+      - name: Download build
+        uses: actions/download-artifact@v4
+        with:
+          name: Messages-windows-x86_64-telegram
+          path: bin/
+
+      - name: Run TDLib smoke
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath "bin\Messages.exe" -ArgumentList "--tdlib-smoke" -Wait -PassThru
+          exit $p.ExitCode
