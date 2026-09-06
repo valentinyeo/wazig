@@ -1532,9 +1532,10 @@ fn clampPlayerSize(width: u32, height: u32) [2]u32 {
 fn playerCallbackQueryInterface(_: [*c]win.IMFPMediaPlayerCallback, riid: [*c]const win.GUID, ppv_object: [*c]?*anyopaque) callconv(.c) win.HRESULT {
     if (ppv_object != null and riid != null) {
         const iid_callback = win.GUID{ .Data1 = 0x766c8ffb, .Data2 = 0x5fdb, .Data3 = 0x4fea, .Data4 = .{ 0xa2, 0x8d, 0xb9, 0x12, 0x99, 0x6f, 0x51, 0xbd } };
+        const iid_unknown = win.GUID{ .Data1 = 0, .Data2 = 0, .Data3 = 0, .Data4 = .{ 0xc0, 0, 0, 0, 0, 0, 0, 0x46 } };
         const g = riid.*;
-        const is_unknown = g.Data1 == 0 and g.Data2 == 0 and g.Data3 == 0 and g.Data4[0] == 0 and g.Data4[1] == 0 and g.Data4[2] == 0 and g.Data4[3] == 0xc0 and g.Data4[4] == 0 and g.Data4[5] == 0 and g.Data4[6] == 0 and g.Data4[7] == 0x46;
-        const is_callback = g.Data1 == iid_callback.Data1 and g.Data2 == iid_callback.Data2 and g.Data3 == iid_callback.Data3 and std.mem.eql(u8, &g.Data4, &iid_callback.Data4);
+        const is_unknown = std.meta.eql(g, iid_unknown);
+        const is_callback = std.meta.eql(g, iid_callback);
         if (is_unknown or is_callback) {
             ppv_object.* = @ptrCast(&player_callback);
             _ = playerCallbackAddRef(&player_callback);
@@ -1558,8 +1559,11 @@ fn playerCallbackRelease(_: [*c]win.IMFPMediaPlayerCallback) callconv(.c) win.UL
 fn playerCallbackEvent(_: [*c]win.IMFPMediaPlayerCallback, event: [*c]win.MFP_EVENT_HEADER) callconv(.c) void {
     if (event == null) return;
     if (event.*.eEventType == win.MFP_EVENT_TYPE_ERROR) {
+        // This callback runs on an MFPlay worker thread; PostMessageW is the
+        // only thread-safe way to reach the window (a direct SetWindowTextW
+        // would block on the UI thread's message pump).
         if (app_ptr) |a| {
-            if (a.player_window) |hwnd| _ = win.SetWindowTextW(hwnd, lit("Messages · Video (playback failed)"));
+            if (a.player_window) |hwnd| _ = win.PostMessageW(hwnd, win.WM_CLOSE, 0, 0);
         }
     }
 }
@@ -1616,10 +1620,7 @@ fn playerProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win
 
 fn playVideoInline(a: *App, message: *const Message) void {
     if (message.local_path.len == 0) return;
-    if (a.player_window) |hwnd| {
-        _ = win.SetForegroundWindow(hwnd);
-        return;
-    }
+    if (a.player_window != null) closePlayer(a);
     const size = clampPlayerSize(@intCast(@max(message.bitmap_width, 0)), @intCast(@max(message.bitmap_height, 0)));
     var rect = win.RECT{ .left = 0, .top = 0, .right = @intCast(size[0]), .bottom = @intCast(size[1]) };
     _ = win.AdjustWindowRect(&rect, win.WS_OVERLAPPEDWINDOW, 0);
