@@ -494,6 +494,9 @@ const App = struct {
     archive_child: ?std.process.Child = null,
     pending_archives: [max_pending_sends]PendingArchive = [_]PendingArchive{.{}} ** max_pending_sends,
     pending_archive_count: usize = 0,
+    // WAZI-62: an unarchive that could not queue (full queue) waits here and
+    // is retried from the refresh timer, so the chat is never lost for good.
+    unarchive_retry: Utf8Text(191) = .{},
     group_refresh_ticks: u8 = 0,
     deepgram_configured: bool = false,
     deepgram_key: []const u8 = "",
@@ -5508,12 +5511,25 @@ fn queueUnarchiveChat(a: *App, jid: []const u8) void {
         const pending = &a.pending_archives[index];
         if (pending.should_unarchive and std.mem.eql(u8, pending.jid.slice(), jid)) return;
     }
-    if (a.pending_archive_count >= a.pending_archives.len) return;
+    if (a.pending_archive_count >= a.pending_archives.len) {
+        // Remember the request instead of dropping it (review finding): the
+        // refresh timer re-queues it once the archive queue drains.
+        if (a.unarchive_retry.len == 0) a.unarchive_retry.set(jid);
+        return;
+    }
+    a.unarchive_retry.set("");
     const pending = &a.pending_archives[a.pending_archive_count];
     pending.jid.set(jid);
     pending.should_unarchive = true;
     a.pending_archive_count += 1;
     startNextArchive(a);
+}
+
+/// Re-queue an unarchive that had to wait for a free archive slot.
+fn retryUnarchiveChat(a: *App) void {
+    if (a.unarchive_retry.len == 0) return;
+    const jid = a.unarchive_retry.slice();
+    queueUnarchiveChat(a, jid);
 }
 
 fn removeFirstPendingArchive(a: *App) void {
@@ -7901,6 +7917,7 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
                 // attachments older than the cutoff, so without this it
                 // could never start.
                 retryPendingDownload(a);
+                retryUnarchiveChat(a);
                 _ = autoDownloadNextMedia(a);
                 requestAvatar(a, a.selected_chat);
             } else if (wparam == timer_search) {
