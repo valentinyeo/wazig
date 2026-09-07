@@ -1041,7 +1041,7 @@ fn wacliEnqueue(a: *App, job: WacliJob, urgent: bool) void {
     a.wacli_cond.broadcast(a.io);
     a.wacli_mutex.unlock(a.io);
     if (dropped_reaction) setStatus(a, "Reaction queue is full; try again");
-    if (a.wacli_thread == null) wacliPumpSync(a);
+    if (a.wacli_thread == null or (jobIsSlack(job.kind) and a.wacli_slack_thread == null)) wacliPumpSync(a);
 }
 
 // Fallback when the worker thread never started: run queued jobs inline on
@@ -1049,16 +1049,22 @@ fn wacliEnqueue(a: *App, job: WacliJob, urgent: bool) void {
 fn wacliPumpSync(a: *App) void {
     while (true) {
         a.wacli_mutex.lockUncancelable(a.io);
-        if (a.wacli_thread != null or a.wacli_queue_len == 0) {
+        // Every job kind must have a lane: the main worker, or this inline
+        // pump when a lane's thread failed to spawn.
+        if (a.wacli_queue_len == 0 or (a.wacli_thread != null and a.wacli_slack_thread != null)) {
             a.wacli_mutex.unlock(a.io);
             return;
         }
-        const job = a.wacli_queue[0];
-        var shift: usize = 0;
-        while (shift + 1 < a.wacli_queue_len) : (shift += 1) a.wacli_queue[shift] = a.wacli_queue[shift + 1];
-        a.wacli_queue_len -= 1;
+        const job = if (a.wacli_thread != null)
+            wacliTakeJob(a, true) // main worker lives: pump only Slack jobs
+        else
+            wacliTakeJob(a, false) orelse wacliTakeJob(a, true);
+        if (job == null) {
+            a.wacli_mutex.unlock(a.io);
+            return;
+        }
         a.wacli_mutex.unlock(a.io);
-        wacliRunJob(a, job);
+        wacliRunJob(a, job.?);
     }
 }
 
@@ -1105,16 +1111,20 @@ fn wacliTakeJob(a: *App, slack_lane: bool) ?WacliJob {
 fn wacliWorkerMain(a: *App, slack_lane: bool) void {
     while (true) {
         a.wacli_mutex.lockUncancelable(a.io);
-        while (wacliTakeJob(a, slack_lane) == null and !a.wacli_quit) a.wacli_cond.waitUncancelable(a.io, &a.wacli_mutex);
+        // Take once and keep the job: a second take here would drop work.
+        var job = wacliTakeJob(a, slack_lane);
+        while (job == null and !a.wacli_quit) {
+            a.wacli_cond.waitUncancelable(a.io, &a.wacli_mutex);
+            job = wacliTakeJob(a, slack_lane);
+        }
         // Quit discards any remaining queued jobs: the window is going away
         // and joining behind them would hang the close.
-        if (a.wacli_quit) {
+        if (job == null or a.wacli_quit) {
             a.wacli_mutex.unlock(a.io);
             return;
         }
-        const job = wacliTakeJob(a, slack_lane).?;
         a.wacli_mutex.unlock(a.io);
-        wacliRunJob(a, job);
+        wacliRunJob(a, job.?);
     }
 }
 
@@ -2345,6 +2355,11 @@ fn dropPendingForEcho(a: *App, text: []const u8) void {
 /// Stamp the optimistic bubble with Slack's authoritative ts (or mark it
 /// failed) when the chat.postMessage job completes.
 fn resolveSlackSend(a: *App, result: *WacliResult) void {
+    // Only the conversation the bubble is displayed in may resolve it; a
+    // result for a chat the user already left must not stamp another chat's
+    // pending send (ponytail: that orphan bubble is silently dropped, the
+    // status bar still reports the outcome).
+    if (!std.mem.eql(u8, a.displayed_jid.slice(), result.jid.slice())) return;
     const index = oldestPendingSend(a) orelse return;
     if (!result.ok) {
         const message = &a.messages[index];
@@ -7829,6 +7844,7 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
             // cannot stall wacli work (and vice versa).
             if (a.wacli_slack_thread == null) {
                 a.wacli_slack_thread = std.Thread.spawn(.{ .stack_size = 1024 * 1024 }, wacliWorkerMain, .{ a, true }) catch null;
+                if (a.wacli_slack_thread == null) setStatus(a, "Slack worker failed to start; sends run inline");
             }
             refreshGroups(a);
             refreshChats(a);
