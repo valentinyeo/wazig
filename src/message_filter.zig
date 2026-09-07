@@ -10,15 +10,18 @@ pub const Row = struct {
     filename: []const u8 = "",
     local_path: []const u8 = "",
     revoked: bool = false,
+    reaction_to: []const u8 = "",
 };
 
 /// A row is a real chat message when it has an id and something to show:
-/// text, an attachment, or a delete notice. Everything else is a protocol or
-/// system event and is hidden.
+/// text, an attachment, a delete notice, or a reaction to merge into its
+/// target message. Everything else is a protocol or system event and is
+/// hidden.
 pub fn isRealMessage(row: Row) bool {
     if (row.id.len == 0) return false;
     return row.text.len > 0 or row.media_type.len > 0 or
-        row.filename.len > 0 or row.local_path.len > 0 or row.revoked;
+        row.filename.len > 0 or row.local_path.len > 0 or row.revoked or
+        row.reaction_to.len > 0;
 }
 
 const std = @import("std");
@@ -34,6 +37,10 @@ test "media row without text is real" {
 
 test "revoked row keeps its delete notice" {
     try std.testing.expect(isRealMessage(.{ .id = "ABC4", .revoked = true }));
+}
+
+test "reaction row survives so it can merge into its target" {
+    try std.testing.expect(isRealMessage(.{ .id = "ABC6", .reaction_to = "ABC1" }));
 }
 
 test "protocol stub without content is hidden" {

@@ -3913,6 +3913,7 @@ fn applyMessageData(a: *App, raw: []const u8, final: bool) void {
         const media_type = getString(object, "MediaType");
         const filename = getString(object, "Filename");
         const local_path = getString(object, "LocalPath");
+        const reaction_to = getString(object, "ReactionToID");
         // Protocol/system rows (receipts, sync stubs) have an id but nothing
         // to show: rendering them produced phantom "messages" that were never
         // sent. See message_filter.zig. Filter before building the Message so
@@ -3924,6 +3925,7 @@ fn applyMessageData(a: *App, raw: []const u8, final: bool) void {
             .filename = filename,
             .local_path = local_path,
             .revoked = revoked,
+            .reaction_to = reaction_to,
         })) continue;
         var message = Message{};
         message.id.set(id);
@@ -3937,7 +3939,7 @@ fn applyMessageData(a: *App, raw: []const u8, final: bool) void {
         message.mime_type.set(getString(object, "MimeType"));
         message.local_path.set(a.allocator, local_path);
         message.filename.set(a.allocator, filename);
-        message.reaction_to.set(getString(object, "ReactionToID"));
+        message.reaction_to.set(reaction_to);
         message.reaction.set(a.allocator, getString(object, "ReactionEmoji"));
         message.timestamp.set(getString(object, "Timestamp"));
         formatTime(&message.time, a.allocator, getString(object, "Timestamp"));
