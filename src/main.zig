@@ -5777,7 +5777,6 @@ fn paletteActivate(a: *App) void {
     if (a.palette_selected >= a.palette_match_count) return;
     const item = &a.palette_items[a.palette_matches[a.palette_selected]];
     if (item.chat_jid.len > 0) {
-        closePalette(a);
         var chat_index: ?usize = null;
         for (a.chats[0..a.chat_count], 0..) |*chat, index| {
             if (std.mem.eql(u8, chat.jid.slice(), item.chat_jid.slice())) {
@@ -5785,8 +5784,23 @@ fn paletteActivate(a: *App) void {
                 break;
             }
         }
-        // Gone from the visible list (refresh, archive) means nothing to open.
-        const selected = chat_index orelse return;
+        // Resolve before closing: gone from the visible list (refresh,
+        // archive toggle, or the 250-row wacli cap) means nothing to open,
+        // and closing first left the palette gone with no feedback.
+        const selected = chat_index orelse {
+            appendDebugLog(a, "palette: chat not in current list, jid={s}", .{item.chat_jid.slice()});
+            const name_utf8 = std.unicode.utf16LeToUtf8Alloc(a.allocator, item.label.slice()) catch null;
+            defer if (name_utf8) |n| a.allocator.free(n);
+            if (name_utf8) |n| appendDebugLog(a, "palette: chat name={s}", .{n});
+            const status = if (name_utf8) |n|
+                std.fmt.allocPrintSentinel(a.allocator, "\"{s}\" is not in the chat list right now. Press R to refresh, then try again.", .{n}, 0) catch null
+            else
+                null;
+            defer if (status) |s| a.allocator.free(s);
+            setStatus(a, status orelse "Chat not in the current list. Press R to refresh, then try again.");
+            return;
+        };
+        closePalette(a);
         // Same flow as clicking the chat in the list: open it and land in
         // the composer with the caret at the end.
         discardStagedImage(a);
