@@ -149,9 +149,11 @@ jobs:
           # --tdlib-smoke starts TDLib, waits for the first authorization
           # state, and exits; it proves the Telegram link is live without a
           # window or a login.
+          # Messages.exe is a GUI-subsystem binary, so `& $exe` does not wait
+          # and $LASTEXITCODE stays empty; Start-Process -Wait does.
           $exe = "$env:LOCALAPPDATA\Programs\Messages\Messages.exe"
-          & $exe --tdlib-smoke
-          $code = $LASTEXITCODE
+          $proc = Start-Process -FilePath $exe -ArgumentList '--tdlib-smoke' -Wait -PassThru
+          $code = $proc.ExitCode
           if ($code -ne 0) { throw "tdlib smoke failed: $code" }
       - name: Uninstall silently
         shell: pwsh
