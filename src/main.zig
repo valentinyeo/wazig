@@ -494,6 +494,9 @@ const App = struct {
     archive_child: ?std.process.Child = null,
     pending_archives: [max_pending_sends]PendingArchive = [_]PendingArchive{.{}} ** max_pending_sends,
     pending_archive_count: usize = 0,
+    // WAZI-62: an unarchive that could not queue (full queue) waits here and
+    // is retried from the refresh timer, so the chat is never lost for good.
+    unarchive_retry: Utf8Text(191) = .{},
     group_refresh_ticks: u8 = 0,
     deepgram_configured: bool = false,
     deepgram_key: []const u8 = "",
@@ -2273,6 +2276,21 @@ fn applySlackEvent(a: *App, event: *slack_win.Event) void {
             chat.unread = true;
             chat.unread_count += 1;
         }
+    }
+    // WAZI-62: a new message must pull an archived chat back into the list.
+    // The visible list filters archived chats out, so a chat that is absent
+    // here but present in the workspace cache is archived.
+    if (!is_open) {
+        var visible = false;
+        var archived = false;
+        for (a.chats[0..a.chat_count]) |*chat| {
+            if (std.mem.eql(u8, chat.jid.slice(), channel)) {
+                visible = true;
+                archived = chat.archived;
+                break;
+            }
+        }
+        if (slack.resurfacesChat(from_me, visible, archived)) queueUnarchiveChat(a, channel);
     }
     if (is_open) {
         var item = slack.HistoryItem{
@@ -5485,6 +5503,35 @@ fn openReactionMenuForSelected(a: *App) void {
     openReactionMenu(a, point.x, point.y);
 }
 
+/// Queue an unarchive for a chat the inbox list does not show (WAZI-62).
+/// Duplicates are dropped: live events can repeat before the write lands.
+fn queueUnarchiveChat(a: *App, jid: []const u8) void {
+    var index: usize = 0;
+    while (index < a.pending_archive_count) : (index += 1) {
+        const pending = &a.pending_archives[index];
+        if (pending.should_unarchive and std.mem.eql(u8, pending.jid.slice(), jid)) return;
+    }
+    if (a.pending_archive_count >= a.pending_archives.len) {
+        // Remember the request instead of dropping it (review finding): the
+        // refresh timer re-queues it once the archive queue drains.
+        if (a.unarchive_retry.len == 0) a.unarchive_retry.set(jid);
+        return;
+    }
+    a.unarchive_retry.set("");
+    const pending = &a.pending_archives[a.pending_archive_count];
+    pending.jid.set(jid);
+    pending.should_unarchive = true;
+    a.pending_archive_count += 1;
+    startNextArchive(a);
+}
+
+/// Re-queue an unarchive that had to wait for a free archive slot.
+fn retryUnarchiveChat(a: *App) void {
+    if (a.unarchive_retry.len == 0) return;
+    const jid = a.unarchive_retry.slice();
+    queueUnarchiveChat(a, jid);
+}
+
 fn removeFirstPendingArchive(a: *App) void {
     if (a.pending_archive_count == 0) return;
     var index: usize = 1;
@@ -7884,6 +7931,7 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
                 // attachments older than the cutoff, so without this it
                 // could never start.
                 retryPendingDownload(a);
+                retryUnarchiveChat(a);
                 _ = autoDownloadNextMedia(a);
                 requestAvatar(a, a.selected_chat);
             } else if (wparam == timer_search) {
