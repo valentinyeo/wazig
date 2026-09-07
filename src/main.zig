@@ -57,6 +57,9 @@ const msg_cache_max_bytes = 4 * 1024 * 1024;
 const update_check_interval_ms: u32 = 60 * 60 * 1000;
 // Automatic re-checks (wake, focus) are throttled to at most one per 5 minutes.
 const update_min_retry_ms: u64 = 5 * 60 * 1000;
+// A check stuck longer than this means its completion message was lost; allow
+// a new check instead of blocking the rest of the session.
+const update_check_timeout_ms: u64 = 10 * 60 * 1000;
 const update_restart_delay_ms: u32 = 10 * 1000;
 const scrollbar_width: i32 = 8; // 6px thumb + 1px inset on each side
 const scrollbar_min_thumb: i32 = 24;
@@ -7626,8 +7629,8 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
                 2 => {
                     const upd: *UpdateAvailable = @ptrFromInt(@as(usize, @bitCast(lparam)));
                     if (a.update_pending) |old| {
-                        old.deinit(a.allocator);
-                        a.allocator.destroy(old);
+                        old.deinit(std.heap.page_allocator);
+                        std.heap.page_allocator.destroy(old);
                     }
                     a.update_pending = upd;
                     a.update_failures = 0;
@@ -7756,7 +7759,7 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
             // WAZI-60: a laptop that sleeps at night checks on the first
             // focus after waking even if no power broadcast arrived.
             if (loword(wparam) != win.WA_INACTIVE) startUpdateCheck(hwnd, false);
-            return 0;
+            return win.DefWindowProcW(hwnd, message, wparam, lparam);
         },
         win.WM_CREATE => {
             a.hwnd = hwnd;
@@ -8781,8 +8784,8 @@ const UpdateAvailable = struct {
 
 fn startUpdateCheck(hwnd: win.HWND, manual: bool) void {
     const a = app_ptr orelse return;
-    if (a.update_check_running) return;
     const now = win.GetTickCount64();
+    if (a.update_check_running and now - a.update_last_check_ms < update_check_timeout_ms) return;
     if (!manual and a.update_last_check_ms != 0 and now - a.update_last_check_ms < update_min_retry_ms) return;
     const ctx = std.heap.page_allocator.create(UpdateContext) catch return;
     ctx.* = .{ .io = a.io, .hwnd = hwnd, .manual = manual, .install = false };
@@ -8797,7 +8800,7 @@ fn startUpdateCheck(hwnd: win.HWND, manual: bool) void {
 
 fn startUpdateInstall(hwnd: win.HWND) void {
     const a = app_ptr orelse return;
-    if (a.update_check_running) return;
+    if (a.update_check_running and win.GetTickCount64() - a.update_last_check_ms < update_check_timeout_ms) return;
     const ctx = std.heap.page_allocator.create(UpdateContext) catch return;
     ctx.* = .{ .io = a.io, .hwnd = hwnd, .manual = true, .install = true };
     const thread = std.Thread.spawn(.{}, updateThreadMain, .{ctx}) catch {
@@ -8840,7 +8843,12 @@ fn updateThreadMain(ctx: *UpdateContext) void {
             return;
         };
         stored.* = found;
-        _ = win.PostMessageW(ctx.hwnd, wm_update_ready, 2, @intCast(@intFromPtr(stored)));
+        // Ownership of `stored` moves to the UI thread only if the post
+        // succeeds; reclaim it here otherwise.
+        if (win.PostMessageW(ctx.hwnd, wm_update_ready, 2, @intCast(@intFromPtr(stored))) == 0) {
+            stored.deinit(allocator);
+            std.heap.page_allocator.destroy(stored);
+        }
     } else {
         _ = win.PostMessageW(ctx.hwnd, wm_update_ready, 3, 0);
     }
