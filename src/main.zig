@@ -12,6 +12,7 @@ const media_age = @import("media_age.zig");
 const webp_detect = @import("webp.zig");
 const paste_image = @import("paste_image.zig");
 const scrollbar = @import("scrollbar.zig");
+const message_filter = @import("message_filter.zig");
 
 const webp = @cImport({
     @cInclude("src/webp/decode.h");
@@ -508,6 +509,7 @@ const App = struct {
     read_started_ms: u64 = 0,
     pending_reads: [max_pending_reads]Utf8Text(191) = [_]Utf8Text(191){.{}} ** max_pending_reads,
     pending_read_count: usize = 0,
+    read_retries: [max_pending_reads]u8 = [_]u8{0} ** max_pending_reads,
     pending_download_jid: Utf8Text(191) = .{},
     pending_download_id: Utf8Text(191) = .{},
     pins: [max_pins]Utf8Text(191) = [_]Utf8Text(191){.{}} ** max_pins,
@@ -2318,6 +2320,7 @@ fn markChatRead(a: *App) void {
     if (already_queued or a.pending_read_count < a.pending_reads.len) {
         if (!already_queued) {
             a.pending_reads[a.pending_read_count].set(chat.jid.slice());
+            a.read_retries[a.pending_read_count] = 0;
             a.pending_read_count += 1;
         }
         chat.unread = false;
@@ -2330,8 +2333,31 @@ fn markChatRead(a: *App) void {
 fn removeFirstPendingRead(a: *App) void {
     if (a.pending_read_count == 0) return;
     var index: usize = 1;
-    while (index < a.pending_read_count) : (index += 1) a.pending_reads[index - 1] = a.pending_reads[index];
+    while (index < a.pending_read_count) : (index += 1) {
+        a.pending_reads[index - 1] = a.pending_reads[index];
+        a.read_retries[index - 1] = a.read_retries[index];
+    }
     a.pending_read_count -= 1;
+    a.pending_reads[a.pending_read_count] = .{};
+    a.read_retries[a.pending_read_count] = 0;
+}
+
+// A failed write goes back in the queue (up to 3 attempts) instead of being
+// dropped: the store lock can be lost to a parallel job, and without a retry
+// the chat stays unread until the user opens it again.
+const max_read_retries = 3;
+
+fn requeueFailedRead(a: *App) bool {
+    if (a.read_retries[0] + 1 >= max_read_retries or a.pending_read_count >= a.pending_reads.len) {
+        removeFirstPendingRead(a);
+        return false;
+    }
+    a.read_retries[0] += 1;
+    a.pending_reads[a.pending_read_count].set(a.pending_reads[0].slice());
+    a.read_retries[a.pending_read_count] = a.read_retries[0];
+    a.pending_read_count += 1;
+    removeFirstPendingRead(a);
+    return true;
 }
 
 // The mark-read write used to run on the UI thread with the sync child
@@ -2339,9 +2365,14 @@ fn removeFirstPendingRead(a: *App) void {
 // store lock took. Run it as a background job like sends and archives.
 fn startNextMarkRead(a: *App) void {
     if (a.read_child != null or a.pending_read_count == 0) return;
-    // Downloads run in parallel: both writes just wait on the store lock.
+    // Media downloads hold the store lock for up to 60s while a mark-read
+    // write waits only 10s, so a read started next to them loses the lock
+    // and its write is dropped. Wait for a free slot instead; the unread
+    // badge is already cleared locally and refreshChats keeps it cleared
+    // while the read is pending.
     if (a.send_child != null or a.pending_send_count > 0 or
-        a.archive_child != null or a.pending_archive_count > 0 or avatarBusy(a)) return;
+        a.archive_child != null or a.pending_archive_count > 0 or
+        avatarBusy(a) or mediaBusy(a)) return;
     stopSync(a);
     const child = std.process.spawn(a.io, .{
         .argv = &.{ a.wacli_path, "--json", "--lock-wait", "10s", "chats", "mark-read", "--chat", a.pending_reads[0].slice() },
@@ -2383,7 +2414,7 @@ fn checkMarkRead(a: *App) void {
         }
         _ = child.wait(a.io) catch {};
         a.read_child = null;
-        removeFirstPendingRead(a);
+        if (code != 0) _ = requeueFailedRead(a) else removeFirstPendingRead(a);
         // Drain the queue back-to-back before restarting live sync, which
         // stays suspended while reads are pending.
         if (a.pending_read_count > 0) {
@@ -3879,11 +3910,24 @@ fn applyMessageData(a: *App, raw: []const u8, final: bool) void {
         message.sender.set(a.allocator, if (getBool(object, "FromMe")) "You" else getString(object, "SenderName"));
         var text = getString(object, "DisplayText");
         if (text.len == 0) text = getString(object, "Text");
-        message.revoked = getBool(object, "Revoked");
+        const revoked = getBool(object, "Revoked");
+        const media_type = getString(object, "MediaType");
+        // Protocol/system rows (receipts, sync stubs) have an id but nothing
+        // to show: rendering them produced phantom "messages" that were never
+        // sent. See message_filter.zig.
+        if (!message_filter.isRealMessage(.{
+            .id = message.id.slice(),
+            .text = text,
+            .media_type = media_type,
+            .filename = getString(object, "Filename"),
+            .local_path = getString(object, "LocalPath"),
+            .revoked = revoked,
+        })) continue;
+        message.revoked = revoked;
         if (message.revoked) text = "Message deleted";
         message.text.set(a.allocator, text);
         message.from_me = getBool(object, "FromMe");
-        message.media_type.set(getString(object, "MediaType"));
+        message.media_type.set(media_type);
         message.mime_type.set(getString(object, "MimeType"));
         message.local_path.set(a.allocator, getString(object, "LocalPath"));
         message.filename.set(a.allocator, getString(object, "Filename"));
@@ -7579,10 +7623,9 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
                 checkMarkRead(a);
                 checkAvatarDownload(a);
                 checkArchive(a);
-                // Reads now run on the async wacli worker, so they keep
-                // flowing while downloads hold the store lock; downloads
-                // themselves no longer gate on mark-read or vice versa,
-                // both queue on the store lock.
+                // Reads wait for media slots instead of racing them for the
+                // store lock: a read that loses the lock fails, so it would
+                // never mark the chat read.
                 checkSync(a);
                 a.group_refresh_ticks += 1;
                 if (a.group_refresh_ticks >= 60) {
