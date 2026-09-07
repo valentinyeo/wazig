@@ -3904,33 +3904,37 @@ fn applyMessageData(a: *App, raw: []const u8, final: bool) void {
             .object => |o| o,
             else => continue,
         };
-        var message = Message{};
-        message.id.set(getString(object, "MsgID"));
-        message.sender_jid.set(getString(object, "SenderJID"));
-        message.sender.set(a.allocator, if (getBool(object, "FromMe")) "You" else getString(object, "SenderName"));
+        const id = getString(object, "MsgID");
         var text = getString(object, "DisplayText");
         if (text.len == 0) text = getString(object, "Text");
         const revoked = getBool(object, "Revoked");
         const media_type = getString(object, "MediaType");
+        const filename = getString(object, "Filename");
+        const local_path = getString(object, "LocalPath");
         // Protocol/system rows (receipts, sync stubs) have an id but nothing
         // to show: rendering them produced phantom "messages" that were never
-        // sent. See message_filter.zig.
+        // sent. See message_filter.zig. Filter before building the Message so
+        // no allocator-owned fields are populated for a dropped row.
         if (!message_filter.isRealMessage(.{
-            .id = message.id.slice(),
+            .id = id,
             .text = text,
             .media_type = media_type,
-            .filename = getString(object, "Filename"),
-            .local_path = getString(object, "LocalPath"),
+            .filename = filename,
+            .local_path = local_path,
             .revoked = revoked,
         })) continue;
+        var message = Message{};
+        message.id.set(id);
+        message.sender_jid.set(getString(object, "SenderJID"));
+        message.sender.set(a.allocator, if (getBool(object, "FromMe")) "You" else getString(object, "SenderName"));
         message.revoked = revoked;
         if (message.revoked) text = "Message deleted";
         message.text.set(a.allocator, text);
         message.from_me = getBool(object, "FromMe");
         message.media_type.set(media_type);
         message.mime_type.set(getString(object, "MimeType"));
-        message.local_path.set(a.allocator, getString(object, "LocalPath"));
-        message.filename.set(a.allocator, getString(object, "Filename"));
+        message.local_path.set(a.allocator, local_path);
+        message.filename.set(a.allocator, filename);
         message.reaction_to.set(getString(object, "ReactionToID"));
         message.reaction.set(a.allocator, getString(object, "ReactionEmoji"));
         message.timestamp.set(getString(object, "Timestamp"));
