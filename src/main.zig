@@ -577,6 +577,8 @@ const App = struct {
     // thread-safe. wacli_pending is only touched under wacli_mutex.
     wacli_thread: ?std.Thread = null,
     wacli_slack_thread: ?std.Thread = null,
+    // WAZI-61: per-process counter for Slack client_msg_id generation.
+    slack_client_seq: u64 = 0,
     wacli_mutex: std.Io.Mutex = .init,
     wacli_cond: std.Io.Condition = .init,
     wacli_queue: [wacli_queue_size]WacliJob = [_]WacliJob{.{}} ** wacli_queue_size,
@@ -2311,12 +2313,14 @@ fn insertSlackMessageSorted(a: *App, message: Message) void {
 
 /// WAZI-61: render an optimistic bubble for a Slack text send the moment the
 /// composer clears, instead of waiting for the send round trip plus echo.
-fn appendSlackPending(a: *App, text: []const u8) void {
+fn appendSlackPending(a: *App, text: []const u8, client_msg_id: []const u8) void {
     if (a.message_count >= max_messages) return;
     var message = Message{};
     message.from_me = true;
     message.sender.set(a.allocator, "You");
     message.text.set(a.allocator, text);
+    // Slack messages leave `timestamp` unused; park the client_msg_id here.
+    message.timestamp.set(client_msg_id);
     var local = std.mem.zeroes(win.SYSTEMTIME);
     win.GetLocalTime(&local);
     var buffer: [6]u8 = undefined;
@@ -2338,18 +2342,39 @@ fn oldestPendingSend(a: *App) ?usize {
     return null;
 }
 
-/// Drop the bubble the moment our own echo arrives (it can beat the HTTP
-/// response); the response then finds no pending and becomes a no-op.
-fn dropPendingForEcho(a: *App, text: []const u8) void {
-    const index = oldestPendingSend(a) orelse return;
-    const message = &a.messages[index];
-    const pending_len = std.unicode.utf16LeToUtf8Alloc(a.allocator, message.text.slice()) catch return;
-    defer a.allocator.free(pending_len);
-    if (std.mem.eql(u8, pending_len, text)) {
-        var shift = index;
-        while (shift + 1 < a.message_count) : (shift += 1) a.messages[shift] = a.messages[shift + 1];
-        a.message_count -= 1;
+/// Pending bubble carrying this client_msg_id, if still displayed.
+fn pendingByClientMsgId(a: *App, client_msg_id: []const u8) ?usize {
+    if (client_msg_id.len == 0) return null;
+    for (a.messages[0..a.message_count], 0..) |*message, index| {
+        if (message.from_me and message.send_state == .pending and
+            std.mem.eql(u8, message.timestamp.slice(), client_msg_id)) return index;
     }
+    return null;
+}
+
+fn removeMessageAt(a: *App, index: usize) void {
+    var shift = index;
+    while (shift + 1 < a.message_count) : (shift += 1) a.messages[shift] = a.messages[shift + 1];
+    a.message_count -= 1;
+}
+
+/// Drop the bubble the moment our own echo arrives (it can beat the HTTP
+/// response); correlate by client_msg_id, falling back to text match only
+/// when Slack sent no id. The response then finds no pending and becomes a
+/// no-op.
+fn dropPendingForEcho(a: *App, event: *slack_win.Event) void {
+    const cmid = event.clientMsgIdSlice();
+    var index: ?usize = null;
+    if (cmid.len > 0) {
+        index = pendingByClientMsgId(a, cmid);
+    } else {
+        const oldest = oldestPendingSend(a) orelse return;
+        const message = &a.messages[oldest];
+        const pending_text = std.unicode.utf16LeToUtf8Alloc(a.allocator, message.text.slice()) catch return;
+        defer a.allocator.free(pending_text);
+        if (std.mem.eql(u8, pending_text, event.textSlice())) index = oldest;
+    }
+    if (index) |found| removeMessageAt(a, found);
 }
 
 /// Stamp the optimistic bubble with Slack's authoritative ts (or mark it
@@ -2360,7 +2385,9 @@ fn resolveSlackSend(a: *App, result: *WacliResult) void {
     // pending send (ponytail: that orphan bubble is silently dropped, the
     // status bar still reports the outcome).
     if (!std.mem.eql(u8, a.displayed_jid.slice(), result.jid.slice())) return;
-    const index = oldestPendingSend(a) orelse return;
+    // Correlate by client_msg_id; fall back to the oldest pending bubble for
+    // sends queued before ids existed.
+    const index = pendingByClientMsgId(a, result.extra.slice()) orelse oldestPendingSend(a) orelse return;
     if (!result.ok) {
         const message = &a.messages[index];
         message.send_state = .failed;
@@ -2439,7 +2466,7 @@ fn applySlackEvent(a: *App, event: *slack_win.Event) void {
             .file_size = event.file_size,
         };
         _ = &item;
-        if (from_me) dropPendingForEcho(a, item.text);
+        if (from_me) dropPendingForEcho(a, event);
         const message = buildSlackMessage(a, item);
         insertSlackMessageSorted(a, message);
         if (item.file_url.len > 0) requestSlackDownload(a, channel, item);
@@ -4857,14 +4884,19 @@ fn sendMessage(a: *App) void {
             wacliJobArgs(&job, &.{ chat.jid.slice(), a.reply_to.slice(), attach, text });
             wacliEnqueue(a, job, true);
         } else {
+            // WAZI-61: client_msg_id correlates the optimistic bubble with
+            // Slack's echo and the send result, even for duplicate texts.
+            a.slack_client_seq +%= 1;
+            var cmid_buffer: [40]u8 = undefined;
+            const client_msg_id = std.fmt.bufPrint(&cmid_buffer, "wz{d}-{d}", .{ win.GetTickCount64(), a.slack_client_seq }) catch "";
             var job = WacliJob{ .kind = .slack_send, .started_ms = win.GetTickCount64() };
             job.jid.set(chat.jid.slice());
-            wacliJobArgs(&job, &.{ chat.jid.slice(), text, a.reply_to.slice() });
+            wacliJobArgs(&job, &.{ chat.jid.slice(), text, a.reply_to.slice(), client_msg_id });
             wacliEnqueue(a, job, true);
-            // WAZI-61: show the message immediately as pending; the send
-            // completion (or the Slack echo, whichever lands first) stamps
-            // it with the real ts or marks it failed.
-            appendSlackPending(a, text);
+            // Show the message immediately as pending; the send completion
+            // (or the Slack echo, whichever lands first) stamps it with the
+            // real ts or marks it failed.
+            appendSlackPending(a, text, client_msg_id);
         }
         clearReply(a);
         a.user_viewed = true;

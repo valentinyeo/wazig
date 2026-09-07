@@ -59,6 +59,7 @@ pub const Envelope = struct {
     user: []const u8 = "",
     bot_id: []const u8 = "",
     text: []const u8 = "",
+    client_msg_id: []const u8 = "",
     file_id: []const u8 = "",
     file_url: []const u8 = "",
     file_name: []const u8 = "",
@@ -116,6 +117,7 @@ pub fn classifyEnvelope(arena: std.mem.Allocator, text: []const u8) classificati
     envelope.user = objectString(event, "user") orelse "";
     envelope.bot_id = objectString(event, "bot_id") orelse "";
     envelope.text = objectString(event, "text") orelse "";
+    envelope.client_msg_id = objectString(event, "client_msg_id") orelse "";
     if (event.get("files")) |files_value| {
         if (files_value == .array and files_value.array.items.len > 0) {
             const file_value = files_value.array.items[0];
@@ -279,15 +281,23 @@ pub const ReplyTo = struct {
     channel_id: []const u8,
     text: []const u8,
     thread_ts: []const u8 = "",
+    // WAZI-61: correlates our optimistic bubble with Slack's echo.
+    client_msg_id: []const u8 = "",
 };
 
 pub fn buildPostMessageBody(allocator: std.mem.Allocator, reply: ReplyTo) ![]u8 {
     const escaped = try escapeJson(allocator, reply.text);
     defer allocator.free(escaped);
-    if (reply.thread_ts.len == 0) {
+    if (reply.thread_ts.len == 0 and reply.client_msg_id.len == 0) {
         return std.fmt.allocPrint(allocator, "{{\"channel\":\"{s}\",\"text\":\"{s}\"}}", .{ reply.channel_id, escaped });
     }
-    return std.fmt.allocPrint(allocator, "{{\"channel\":\"{s}\",\"text\":\"{s}\",\"thread_ts\":\"{s}\"}}", .{ reply.channel_id, escaped, reply.thread_ts });
+    if (reply.thread_ts.len == 0) {
+        return std.fmt.allocPrint(allocator, "{{\"channel\":\"{s}\",\"text\":\"{s}\",\"client_msg_id\":\"{s}\"}}", .{ reply.channel_id, escaped, reply.client_msg_id });
+    }
+    if (reply.client_msg_id.len == 0) {
+        return std.fmt.allocPrint(allocator, "{{\"channel\":\"{s}\",\"text\":\"{s}\",\"thread_ts\":\"{s}\"}}", .{ reply.channel_id, escaped, reply.thread_ts });
+    }
+    return std.fmt.allocPrint(allocator, "{{\"channel\":\"{s}\",\"text\":\"{s}\",\"thread_ts\":\"{s}\",\"client_msg_id\":\"{s}\"}}", .{ reply.channel_id, escaped, reply.thread_ts, reply.client_msg_id });
 }
 
 pub fn buildCompleteUploadBody(allocator: std.mem.Allocator, file_id: []const u8, channel_id: []const u8, thread_ts: []const u8, caption: []const u8) ![]u8 {
@@ -581,4 +591,11 @@ test "parseSentTs extracts the message timestamp" {
     try std.testing.expectEqualStrings("1757000000.000300", ts);
     try std.testing.expect(parseSentTs(allocator, "{\"ok\":false,\"error\":\"rate_limited\"}") == null);
     try std.testing.expect(parseSentTs(allocator, "not json") == null);
+}
+
+test "postMessage body carries client_msg_id when set" {
+    const allocator = std.testing.allocator;
+    const with_id = try buildPostMessageBody(allocator, .{ .channel_id = "C1", .text = "hi", .thread_ts = "", .client_msg_id = "wz1-2" });
+    defer allocator.free(with_id);
+    try std.testing.expectEqualStrings("{\"channel\":\"C1\",\"text\":\"hi\",\"client_msg_id\":\"wz1-2\"}", with_id);
 }
