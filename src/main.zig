@@ -2274,6 +2274,21 @@ fn applySlackEvent(a: *App, event: *slack_win.Event) void {
             chat.unread_count += 1;
         }
     }
+    // WAZI-62: a new message must pull an archived chat back into the list.
+    // The visible list filters archived chats out, so a chat that is absent
+    // here but present in the workspace cache is archived.
+    if (!is_open) {
+        var visible = false;
+        var archived = false;
+        for (a.chats[0..a.chat_count]) |*chat| {
+            if (std.mem.eql(u8, chat.jid.slice(), channel)) {
+                visible = true;
+                archived = chat.archived;
+                break;
+            }
+        }
+        if (slack.resurfacesChat(from_me, visible, archived)) queueUnarchiveChat(a, channel);
+    }
     if (is_open) {
         var item = slack.HistoryItem{
             .ts = event.tsSlice(),
@@ -5483,6 +5498,22 @@ fn openReactionMenuForSelected(a: *App) void {
     var point = win.POINT{ .x = @divTrunc(bubble.left + bubble.right, 2), .y = bubble.bottom };
     _ = win.ClientToScreen(canvas, &point);
     openReactionMenu(a, point.x, point.y);
+}
+
+/// Queue an unarchive for a chat the inbox list does not show (WAZI-62).
+/// Duplicates are dropped: live events can repeat before the write lands.
+fn queueUnarchiveChat(a: *App, jid: []const u8) void {
+    var index: usize = 0;
+    while (index < a.pending_archive_count) : (index += 1) {
+        const pending = &a.pending_archives[index];
+        if (pending.should_unarchive and std.mem.eql(u8, pending.jid.slice(), jid)) return;
+    }
+    if (a.pending_archive_count >= a.pending_archives.len) return;
+    const pending = &a.pending_archives[a.pending_archive_count];
+    pending.jid.set(jid);
+    pending.should_unarchive = true;
+    a.pending_archive_count += 1;
+    startNextArchive(a);
 }
 
 fn removeFirstPendingArchive(a: *App) void {
