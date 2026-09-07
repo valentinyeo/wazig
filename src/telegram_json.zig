@@ -150,6 +150,25 @@ pub fn formatTimestamp(buffer: *[20]u8, unix_seconds: i64) []const u8 {
     return text;
 }
 
+/// Maps TDLib error codes to plain-language text. The wording is load-bearing:
+/// main.zig routes the user back to the right login step by matching it.
+fn friendlyTgError(message: []const u8) []const u8 {
+    const map = std.StaticStringMap([]const u8).initComptime(.{
+        .{ "API_ID_INVALID", "Telegram rejected the app keys. Check api_id and api_hash and enter them again." },
+        .{ "API_ID_PUBLISHED_FLOOD", "These app keys are blocked by Telegram. Create new ones at my.telegram.org/apps." },
+        .{ "PHONE_NUMBER_INVALID", "That phone number looks wrong. Include the country code, like +491701234567." },
+        .{ "PHONE_NUMBER_BANNED", "Telegram has banned this phone number." },
+        .{ "PHONE_CODE_INVALID", "That code was wrong. Check the Telegram app and try again." },
+        .{ "PHONE_CODE_EXPIRED", "The code expired. Start the login again with your phone number." },
+        .{ "PHONE_CODE_EMPTY", "Type the login code and press Enter." },
+        .{ "PASSWORD_HASH_INVALID", "That 2FA password was wrong. Type it again." },
+        .{ "FLOOD_WAIT", "Telegram asked to wait before trying again. Try again in a few minutes." },
+        .{ "AUTH_KEY_UNREGISTERED", "This session was revoked. Log in again with your phone number." },
+    });
+    if (map.get(message)) |friendly| return friendly;
+    return message;
+}
+
 fn parseAuthState(type_name: []const u8) AuthState {
     const map = std.StaticStringMap(AuthState).initComptime(.{
         .{ "authorizationStateWaitTdlibParameters", .wait_parameters },
@@ -431,13 +450,7 @@ pub fn parseEvent(allocator: std.mem.Allocator, json_text: []const u8) !Event {
     }
     if (std.mem.eql(u8, type_name, "error")) {
         const message = getString(object, "message");
-        var lower_buffer: [128]u8 = undefined;
-        const lowered = lower_buffer[0..@min(message.len, lower_buffer.len)];
-        for (message[0..lowered.len], 0..) |character, index| lowered[index] = std.ascii.toLower(character);
-        const safe = if (std.mem.indexOf(u8, lowered, "phone") != null or
-            std.mem.indexOf(u8, lowered, "code") != null or
-            std.mem.indexOf(u8, lowered, "password") != null) "Telegram rejected the input" else message;
-        return .{ .auth = .{ .state = .unknown, .error_text = dupe(allocator, safe) } };
+        return .{ .auth = .{ .state = .unknown, .error_text = dupe(allocator, friendlyTgError(message)) } };
     }
     if (std.mem.eql(u8, type_name, "updateAuthorizationState")) {
         const inner = object.get("authorization_state") orelse return .ignored;
@@ -643,9 +656,13 @@ test "parses photo caption and largest size" {
     try std.testing.expectEqual(@as(i32, 51), msg.file_id);
 }
 
-test "error messages are sanitized" {
+test "error messages are mapped to plain language" {
     const event = try parseEvent(std.testing.allocator, "{\"@type\":\"error\",\"code\":400,\"message\":\"PHONE_CODE_INVALID\"}");
     var moved = event;
     defer moved.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("Telegram rejected the input", event.auth.error_text);
+    try std.testing.expectEqualStrings("That code was wrong. Check the Telegram app and try again.", event.auth.error_text);
+    const keys = try parseEvent(std.testing.allocator, "{\"@type\":\"error\",\"code\":400,\"message\":\"API_ID_INVALID\"}");
+    var moved_keys = keys;
+    defer moved_keys.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.startsWith(u8, moved_keys.auth.error_text, "Telegram rejected the app keys."));
 }
