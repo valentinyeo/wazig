@@ -24,7 +24,27 @@ pub const Asset = struct {
     url: []const u8,
     size: u64,
     digest: []const u8,
+    /// Release notes body from the GitHub release; empty when absent.
+    notes: []const u8,
 };
+
+/// Copies release notes into `buf` for display: drops control characters
+/// (keeping newline and tab) and never splits a UTF-8 code point at the
+/// buffer edge. Returns the truncated slice of `buf`.
+pub fn sanitizeNotes(src: []const u8, buf: []u8) []const u8 {
+    var out: usize = 0;
+    for (src) |c| {
+        if (out >= buf.len) break;
+        const is_control = c < 0x20 and c != '\n' and c != '\t';
+        if (is_control or c == 0x7f) continue;
+        buf[out] = c;
+        out += 1;
+    }
+    // Back up over any trailing partial code point.
+    while (out > 0 and (buf[out - 1] & 0xC0) == 0x80) out -= 1;
+    if (out > 0 and (buf[out - 1] & 0xE0) == 0xC0) out -= 1;
+    return buf[0..out];
+}
 
 /// Strict release tag grammar: "v" prefix optional, three numeric components,
 /// no build or pre-release suffix. Anything else is rejected so pre-releases
@@ -108,6 +128,8 @@ fn findAsset(root: std.json.Value) ?Asset {
         const size_value = asset.get("size") orelse continue;
         if (size_value != .integer) continue;
         if (size_value.integer < 0) continue;
+        const notes_value = obj.get("body");
+        const notes = if (notes_value != null and notes_value.? == .string) notes_value.?.string else "";
         if (matched != null) return null; // ambiguous release: refuse rather than guess
         matched = .{
             // Strings live inside the caller's `parsed`; it stays alive while the asset is used.
@@ -116,6 +138,7 @@ fn findAsset(root: std.json.Value) ?Asset {
             .url = url.string,
             .size = @intCast(size_value.integer),
             .digest = digest.string,
+            .notes = notes,
         };
     }
     return matched;
@@ -181,6 +204,8 @@ test pickAsset {
     try std.testing.expectEqualStrings("v0.2.0", asset.tag);
     try std.testing.expectEqual(12345, asset.size);
     try std.testing.expect(asset.url.len > 0);
+    // Body is empty when the release has no notes field.
+    try std.testing.expectEqualStrings("", asset.notes);
 
     // Pre-release with the same asset name must be ignored.
     const draft =
@@ -279,4 +304,65 @@ test isZipAssetName {
     try std.testing.expect(!isZipAssetName("Messages-v0.0.0"));
     try std.testing.expect(!isZipAssetName("SHA256SUMS.txt"));
     try std.testing.expect(!isZipAssetName("Other-v1.0.0.zip"));
+}
+
+test "sanitizeNotes" {
+    var buf: [64]u8 = undefined;
+    // Control characters are dropped, newline and tab survive.
+    try std.testing.expectEqualStrings("line1\nline2\ttabbed", sanitizeNotes("line1\n\x02line2\ttabbed\x7f", &buf));
+    // Truncation never splits a UTF-8 code point.
+    var small: [5]u8 = undefined;
+    const cut = sanitizeNotes("aaaa\u{00e9}\u{00e9}", &small);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(cut));
+    try std.testing.expectEqualStrings("aaaa", cut);
+    // A multi-byte character that started before the edge is backed off whole.
+    var small2: [6]u8 = undefined;
+    try std.testing.expect(std.unicode.utf8ValidateSlice(sanitizeNotes("ab\u{2713}cd", &small2)));
+    // Empty input stays empty.
+    try std.testing.expectEqualStrings("", sanitizeNotes("", &buf));
+}
+
+test "pickAssetNotes" {
+    const body =
+        \\{
+        \\  "tag_name": "v0.3.0",
+        \\  "body": "Fixes and\nimprovements",
+        \\  "draft": false,
+        \\  "prerelease": false,
+        \\  "assets": [
+        \\    {
+        \\      "name": "Messages-windows-x86_64.zip",
+        \\      "browser_download_url": "https://github.com/valentinyeo/wazig/releases/download/v0.3.0/Messages-windows-x86_64.zip",
+        \\      "size": 1,
+        \\      "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        \\    }
+        \\  ]
+        \\}
+    ;
+    var parsed: std.json.Parsed(std.json.Value) = undefined;
+    const asset = (try pickAsset(std.testing.allocator, body, &parsed)).?;
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("Fixes and\nimprovements", asset.notes);
+
+    // A non-string body must behave like a missing one.
+    const null_body =
+        \\{
+        \\  "tag_name": "v0.3.0",
+        \\  "body": null,
+        \\  "draft": false,
+        \\  "prerelease": false,
+        \\  "assets": [
+        \\    {
+        \\      "name": "Messages-windows-x86_64.zip",
+        \\      "browser_download_url": "https://github.com/valentinyeo/wazig/releases/download/v0.3.0/Messages-windows-x86_64.zip",
+        \\      "size": 1,
+        \\      "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        \\    }
+        \\  ]
+        \\}
+    ;
+    var parsed2: std.json.Parsed(std.json.Value) = undefined;
+    const asset2 = (try pickAsset(std.testing.allocator, null_body, &parsed2)).?;
+    defer parsed2.deinit();
+    try std.testing.expectEqualStrings("", asset2.notes);
 }
