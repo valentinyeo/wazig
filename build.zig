@@ -57,15 +57,12 @@ pub fn build(b: *std.Build) void {
     const td_enabled = tdlib_dir.len > 0;
     build_info.addOption(bool, "td_enabled", td_enabled);
     const telegram_api_id = b.option(i32, "telegram-api-id", "Telegram application api_id (build-time, from CI secret)") orelse 0;
-    const telegram_api_hash = b.option([]const u8, "telegram-api-hash", "Telegram application api_hash (build-time, from CI secret)") orelse "";
+    // Baked credentials are only defaults so their owner skips the in-app
+    // api_id/api_hash step; without them the Add Telegram flow asks for keys
+    // at runtime and stores them in the registry. Builds never require them.
+    const telegram_api_hash = b.option([]const u8, "telegram-api-hash", "Telegram application api_hash (baked default)") orelse "";
     build_info.addOption(i32, "telegram_api_id", telegram_api_id);
     build_info.addOption([]const u8, "telegram_api_hash", telegram_api_hash);
-    if (td_enabled and (telegram_api_id == 0 or telegram_api_hash.len == 0) and (optimize == .ReleaseSmall or optimize == .ReleaseFast or optimize == .ReleaseSafe)) {
-        // A release build without credentials would ship a binary where the
-        // Telegram login can never succeed: fail the build instead.
-        std.debug.print("error: -Dtdlib requires -Dtelegram-api-id and -Dtelegram-api-hash in release builds\n", .{});
-        std.process.exit(1);
-    }
 
     const exe = b.addExecutable(.{
         .name = "Messages",

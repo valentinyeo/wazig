@@ -115,6 +115,9 @@ const max_pins = 16;
 const command_slack_setup = 2046;
 const command_slack_disconnect = 2047;
 const command_slack_attach = 2048;
+const command_accounts_tg_remove = 2049;
+const command_accounts_tg_remove_confirm = 2050;
+const command_tg_open_apps = 2051;
 const reaction_like = 3001;
 const reaction_love = 3002;
 const reaction_laugh = 3003;
@@ -213,7 +216,7 @@ const TgChat = struct {
     is_group: bool = false,
 };
 
-const TgLoginMode = enum { none, phone, code, password };
+const TgLoginMode = enum { none, phone, code, password, api_id, api_hash };
 
 const PendingSend = struct {
     jid: Utf8Text(191) = .{},
@@ -474,6 +477,10 @@ const App = struct {
     tg_login: TgLoginMode = .none,
     tg_auth: tj.AuthState = .unknown,
     tg_dirty: bool = false,
+    tg_api_id: i32 = 0,
+    tg_api_hash: Utf8Text(64) = .{},
+    tg_data_dir: Utf8Text(259) = .{},
+    accounts_confirm_remove_tg: bool = false,
     groups: [max_groups]Group = [_]Group{.{}} ** max_groups,
     group_count: usize = 0,
     messages: [max_messages]Message = [_]Message{.{}} ** max_messages,
@@ -1564,7 +1571,10 @@ fn drainTelegram(a: *App) void {
                     },
                     else => {},
                 }
-                if (auth.error_text.len > 0) setStatus(a, auth.error_text);
+                if (auth.error_text.len > 0) {
+                    setStatus(a, auth.error_text);
+                    handleTgAuthError(a, auth.error_text);
+                }
             },
             .chat => |*info| {
                 upsertTgChat(a, info);
@@ -1697,12 +1707,33 @@ fn tgDisplayText(msg: *const tg.Msg) []const u8 {
     };
 }
 
+/// Routes the user back to the login step the error belongs to. Matches the
+/// plain-language texts from friendlyTgError in telegram_json.zig.
+fn handleTgAuthError(a: *App, error_text: []const u8) void {
+    if (std.mem.indexOf(u8, error_text, "app keys") != null) {
+        wipeBadTelegramKeys(a);
+        return;
+    }
+    if (a.tg_login == .api_id or a.tg_login == .api_hash) return;
+    const mode: TgLoginMode = if (std.mem.indexOf(u8, error_text, "phone number") != null)
+        .phone
+    else if (std.mem.indexOf(u8, error_text, "code") != null)
+        .code
+    else if (std.mem.indexOf(u8, error_text, "2FA password") != null)
+        .password
+    else
+        return;
+    openTelegramLogin(a, mode);
+}
+
 fn openTelegramLogin(a: *App, mode: TgLoginMode) void {
     a.tg_login = mode;
     setStatus(a, switch (mode) {
         .phone => "Telegram: type your phone number in the box and press Enter",
         .code => "Telegram: type the login code and press Enter",
         .password => "Telegram: type your 2FA password and press Enter",
+        .api_id => "Telegram: open my.telegram.org/apps below, then type your api_id here and press Enter",
+        .api_hash => "Telegram: type your api_hash and press Enter",
         .none => "Telegram",
     });
     if (a.palette == null) {
@@ -1713,7 +1744,10 @@ fn openTelegramLogin(a: *App, mode: TgLoginMode) void {
 }
 
 fn handleTgLoginInput(a: *App) void {
-    const client = a.telegram orelse return;
+    const client = a.telegram orelse {
+        if (a.tg_login == .api_id or a.tg_login == .api_hash) handleTgKeyInput(a);
+        return;
+    };
     var wide_buffer: [128]u16 = [_]u16{0} ** 128;
     const length: usize = if (a.palette_edit) |edit|
         @intCast(win.GetWindowTextW(edit, &wide_buffer, wide_buffer.len))
@@ -1727,11 +1761,168 @@ fn handleTgLoginInput(a: *App) void {
         .phone => client.authPhone(trimmed),
         .code => client.authCode(trimmed),
         .password => client.authPassword(trimmed),
+        .api_id, .api_hash => {
+            handleTgKeyInput(a);
+            return;
+        },
         .none => return,
     }
     a.tg_login = .none;
     closePalette(a);
     setStatus(a, "Telegram: checking with Telegram...");
+}
+
+/// The api_id/api_hash steps run before the Telegram client exists: input is
+/// validated and stored (registry), and only the api_hash step starts the
+/// client and hands over to the phone step.
+fn handleTgKeyInput(a: *App) void {
+    var wide_buffer: [128]u16 = [_]u16{0} ** 128;
+    const length: usize = if (a.palette_edit) |edit|
+        @intCast(win.GetWindowTextW(edit, &wide_buffer, wide_buffer.len))
+    else
+        0;
+    if (length == 0) return;
+    const text = std.unicode.utf16LeToUtf8Alloc(a.allocator, wide_buffer[0..length]) catch return;
+    defer a.allocator.free(text);
+    const trimmed = std.mem.trim(u8, text, " ");
+    switch (a.tg_login) {
+        .api_id => {
+            const parsed = std.fmt.parseInt(i32, trimmed, 10) catch {
+                setStatus(a, "The api_id is a number. Type it again.");
+                return;
+            };
+            if (parsed <= 0) {
+                setStatus(a, "The api_id is a number. Type it again.");
+                return;
+            }
+            a.tg_api_id = parsed;
+            a.tg_login = .api_hash;
+            if (a.palette_edit) |edit| _ = win.SetWindowTextW(edit, lit(""));
+            setStatus(a, "Telegram: api_id saved. Now type your api_hash and press Enter");
+        },
+        .api_hash => {
+            if (trimmed.len < 32) {
+                setStatus(a, "That api_hash looks too short. Copy the whole 32-character value.");
+                return;
+            }
+            a.tg_api_hash.set(trimmed);
+            if (!saveTelegramKeys(a)) {
+                setStatus(a, "Could not save the Telegram keys on this PC. Try again.");
+                return;
+            }
+            createTelegramClient(a);
+            if (a.telegram == null) {
+                // Creation failed: stay on the api_hash step so Enter retries
+                // instead of a phone prompt that can never be answered.
+                setStatus(a, "Telegram could not start on this PC. Press Enter to try again.");
+                return;
+            }
+            a.tg_login = .none;
+            closePalette(a);
+            openTelegramLogin(a, .phone);
+            setStatus(a, "Telegram: keys saved. Type your phone number and press Enter");
+        },
+        else => {},
+    }
+}
+
+fn createTelegramClient(a: *App) void {
+    if (a.telegram != null or a.tg_data_dir.len == 0) return;
+    if (a.tg_api_id == 0 or a.tg_api_hash.len == 0) return;
+    a.telegram = tg.Client.create(a.allocator, a.io, a.tg_api_id, a.tg_api_hash.slice(), a.tg_data_dir.slice());
+    if (a.telegram == null) setStatus(a, "Telegram could not start on this PC");
+}
+
+fn startTelegramAdd(a: *App) void {
+    if (!tg.enabled) {
+        setStatus(a, "Telegram is not in this build");
+        return;
+    }
+    if (a.tg_auth == .ready) {
+        setStatus(a, "Telegram is already connected");
+        return;
+    }
+    if (a.telegram == null) {
+        if (a.tg_api_id == 0 or a.tg_api_hash.len == 0) {
+            openTelegramLogin(a, .api_id);
+            return;
+        }
+        createTelegramClient(a);
+        if (a.telegram == null) return;
+    }
+    openTelegramLogin(a, switch (a.tg_auth) {
+        .wait_code => .code,
+        .wait_password => .password,
+        else => .phone,
+    });
+}
+
+/// Returns false when either registry write failed; the caller treats the
+/// keys as unsaved instead of continuing the login with half-saved keys.
+fn saveTelegramKeys(a: *App) bool {
+    var key: win.HKEY = undefined;
+    if (win.RegCreateKeyExW(winHandle(win.HKEY, 0x80000001), lit("Software\\Messages"), 0, null, 0, win.KEY_SET_VALUE, null, &key, null) != win.ERROR_SUCCESS) return false;
+    defer _ = win.RegCloseKey(key);
+    var id_buffer: [16]u8 = undefined;
+    const id_text = std.fmt.bufPrint(&id_buffer, "{d}", .{a.tg_api_id}) catch return false;
+    const id_wide = utf8ToWide(a.allocator, id_text) catch return false;
+    defer a.allocator.free(id_wide);
+    const id_saved = win.RegSetValueExW(key, lit("TelegramApiId"), 0, win.REG_SZ, @ptrCast(id_wide.ptr), @intCast((id_wide.len + 1) * 2)) == win.ERROR_SUCCESS;
+    const hash_wide = utf8ToWide(a.allocator, a.tg_api_hash.slice()) catch return false;
+    defer a.allocator.free(hash_wide);
+    const hash_saved = win.RegSetValueExW(key, lit("TelegramApiHash"), 0, win.REG_SZ, @ptrCast(hash_wide.ptr), @intCast((hash_wide.len + 1) * 2)) == win.ERROR_SUCCESS;
+    if (!id_saved or !hash_saved) {
+        // Roll back a partial write so a later start does not read a key
+        // pair where only one half belongs to this user.
+        _ = win.RegDeleteValueW(key, lit("TelegramApiId"));
+        _ = win.RegDeleteValueW(key, lit("TelegramApiHash"));
+        return false;
+    }
+    return true;
+}
+
+fn deleteTelegramKeys(a: *App) void {
+    var key: win.HKEY = undefined;
+    if (win.RegCreateKeyExW(winHandle(win.HKEY, 0x80000001), lit("Software\\Messages"), 0, null, 0, win.KEY_SET_VALUE, null, &key, null) != win.ERROR_SUCCESS) return;
+    defer _ = win.RegCloseKey(key);
+    _ = win.RegDeleteValueW(key, lit("TelegramApiId"));
+    _ = win.RegDeleteValueW(key, lit("TelegramApiHash"));
+    a.tg_api_id = 0;
+    a.tg_api_hash.set("");
+}
+
+/// Bad keys are wiped so the next Add attempt asks for them again instead of
+/// replaying the same failure from the registry.
+fn wipeBadTelegramKeys(a: *App) void {
+    deleteTelegramKeys(a);
+    if (a.telegram) |client| {
+        a.telegram = null;
+        client.destroy();
+    }
+    openTelegramLogin(a, .api_id);
+}
+
+/// Stops Telegram cleanly (destroy closes TDLib and joins its receive
+/// thread), then deletes the stored keys and the local Telegram data folder.
+fn removeTelegramAccount(a: *App) void {
+    if (a.telegram) |client| {
+        a.telegram = null;
+        client.destroy();
+    }
+    deleteTelegramKeys(a);
+    a.tg_login = .none;
+    a.tg_auth = .unknown;
+    a.tg_chat_count = 0;
+    a.tg_chats = [_]TgChat{.{}} ** max_tg_chats;
+    var removed = true;
+    if (a.tg_data_dir.len > 0) {
+        std.Io.Dir.cwd().deleteTree(a.io, a.tg_data_dir.slice()) catch {
+            removed = false;
+        };
+    }
+    refreshChats(a);
+    if (a.canvas) |canvas| _ = win.InvalidateRect(canvas, null, win.TRUE);
+    setStatus(a, if (removed) "Telegram removed from this PC" else "Telegram signed out, but its files could not be deleted");
 }
 
 fn tdlibSmoke(io: std.Io) u8 {
@@ -5409,6 +5600,9 @@ fn appendPaletteChat(a: *App, index: usize) void {
 
 fn buildPaletteItems(a: *App) void {
     a.palette_item_count = 0;
+    if (a.tg_login == .api_id or a.tg_login == .api_hash) {
+        appendPalette(a, "Open the Telegram app page (my.telegram.org/apps) in your browser", "", command_tg_open_apps);
+    }
     appendPalette(a, "Search chats", "Ctrl+F", command_search);
     appendPalette(a, "Compose message", "C", command_compose);
     appendPalette(a, "Dictate", "Ctrl+D", command_dictate);
@@ -5555,16 +5749,30 @@ fn paletteMove(a: *App, delta: i32) void {
 
 fn closePalette(a: *App) void {
     a.accounts_confirm_remove = false;
+    a.accounts_confirm_remove_tg = false;
     if (a.palette) |palette| {
         _ = win.DestroyWindow(palette);
     }
     if (a.chats_hwnd) |list| _ = win.SetFocus(list);
 }
 
+fn paletteEditEmpty(a: *App) bool {
+    var wide_buffer: [8]u16 = [_]u16{0} ** 8;
+    const length: usize = if (a.palette_edit) |edit|
+        @intCast(win.GetWindowTextW(edit, &wide_buffer, wide_buffer.len))
+    else
+        0;
+    return length == 0;
+}
+
 fn paletteActivate(a: *App) void {
     if (a.tg_login != .none) {
-        handleTgLoginInput(a);
-        return;
+        // In the api key steps, Enter on an empty box activates the selected
+        // item instead (the "open my.telegram.org/apps" entry).
+        if ((a.tg_login != .api_id and a.tg_login != .api_hash) or !paletteEditEmpty(a)) {
+            handleTgLoginInput(a);
+            return;
+        }
     }
     if (a.palette_selected >= a.palette_match_count) return;
     const item = &a.palette_items[a.palette_matches[a.palette_selected]];
@@ -5691,6 +5899,13 @@ fn buildAccountsItems(a: *App) void {
         appendPalette(a, "Log out of Telegram", "", command_telegram_logout);
     } else {
         appendPalette(a, "Add Telegram account", "", command_telegram_login);
+    }
+    if (a.telegram != null or a.tg_auth == .ready) {
+        if (a.accounts_confirm_remove_tg) {
+            appendPalette(a, "Confirm: remove the Telegram account from this PC", "", command_accounts_tg_remove_confirm);
+        } else {
+            appendPalette(a, "Remove Telegram account...", "", command_accounts_tg_remove);
+        }
     }
 }
 
@@ -6010,19 +6225,7 @@ fn runCommand(a: *App, command: u16) void {
             startSync(a);
         },
         command_telegram_login => {
-            if (a.telegram == null) {
-                setStatus(a, "Telegram is not available in this build");
-                return;
-            }
-            if (a.tg_auth == .ready) {
-                setStatus(a, "Telegram is already connected");
-                return;
-            }
-            openTelegramLogin(a, switch (a.tg_auth) {
-                .wait_code => .code,
-                .wait_password => .password,
-                else => .phone,
-            });
+            startTelegramAdd(a);
         },
         command_telegram_logout => {
             if (a.telegram) |client| client.logOut();
@@ -6030,6 +6233,24 @@ fn runCommand(a: *App, command: u16) void {
         },
         command_slack_setup => {
             openSlackSetup(a);
+        },
+        command_tg_open_apps => {
+            const url_wide = utf8ToWide(a.allocator, "https://my.telegram.org/apps") catch return;
+            defer a.allocator.free(url_wide);
+            const result = win.ShellExecuteW(a.hwnd.?, lit("open"), url_wide.ptr, null, null, win.SW_SHOWNORMAL);
+            if (@intFromPtr(result) <= 32) {
+                setStatus(a, "Windows could not open the browser");
+            }
+            // The api key prompt closed with the palette; bring it back.
+            openTelegramLogin(a, if (a.tg_login == .api_hash) .api_hash else .api_id);
+        },
+        command_accounts_tg_remove => {
+            a.accounts_confirm_remove_tg = true;
+            openAccountsPalette(a);
+        },
+        command_accounts_tg_remove_confirm => {
+            a.accounts_confirm_remove_tg = false;
+            removeTelegramAccount(a);
         },
         command_slack_disconnect => {
             slack_win.clearTokens();
@@ -8225,8 +8446,26 @@ pub fn main(init: std.process.Init) !void {
     loadEmojiRecents(&app);
     if (init.environ_map.get("LOCALAPPDATA")) |local| {
         if (std.fs.path.join(init.gpa, &.{ local, "Messages", "telegram" })) |telegram_dir| {
-            if (tg.Client.create(init.gpa, init.io, build_info.telegram_api_id, build_info.telegram_api_hash, telegram_dir)) |client| {
-                app.telegram = client;
+            // Runtime keys (registry) override the baked build defaults.
+            if (loadRegistryString(init.gpa, lit("TelegramApiId"))) |stored| {
+                if (std.fmt.parseInt(i32, stored, 10)) |parsed| {
+                    if (parsed != 0) {
+                        app.tg_api_id = parsed;
+                        if (loadRegistryString(init.gpa, lit("TelegramApiHash"))) |stored_hash| {
+                            if (stored_hash.len > 0) app.tg_api_hash.set(stored_hash);
+                        }
+                    }
+                } else |_| {}
+            }
+            if (app.tg_api_id == 0) app.tg_api_id = build_info.telegram_api_id;
+            if (app.tg_api_hash.len == 0) app.tg_api_hash.set(build_info.telegram_api_hash);
+            app.tg_data_dir.set(telegram_dir);
+            // Without usable keys the client is created on demand once the
+            // Add Telegram flow has collected them.
+            if (app.tg_api_id != 0 and app.tg_api_hash.len > 0) {
+                if (tg.Client.create(init.gpa, init.io, app.tg_api_id, app.tg_api_hash.slice(), telegram_dir)) |client| {
+                    app.telegram = client;
+                }
             }
         } else |_| {}
     }
