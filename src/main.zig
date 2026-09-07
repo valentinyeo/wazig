@@ -2348,15 +2348,17 @@ fn removeFirstPendingRead(a: *App) void {
 const max_read_retries = 3;
 
 fn requeueFailedRead(a: *App) bool {
-    if (a.read_retries[0] + 1 >= max_read_retries or a.pending_read_count >= a.pending_reads.len) {
+    if (a.read_retries[0] + 1 >= max_read_retries) {
         removeFirstPendingRead(a);
         return false;
     }
-    a.read_retries[0] += 1;
-    a.pending_reads[a.pending_read_count].set(a.pending_reads[0].slice());
-    a.read_retries[a.pending_read_count] = a.read_retries[0];
-    a.pending_read_count += 1;
+    // Rotate in place: a full queue must not cost the failed read its retry.
+    const jid = a.pending_reads[0];
+    const retries = a.read_retries[0] + 1;
     removeFirstPendingRead(a);
+    a.pending_reads[a.pending_read_count] = jid;
+    a.read_retries[a.pending_read_count] = retries;
+    a.pending_read_count += 1;
     return true;
 }
 
