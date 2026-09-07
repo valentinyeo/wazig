@@ -301,6 +301,9 @@ const Message = struct {
     reaction: WideText(31) = .{},
     from_me: bool = false,
     revoked: bool = false,
+    // WAZI-61: optimistic Slack sends render before Slack confirms; .failed
+    // bubbles keep their text with a "(not sent)" marker.
+    send_state: enum { none, pending, failed } = .none,
     bitmap: ?win.HBITMAP = null,
     bitmap_width: i32 = 0,
     bitmap_height: i32 = 0,
@@ -334,6 +337,8 @@ const WacliJob = struct {
     jid: Utf8Text(191) = .{},
     msg_id: Utf8Text(191) = .{},
     extra: Utf8Text(63) = .{},
+    // WAZI-61: enqueue timestamp so send latency is visible in the UI.
+    started_ms: u64 = 0,
     arg_count: usize = 0,
     args: [max_wacli_args]Utf8Text(wacli_arg_cap) = [_]Utf8Text(wacli_arg_cap){.{}} ** max_wacli_args,
 };
@@ -345,6 +350,7 @@ const WacliResult = struct {
     jid: Utf8Text(191) = .{},
     msg_id: Utf8Text(191) = .{},
     extra: Utf8Text(63) = .{},
+    started_ms: u64 = 0,
     data: []u8 = &.{},
 };
 
@@ -570,6 +576,7 @@ const App = struct {
     // safe because start.zig provides c_allocator and std.Io.Threaded, both
     // thread-safe. wacli_pending is only touched under wacli_mutex.
     wacli_thread: ?std.Thread = null,
+    wacli_slack_thread: ?std.Thread = null,
     wacli_mutex: std.Io.Mutex = .init,
     wacli_cond: std.Io.Condition = .init,
     wacli_queue: [wacli_queue_size]WacliJob = [_]WacliJob{.{}} ** wacli_queue_size,
@@ -1016,15 +1023,22 @@ fn wacliEnqueue(a: *App, job: WacliJob, urgent: bool) void {
         a.wacli_queue_len -= 1;
     }
     if (urgent) {
+        // WAZI-61: sends must keep the order they were typed in, so an urgent
+        // send slots in after any already-queued sends instead of jumping
+        // ahead of them (plain head-insert would reverse A and B).
+        var insert: usize = 0;
+        while (insert < a.wacli_queue_len and
+            (a.wacli_queue[insert].kind == .slack_send or a.wacli_queue[insert].kind == .slack_attach)) insert += 1;
         var shift = a.wacli_queue_len;
-        while (shift > 0) : (shift -= 1) a.wacli_queue[shift] = a.wacli_queue[shift - 1];
-        a.wacli_queue[0] = job;
+        while (shift > insert) : (shift -= 1) a.wacli_queue[shift] = a.wacli_queue[shift - 1];
+        a.wacli_queue[insert] = job;
     } else {
         a.wacli_queue[a.wacli_queue_len] = job;
     }
     a.wacli_queue_len += 1;
     a.wacli_pending[@intFromEnum(job.kind)] += 1;
-    a.wacli_cond.signal(a.io);
+    // Two worker lanes (wacli and Slack) scan the same queue: wake both.
+    a.wacli_cond.broadcast(a.io);
     a.wacli_mutex.unlock(a.io);
     if (dropped_reaction) setStatus(a, "Reaction queue is full; try again");
     if (a.wacli_thread == null) wacliPumpSync(a);
@@ -1051,10 +1065,12 @@ fn wacliPumpSync(a: *App) void {
 fn wacliShutdown(a: *App) void {
     a.wacli_mutex.lockUncancelable(a.io);
     a.wacli_quit = true;
-    a.wacli_cond.signal(a.io);
+    a.wacli_cond.broadcast(a.io);
     a.wacli_mutex.unlock(a.io);
     if (a.wacli_thread) |thread| thread.join();
     a.wacli_thread = null;
+    if (a.wacli_slack_thread) |thread| thread.join();
+    a.wacli_slack_thread = null;
     for (a.msg_cache[0..a.msg_cache_len]) |*entry| {
         if (entry.data) |data| a.allocator.free(data);
         entry.data = null;
@@ -1062,20 +1078,41 @@ fn wacliShutdown(a: *App) void {
     a.msg_cache_len = 0;
 }
 
-fn wacliWorkerMain(a: *App) void {
+/// True when `kind` runs on the dedicated Slack lane (WAZI-61): a 429 backoff
+/// sleep then stalls only Slack work, never wacli reads/writes.
+fn jobIsSlack(kind: WacliJobKind) bool {
+    return switch (kind) {
+        .slack_workspace, .slack_users, .slack_history, .slack_replies, .slack_send, .slack_attach, .slack_download, .slack_auth => true,
+        else => false,
+    };
+}
+
+/// Take the first queued job matching this lane; null when none is queued.
+/// Caller holds wacli_mutex.
+fn wacliTakeJob(a: *App, slack_lane: bool) ?WacliJob {
+    var index: usize = 0;
+    while (index < a.wacli_queue_len) : (index += 1) {
+        if (jobIsSlack(a.wacli_queue[index].kind) != slack_lane) continue;
+        const job = a.wacli_queue[index];
+        var shift = index;
+        while (shift + 1 < a.wacli_queue_len) : (shift += 1) a.wacli_queue[shift] = a.wacli_queue[shift + 1];
+        a.wacli_queue_len -= 1;
+        return job;
+    }
+    return null;
+}
+
+fn wacliWorkerMain(a: *App, slack_lane: bool) void {
     while (true) {
         a.wacli_mutex.lockUncancelable(a.io);
-        while (a.wacli_queue_len == 0 and !a.wacli_quit) a.wacli_cond.waitUncancelable(a.io, &a.wacli_mutex);
+        while (wacliTakeJob(a, slack_lane) == null and !a.wacli_quit) a.wacli_cond.waitUncancelable(a.io, &a.wacli_mutex);
         // Quit discards any remaining queued jobs: the window is going away
         // and joining behind them would hang the close.
         if (a.wacli_quit) {
             a.wacli_mutex.unlock(a.io);
             return;
         }
-        const job = a.wacli_queue[0];
-        var shift: usize = 0;
-        while (shift + 1 < a.wacli_queue_len) : (shift += 1) a.wacli_queue[shift] = a.wacli_queue[shift + 1];
-        a.wacli_queue_len -= 1;
+        const job = wacliTakeJob(a, slack_lane).?;
         a.wacli_mutex.unlock(a.io);
         wacliRunJob(a, job);
     }
@@ -1092,7 +1129,7 @@ fn wacliRunJob(a: *App, job: WacliJob) void {
         wacliPendingSub(a, job.kind);
         return;
     };
-    result.* = .{ .kind = job.kind, .gen = job.gen, .jid = job.jid, .msg_id = job.msg_id, .extra = job.extra };
+    result.* = .{ .kind = job.kind, .gen = job.gen, .jid = job.jid, .msg_id = job.msg_id, .extra = job.extra, .started_ms = job.started_ms };
     switch (job.kind) {
         .slack_workspace, .slack_users, .slack_history, .slack_replies, .slack_send, .slack_attach, .slack_download, .slack_auth => {
             var slack_args: [max_wacli_args][]const u8 = undefined;
@@ -2162,6 +2199,19 @@ fn applySlackHistory(a: *App, raw: []const u8) void {
     if (a.selected_message) |selected| {
         if (selected < a.message_count) selected_id.set(a.messages[selected].id.slice());
     }
+    // WAZI-61: optimistic bubbles are not in Slack's history yet. Keep them
+    // only when this refresh is for the chat already on screen; a chat switch
+    // discards them (the switched-back view refetches authoritative history).
+    var saved: [8]Message = undefined;
+    var saved_count: usize = 0;
+    if (std.mem.eql(u8, a.displayed_jid.slice(), chat.jid.slice())) {
+        for (a.messages[0..a.message_count]) |*message| {
+            if (message.from_me and message.send_state != .none and saved_count < saved.len) {
+                saved[saved_count] = message.*;
+                saved_count += 1;
+            }
+        }
+    }
     clearMessages(a);
     a.selected_message = null;
     var reply_parents: [8]Utf8Text(64) = [_]Utf8Text(64){.{}} ** 8;
@@ -2182,6 +2232,11 @@ fn applySlackHistory(a: *App, raw: []const u8) void {
         if (item.file_url.len > 0 and count <= 20) {
             requestSlackDownload(a, chat.jid.slice(), item);
         }
+    }
+    for (saved[0..saved_count]) |message| {
+        if (a.message_count >= max_messages) break;
+        a.messages[a.message_count] = message;
+        a.message_count += 1;
     }
     if (selected_id.len > 0) {
         for (a.messages[0..a.message_count], 0..) |*message, index| {
@@ -2244,6 +2299,88 @@ fn insertSlackMessageSorted(a: *App, message: Message) void {
     a.message_count += 1;
 }
 
+/// WAZI-61: render an optimistic bubble for a Slack text send the moment the
+/// composer clears, instead of waiting for the send round trip plus echo.
+fn appendSlackPending(a: *App, text: []const u8) void {
+    if (a.message_count >= max_messages) return;
+    var message = Message{};
+    message.from_me = true;
+    message.sender.set(a.allocator, "You");
+    message.text.set(a.allocator, text);
+    var local = std.mem.zeroes(win.SYSTEMTIME);
+    win.GetLocalTime(&local);
+    var buffer: [6]u8 = undefined;
+    if (std.fmt.bufPrint(&buffer, "{d:0>2}:{d:0>2}", .{ local.wHour, local.wMinute })) |rendered| {
+        message.time.set(a.allocator, rendered);
+    } else |_| {}
+    message.send_state = .pending;
+    a.messages[a.message_count] = message;
+    a.message_count += 1;
+    a.scroll_y = 0; // the user just typed: pin the view to the newest bubble
+    if (a.canvas) |canvas| _ = win.InvalidateRect(canvas, null, win.TRUE);
+}
+
+/// Index of the oldest from-me pending Slack bubble in the open conversation.
+fn oldestPendingSend(a: *App) ?usize {
+    for (a.messages[0..a.message_count], 0..) |*message, index| {
+        if (message.from_me and message.send_state == .pending) return index;
+    }
+    return null;
+}
+
+/// Drop the bubble the moment our own echo arrives (it can beat the HTTP
+/// response); the response then finds no pending and becomes a no-op.
+fn dropPendingForEcho(a: *App, text: []const u8) void {
+    const index = oldestPendingSend(a) orelse return;
+    const message = &a.messages[index];
+    const pending_len = std.unicode.utf16LeToUtf8Alloc(a.allocator, message.text.slice()) catch return;
+    defer a.allocator.free(pending_len);
+    if (std.mem.eql(u8, pending_len, text)) {
+        var shift = index;
+        while (shift + 1 < a.message_count) : (shift += 1) a.messages[shift] = a.messages[shift + 1];
+        a.message_count -= 1;
+    }
+}
+
+/// Stamp the optimistic bubble with Slack's authoritative ts (or mark it
+/// failed) when the chat.postMessage job completes.
+fn resolveSlackSend(a: *App, result: *WacliResult) void {
+    const index = oldestPendingSend(a) orelse return;
+    if (!result.ok) {
+        const message = &a.messages[index];
+        message.send_state = .failed;
+        if (message.text.len + " (not sent)".len < slack.max_text) {
+            const old = std.unicode.utf16LeToUtf8Alloc(a.allocator, message.text.slice()) catch return;
+            defer a.allocator.free(old);
+            const marked = std.fmt.allocPrint(a.allocator, "{s} (not sent)", .{old}) catch return;
+            defer a.allocator.free(marked);
+            message.text.set(a.allocator, marked);
+        }
+        if (a.canvas) |canvas| _ = win.InvalidateRect(canvas, null, win.TRUE);
+        return;
+    }
+    const ts = slack.parseSentTs(a.allocator, result.data) orelse {
+        // No usable ts: the send succeeded, so release the pending state and
+        // let the next history refresh give the bubble its real identity.
+        a.messages[index].send_state = .none;
+        return;
+    };
+    defer a.allocator.free(ts);
+    // The echo may have replaced the pending bubble already; then the message
+    // with this ts exists and there is nothing left to stamp.
+    for (a.messages[0..a.message_count]) |*message| {
+        if (std.mem.eql(u8, message.id.slice(), ts)) return;
+    }
+    const message = &a.messages[index];
+    message.id.set(ts);
+    formatSlackTime(&message.time, a.allocator, ts);
+    message.send_state = .none;
+    a.slack_log_mutex.lockUncancelable(a.io);
+    _ = a.slack_log.mark(result.jid.slice(), ts);
+    a.slack_log_mutex.unlock(a.io);
+    if (a.canvas) |canvas| _ = win.InvalidateRect(canvas, null, win.TRUE);
+}
+
 fn requestSlackDownload(a: *App, channel: []const u8, item: slack.HistoryItem) void {
     if (item.file_id.len == 0 or item.file_url.len == 0) return;
     var job = WacliJob{ .kind = .slack_download };
@@ -2287,6 +2424,7 @@ fn applySlackEvent(a: *App, event: *slack_win.Event) void {
             .file_size = event.file_size,
         };
         _ = &item;
+        if (from_me) dropPendingForEcho(a, item.text);
         const message = buildSlackMessage(a, item);
         insertSlackMessageSorted(a, message);
         if (item.file_url.len > 0) requestSlackDownload(a, channel, item);
@@ -4699,19 +4837,24 @@ fn sendMessage(a: *App) void {
             releaseStagedImage(a);
         }
         if (attach.len > 0) {
-            var job = WacliJob{ .kind = .slack_attach };
+            var job = WacliJob{ .kind = .slack_attach, .started_ms = win.GetTickCount64() };
+            job.jid.set(chat.jid.slice());
             wacliJobArgs(&job, &.{ chat.jid.slice(), a.reply_to.slice(), attach, text });
-            wacliEnqueue(a, job, false);
+            wacliEnqueue(a, job, true);
         } else {
-            var job = WacliJob{ .kind = .slack_send };
+            var job = WacliJob{ .kind = .slack_send, .started_ms = win.GetTickCount64() };
+            job.jid.set(chat.jid.slice());
             wacliJobArgs(&job, &.{ chat.jid.slice(), text, a.reply_to.slice() });
-            wacliEnqueue(a, job, false);
+            wacliEnqueue(a, job, true);
+            // WAZI-61: show the message immediately as pending; the send
+            // completion (or the Slack echo, whichever lands first) stamps
+            // it with the real ts or marks it failed.
+            appendSlackPending(a, text);
         }
         clearReply(a);
         a.user_viewed = true;
         _ = win.SetWindowTextW(a.compose.?, lit(""));
         layout(a, a.compose_client_width, a.compose_client_height);
-        setStatus(a, "Sending to Slack...");
         focusCompose(a);
         return;
     }
@@ -7170,7 +7313,8 @@ fn drawCanvas(hwnd: win.HWND, a: *App) void {
         const left: i32 = if (message.from_me) client.right - bubble_width - 24 else if (in_group) 62 else 24;
         const right = left + bubble_width;
         message.bubble_hit = .{ .left = left, .top = y, .right = right, .bottom = y + height };
-        const brush = win.CreateSolidBrush(if (message.from_me) color_outgoing else color_incoming) orelse continue;
+        const failed = message.send_state == .failed;
+        const brush = win.CreateSolidBrush(if (failed) color_muted else if (message.from_me) color_outgoing else color_incoming) orelse continue;
         const old_brush = win.SelectObject(hdc, brush);
         const selected = if (a.selected_message) |selected_index| selected_index == index else false;
         const selection_pen = if (selected) win.CreatePen(win.PS_SOLID, 2, color_accent) else null;
@@ -7606,8 +7750,20 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
                         applySlackReplies(a, result.data);
                     }
                 },
-                .slack_send => setStatus(a, if (result.ok) "Sent" else "Slack send failed"),
-                .slack_attach => setStatus(a, if (result.ok) "Image sent" else "Slack image send failed"),
+                .slack_send, .slack_attach => {
+                    // Only text sends own an optimistic bubble; an attach
+                    // failure must never fail a pending text bubble.
+                    if (result.kind == .slack_send) resolveSlackSend(a, result);
+                    var status_buffer: [64]u8 = undefined;
+                    if (result.ok) {
+                        // WAZI-61 timing: enqueue-to-confirmation, visible proof.
+                        const label: []const u8 = if (result.kind == .slack_send) "Sent" else "Image sent";
+                        const elapsed = win.GetTickCount64() - result.started_ms;
+                        setStatus(a, std.fmt.bufPrint(&status_buffer, "{s} in {d} ms", .{ label, elapsed }) catch label);
+                    } else {
+                        setStatus(a, if (result.kind == .slack_send) "Slack send failed" else "Slack image send failed");
+                    }
+                },
                 .slack_download => {
                     if (result.ok) {
                         const ts = result.msg_id.slice();
@@ -7666,9 +7822,14 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
             _ = win.SetTimer(hwnd, timer_telegram, 250, null);
             _ = win.SetTimer(hwnd, timer_update_check, update_check_interval_ms, null);
             if (a.wacli_thread == null) {
-                a.wacli_thread = std.Thread.spawn(.{ .stack_size = 1024 * 1024 }, wacliWorkerMain, .{a}) catch null;
+                a.wacli_thread = std.Thread.spawn(.{ .stack_size = 1024 * 1024 }, wacliWorkerMain, .{ a, false }) catch null;
             }
             if (a.wacli_thread == null) setStatus(a, "Background reader failed to start");
+            // WAZI-61: a second lane for Slack HTTP so a 429 backoff sleep
+            // cannot stall wacli work (and vice versa).
+            if (a.wacli_slack_thread == null) {
+                a.wacli_slack_thread = std.Thread.spawn(.{ .stack_size = 1024 * 1024 }, wacliWorkerMain, .{ a, true }) catch null;
+            }
             refreshGroups(a);
             refreshChats(a);
             refreshMessages(a);

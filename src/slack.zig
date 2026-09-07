@@ -357,6 +357,24 @@ pub fn responseIsOk(allocator: std.mem.Allocator, body: []const u8) bool {
     };
 }
 
+/// Copy the message ts out of a chat.postMessage response body, so the
+/// optimistic bubble can adopt Slack's authoritative timestamp. Returns a
+/// heap slice; null when the body has no usable ts.
+pub fn parseSentTs(allocator: std.mem.Allocator, body: []const u8) ?[]u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return null;
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |object| object,
+        else => return null,
+    };
+    const ts = switch (root.get("ts") orelse return null) {
+        .string => |text| text,
+        else => return null,
+    };
+    if (ts.len == 0 or ts.len > 40) return null;
+    return allocator.dupe(u8, ts) catch null;
+}
+
 /// Percent-encode a query value (Slack cursors are base64 with +/=).
 pub fn percentEncode(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
     var out = std.ArrayList(u8).empty;
@@ -554,4 +572,13 @@ test "Log is exactly-once per channel and ts" {
         _ = log.mark("K", key);
     }
     try std.testing.expect(log.mark("C1", "5.1"));
+}
+
+test "parseSentTs extracts the message timestamp" {
+    const allocator = std.testing.allocator;
+    const ts = parseSentTs(allocator, "{\"ok\":true,\"channel\":\"C1\",\"ts\":\"1757000000.000300\"}") orelse return error.TestUnexpectedResult;
+    defer allocator.free(ts);
+    try std.testing.expectEqualStrings("1757000000.000300", ts);
+    try std.testing.expect(parseSentTs(allocator, "{\"ok\":false,\"error\":\"rate_limited\"}") == null);
+    try std.testing.expect(parseSentTs(allocator, "not json") == null);
 }
