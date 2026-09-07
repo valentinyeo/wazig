@@ -15,7 +15,7 @@ jobs:
       TDLIB_COMMIT: d1085f9cebc5a62379991ae1652673954f229c1f
     steps:
       - uses: actions/checkout@v4
-      - uses: mlugg/setup-zig@v2
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: 0.16.0
       - name: Check tag shape
@@ -38,8 +38,10 @@ jobs:
         run: |
           P=/tmp/tdbuild-prefix
           mkdir -p "$P" /tmp/tdlib-install
-          git clone --depth 1 --branch v1.3.1 https://github.com/madler/zlib.git /tmp/zlibsrc
-          (cd /tmp/zlibsrc && CC=x86_64-w64-mingw32-gcc ./configure --static --prefix="$P" && make -j$(nproc) install)
+          # Pinned to the v1.3.1 commit so the release build never runs
+          # code from a tag that could be moved.
+          git clone https://github.com/madler/zlib.git /tmp/zlibsrc
+          (cd /tmp/zlibsrc && git checkout 51b7f2abdade71cd9bb0e7a373ef2610ec6f9daf && CC=x86_64-w64-mingw32-gcc ./configure --static --prefix="$P" && make -j$(nproc) install)
           # Integrity: this tarball is statically linked into the shipped binary; pin the
           # sha256 published on the official openssl-3.3.2 GitHub release.
           echo '2e8a40b01979afe8be0bbfb3de5dc1c6709fedb46d6c89c10da114ab5fc3d281  /tmp/openssl.tar.gz' > /tmp/openssl.sha256

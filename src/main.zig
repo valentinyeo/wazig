@@ -1806,8 +1806,17 @@ fn handleTgKeyInput(a: *App) void {
                 return;
             }
             a.tg_api_hash.set(trimmed);
-            saveTelegramKeys(a);
+            if (!saveTelegramKeys(a)) {
+                setStatus(a, "Could not save the Telegram keys on this PC. Try again.");
+                return;
+            }
             createTelegramClient(a);
+            if (a.telegram == null) {
+                // Creation failed: stay on the api_hash step so Enter retries
+                // instead of a phone prompt that can never be answered.
+                setStatus(a, "Telegram could not start on this PC. Press Enter to try again.");
+                return;
+            }
             a.tg_login = .none;
             closePalette(a);
             openTelegramLogin(a, .phone);
@@ -1848,21 +1857,28 @@ fn startTelegramAdd(a: *App) void {
     });
 }
 
-fn saveTelegramKeys(a: *App) void {
+/// Returns false when either registry write failed; the caller treats the
+/// keys as unsaved instead of continuing the login with half-saved keys.
+fn saveTelegramKeys(a: *App) bool {
     var key: win.HKEY = undefined;
-    if (win.RegCreateKeyExW(winHandle(win.HKEY, 0x80000001), lit("Software\\Messages"), 0, null, 0, win.KEY_SET_VALUE, null, &key, null) != win.ERROR_SUCCESS) {
-        setStatus(a, "Could not save the Telegram keys");
-        return;
-    }
+    if (win.RegCreateKeyExW(winHandle(win.HKEY, 0x80000001), lit("Software\\Messages"), 0, null, 0, win.KEY_SET_VALUE, null, &key, null) != win.ERROR_SUCCESS) return false;
     defer _ = win.RegCloseKey(key);
     var id_buffer: [16]u8 = undefined;
-    const id_text = std.fmt.bufPrint(&id_buffer, "{d}", .{a.tg_api_id}) catch return;
-    const id_wide = utf8ToWide(a.allocator, id_text) catch return;
+    const id_text = std.fmt.bufPrint(&id_buffer, "{d}", .{a.tg_api_id}) catch return false;
+    const id_wide = utf8ToWide(a.allocator, id_text) catch return false;
     defer a.allocator.free(id_wide);
-    _ = win.RegSetValueExW(key, lit("TelegramApiId"), 0, win.REG_SZ, @ptrCast(id_wide.ptr), @intCast((id_wide.len + 1) * 2));
-    const hash_wide = utf8ToWide(a.allocator, a.tg_api_hash.slice()) catch return;
+    const id_saved = win.RegSetValueExW(key, lit("TelegramApiId"), 0, win.REG_SZ, @ptrCast(id_wide.ptr), @intCast((id_wide.len + 1) * 2)) == win.ERROR_SUCCESS;
+    const hash_wide = utf8ToWide(a.allocator, a.tg_api_hash.slice()) catch return false;
     defer a.allocator.free(hash_wide);
-    _ = win.RegSetValueExW(key, lit("TelegramApiHash"), 0, win.REG_SZ, @ptrCast(hash_wide.ptr), @intCast((hash_wide.len + 1) * 2));
+    const hash_saved = win.RegSetValueExW(key, lit("TelegramApiHash"), 0, win.REG_SZ, @ptrCast(hash_wide.ptr), @intCast((hash_wide.len + 1) * 2)) == win.ERROR_SUCCESS;
+    if (!id_saved or !hash_saved) {
+        // Roll back a partial write so a later start does not read a key
+        // pair where only one half belongs to this user.
+        _ = win.RegDeleteValueW(key, lit("TelegramApiId"));
+        _ = win.RegDeleteValueW(key, lit("TelegramApiHash"));
+        return false;
+    }
+    return true;
 }
 
 fn deleteTelegramKeys(a: *App) void {
