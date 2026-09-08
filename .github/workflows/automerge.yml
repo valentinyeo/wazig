@@ -71,7 +71,10 @@ jobs:
                 sleep 15
                 # Only a numeric count of at least one successful run counts;
                 # a failed query must not be read as "ci started".
-                count=$(gh run list -R "$REPO" -w ci -b main --commit "$merged_oid" --json databaseId,conclusion -q '[.[] | select(.conclusion == "success")] | length' 2>/dev/null) || count=""
+                # Any run for the commit (even queued) proves the dispatch
+                # landed; re-dispatching while ci is merely slow would only
+                # duplicate runs.
+                count=$(gh run list -R "$REPO" -w ci -b main --commit "$merged_oid" --json databaseId -q 'length' 2>/dev/null) || count=""
                 if [ "${count:-0}" -ge 1 ] 2>/dev/null; then
                   echo "#$pr: ci dispatched on main (${merged_oid})"
                   ci_started=1

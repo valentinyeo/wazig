@@ -75,14 +75,14 @@ jobs:
           # job here instead of skipping: dispatch at the existing tag.
           tag="$(git tag -l 'v*' --points-at HEAD | grep -E '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' | tail -1 || true)"
           if [ -n "${tag}" ]; then
-            started="$(gh run list -R "${GITHUB_REPOSITORY}" -w release \
-              --json event,headBranch,headSha \
-              -q "[.[] | select((.event == \"push\" or .event == \"workflow_dispatch\") and .headBranch == \"${tag}\" and .headSha == \"$(git rev-parse HEAD)\")] | length")"
-            if [ "${started}" != "0" ]; then
-              echo "HEAD already carries a release tag and release.yml is running"
+            read -r running done_ok < <(gh run list -R "${GITHUB_REPOSITORY}" -w release \
+              --json event,headBranch,headSha,status,conclusion \
+              -q '[.[] | select((.event == "push" or .event == "workflow_dispatch") and .headBranch == "'"${tag}"'" and .headSha == "'"$(git rev-parse HEAD)"'")] | [([.[] | select(.status == "queued" or .status == "in_progress")] | length), ([.[] | select(.conclusion == "success")] | length)] | "\(.[0]) \(.[1])"' 2>/dev/null || echo "0 0")
+            if [ "${running:-0}" -ge 1 ] 2>/dev/null || [ "${done_ok:-0}" -ge 1 ] 2>/dev/null; then
+              echo "HEAD already carries a release tag and its release ran or is running"
               echo "skip=true" >> "$GITHUB_ENV"
             else
-              echo "HEAD is tagged ${tag} but never released; dispatching release.yml"
+              echo "HEAD is tagged ${tag} but has no successful release run; dispatching release.yml"
               gh workflow run release.yml -R "${GITHUB_REPOSITORY}" --ref "${tag}"
               exit 0
             fi
