@@ -2916,7 +2916,7 @@ fn requeueFailedRead(a: *App) bool {
 // because the store's unread state only clears once the write lands.
 fn persistPendingReads(a: *App) void {
     if (a.read_path.len == 0) return;
-    var buffer: [max_pending_reads * 192]u8 = undefined;
+    var buffer: [pending_reads.max_pending_reads * (pending_reads.max_jid_len + 1)]u8 = undefined;
     var total: usize = 0;
     for (a.pending_reads[0..a.pending_read_count]) |entry| {
         const jid = entry.slice();
@@ -2942,14 +2942,18 @@ fn persistPendingReads(a: *App) void {
         if (win.WriteFile(handle, buffer[written_total..].ptr, @intCast(total - written_total), &written, null) == 0 or written == 0) ok = false;
         written_total += written;
     }
+    if (ok and win.FlushFileBuffers(handle) == 0) ok = false;
     _ = win.CloseHandle(handle);
-    if (!ok or written_total != total) return;
+    if (!ok or written_total != total) {
+        _ = win.DeleteFileW(wide.ptr);
+        return;
+    }
     const target = std.unicode.utf8ToUtf16LeAllocZ(a.allocator, a.read_path) catch return;
     defer a.allocator.free(target);
     // A full write landed; replacing the queue now cannot leave a truncated
     // store behind. If the swap itself fails the in-memory queue is still
     // accurate and WM_DESTROY re-persists (retries the swap) on exit.
-    _ = win.MoveFileExW(wide.ptr, target.ptr, win.MOVEFILE_REPLACE_EXISTING);
+    _ = win.MoveFileExW(wide.ptr, target.ptr, win.MOVEFILE_REPLACE_EXISTING | win.MOVEFILE_WRITE_THROUGH);
 }
 
 /// Fills `out` from the one-jid-per-line queue file, dropping duplicates and
@@ -2973,7 +2977,8 @@ fn loadPendingReads(a: *App) void {
     var parsed: [pending_reads.max_pending_reads][pending_reads.max_jid_len + 1]u8 = undefined;
     const count = pending_reads.parse(buffer[0..total], &parsed);
     a.pending_read_count = 0;
-    for (parsed[0..count]) |entry| {
+    // @min guards the App-side queue length ever diverging from the parser's.
+    for (parsed[0..@min(count, a.pending_reads.len)]) |entry| {
         const jid = pending_reads.term(entry[0..]);
         a.pending_reads[a.pending_read_count].set(jid);
         a.pending_read_count += 1;
