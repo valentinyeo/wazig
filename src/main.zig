@@ -2364,6 +2364,14 @@ fn pendingByClientMsgId(a: *App, client_msg_id: []const u8) ?usize {
 }
 
 fn removeMessageAt(a: *App, index: usize) void {
+    // Keep the selection pointing at the same bubble (or none) after the shift.
+    if (a.selected_message) |selected| {
+        if (selected == index) {
+            a.selected_message = null;
+        } else if (selected > index) {
+            a.selected_message = selected - 1;
+        }
+    }
     var shift = index;
     while (shift + 1 < a.message_count) : (shift += 1) a.messages[shift] = a.messages[shift + 1];
     a.message_count -= 1;
