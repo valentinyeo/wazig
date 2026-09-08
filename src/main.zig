@@ -1259,6 +1259,12 @@ fn ensureWebPBitmap(a: *App, message: *Message) void {
     const data = readFileWin(a.allocator, path_utf8, 32 * 1024 * 1024) orelse return;
     defer a.allocator.free(data);
     if (!webp_detect.isWebPBytes(data)) return;
+    var features: webp.WebPBitstreamFeatures = undefined;
+    if (webp.WebPGetFeatures(data.ptr, data.len, &features) != webp.VP8_STATUS_OK) return;
+    // Untrusted sticker bytes: reject sizes whose decoded pixels could exhaust
+    // memory (16M pixels is ~64 MiB of RGBA, far above any sticker).
+    if (features.width <= 0 or features.height <= 0) return;
+    if (@as(i64, features.width) * @as(i64, features.height) > 16 * 1024 * 1024) return;
     var width: c_int = 0;
     var height: c_int = 0;
     var pixels = webp.WebPDecodeRGBA(data.ptr, data.len, &width, &height);
