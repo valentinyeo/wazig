@@ -9386,7 +9386,7 @@ fn clearStaleOrphans() void {
     // First pass: pids that own a visible window anywhere on the desktop.
     // The list is bounded; if it overflows we skip orphan cleanup entirely
     // rather than risk misreading a live copy as windowless.
-    var visible: [64]win.DWORD = undefined;
+    var visible: [1024]win.DWORD = undefined;
     var visible_count: usize = 0;
     var visible_overflow = false;
     const ctx = VisibleWindowScan{ .pids = &visible, .count = &visible_count, .overflow = &visible_overflow };
@@ -9401,20 +9401,38 @@ fn clearStaleOrphans() void {
     if (win.Process32FirstW(snapshot, &entry) == 0) return;
     while (true) {
         const pid = entry.th32ProcessID;
-        if (pid != self_pid and isWindowlessProcess(visible[0..visible_count], pid)) {
-            var path_buf: [519]u16 = undefined;
-            var path_len: win.DWORD = path_buf.len;
-            const handle = win.OpenProcess(win.PROCESS_QUERY_LIMITED_INFORMATION | win.PROCESS_TERMINATE, win.FALSE, pid);
+        if (pid != self_pid) {
+            // A live copy is also windowless while starting up (and
+            // --tdlib-smoke runs windowless by design), so only a copy that
+            // has been alive for minutes can be an orphan.
+            const handle = win.OpenProcess(win.PROCESS_QUERY_LIMITED_INFORMATION | win.PROCESS_TERMINATE | win.SYNCHRONIZE, win.FALSE, pid);
             if (handle != null and handle != win.INVALID_HANDLE_VALUE) {
-                if (win.QueryFullProcessImageNameW(handle, 0, &path_buf, &path_len) != 0 and
-                    path_len == exe_len and std.mem.eql(u16, path_buf[0..exe_len], exe_buf[0..exe_len]))
+                defer _ = win.CloseHandle(handle);
+                var created: win.FILETIME = undefined;
+                var exit_time: win.FILETIME = undefined;
+                var kernel_time: win.FILETIME = undefined;
+                var user_time: win.FILETIME = undefined;
+                var path_buf: [519]u16 = undefined;
+                var path_len: win.DWORD = path_buf.len;
+                var orphan_session: win.DWORD = 0;
+                var self_session: win.DWORD = 0;
+                // EnumWindows only sees this desktop, so a live copy in
+                // another user session would look windowless here; only ever
+                // reclaim orphans within our own session.
+                const same_session = win.ProcessIdToSessionId(pid, &orphan_session) != 0 and
+                    win.ProcessIdToSessionId(self_pid, &self_session) != 0 and
+                    orphan_session == self_session;
+                if (same_session and
+                    win.GetProcessTimes(handle, &created, &exit_time, &kernel_time, &user_time) != 0 and
+                    update.isStaleOrphan(self_pid, pid, containsPid(visible[0..visible_count], pid), filetimeAgeSeconds(created)) and
+                    win.QueryFullProcessImageNameW(handle, 0, &path_buf, &path_len) != 0 and
+                    eqlWideIgnoreCase(path_buf[0..path_len], exe_buf[0..exe_len]))
                 {
                     // Terminating is the only way an orphan releases the
                     // mutex it took as a windowless instance.
                     _ = win.TerminateProcess(handle, 1);
                     _ = win.WaitForSingleObject(handle, 5000);
                 }
-                _ = win.CloseHandle(handle);
             }
         }
         if (win.Process32NextW(snapshot, &entry) == 0) break;
@@ -9442,11 +9460,32 @@ fn visibleWindowProc(hwnd: win.HWND, lparam: win.LPARAM) callconv(.winapi) win.B
     return 1;
 }
 
-fn isWindowlessProcess(visible_pids: []const win.DWORD, pid: win.DWORD) bool {
-    for (visible_pids) |visible_pid| {
-        if (visible_pid == pid) return false;
+fn containsPid(pids: []const win.DWORD, pid: win.DWORD) bool {
+    for (pids) |candidate| {
+        if (candidate == pid) return true;
     }
-    return update.isStaleOrphan(win.GetCurrentProcessId(), pid, false);
+    return false;
+}
+
+fn filetimeAgeSeconds(created: win.FILETIME) u64 {
+    var now: win.FILETIME = undefined;
+    win.GetSystemTimeAsFileTime(&now);
+    const created_64 = (@as(u64, created.dwHighDateTime) << 32) | created.dwLowDateTime;
+    const now_64 = (@as(u64, now.dwHighDateTime) << 32) | now.dwLowDateTime;
+    if (now_64 <= created_64) return 0;
+    return (now_64 - created_64) / 10_000_000;
+}
+
+/// Windows paths are case-insensitive and the reporting of casing varies,
+/// so compare without case.
+fn eqlWideIgnoreCase(a: []const u16, b: []const u16) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| {
+        const lx: u16 = if (x >= 'A' and x <= 'Z') x + 0x20 else x;
+        const ly: u16 = if (y >= 'A' and y <= 'Z') y + 0x20 else y;
+        if (lx != ly) return false;
+    }
+    return true;
 }
 
 fn performUpdate(io: std.Io) !UpdateOutcome {
@@ -9456,16 +9495,17 @@ fn performUpdate(io: std.Io) !UpdateOutcome {
     // One updater at a time across every running copy of the app.
     const mutex = win.CreateMutexW(null, win.FALSE, lit("Local\\MessagesUpdateMutex")) orelse return error.UpdateMutexFailed;
     defer _ = win.CloseHandle(mutex);
-    var acquired = update.classifyMutexWait(win.WaitForSingleObject(mutex, 0)) == .acquired;
-    if (!acquired) {
+    var wait = update.classifyMutexWait(win.WaitForSingleObject(mutex, 0));
+    if (wait == .busy) {
         // WAZI-66: a windowless orphan from an earlier swap holds the mutex
         // (and the .old binary) forever, so contention used to look like
         // "no update available". End stale orphans, wait once more, and only
         // then report a distinct blocked outcome.
         clearStaleOrphans();
-        acquired = update.classifyMutexWait(win.WaitForSingleObject(mutex, 10_000)) == .acquired;
-        if (!acquired) return .blocked;
+        wait = update.classifyMutexWait(win.WaitForSingleObject(mutex, 10_000));
     }
+    if (wait == .failed) return error.UpdateMutexFailed;
+    if (wait != .acquired) return .blocked;
     defer _ = win.ReleaseMutex(mutex);
 
     var exe_wide_buf: [519]u16 = undefined;
