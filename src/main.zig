@@ -577,8 +577,6 @@ const App = struct {
     // thread-safe. wacli_pending is only touched under wacli_mutex.
     wacli_thread: ?std.Thread = null,
     wacli_slack_thread: ?std.Thread = null,
-    // WAZI-61: per-process counter for Slack client_msg_id generation.
-    slack_client_seq: u64 = 0,
     wacli_mutex: std.Io.Mutex = .init,
     wacli_cond: std.Io.Condition = .init,
     wacli_queue: [wacli_queue_size]WacliJob = [_]WacliJob{.{}} ** wacli_queue_size,
@@ -2388,11 +2386,21 @@ fn dropPendingForEcho(a: *App, event: *slack_win.Event) void {
             }
         }
     } else {
-        const oldest = oldestPendingSend(a) orelse return;
-        const message = &a.messages[oldest];
-        const pending_text = std.unicode.utf16LeToUtf8Alloc(a.allocator, message.text.slice()) catch return;
-        defer a.allocator.free(pending_text);
-        if (std.mem.eql(u8, pending_text, event.textSlice())) index = oldest;
+        // No id in the echo: match the oldest optimistic bubble whose text
+        // equals the echo, allowing the "(not sent)" failure marker.
+        for (a.messages[0..a.message_count], 0..) |*message, i| {
+            if (!message.from_me or message.send_state == .none) continue;
+            const bubble_text = std.unicode.utf16LeToUtf8Alloc(a.allocator, message.text.slice()) catch continue;
+            defer a.allocator.free(bubble_text);
+            if (std.mem.eql(u8, bubble_text, event.textSlice()) or
+                (message.send_state == .failed and bubble_text.len == event.textSlice().len + " (not sent)".len and
+                    std.mem.startsWith(u8, bubble_text, event.textSlice()) and
+                    std.mem.endsWith(u8, bubble_text, " (not sent)")))
+            {
+                index = i;
+                break;
+            }
+        }
     }
     if (index) |found| removeMessageAt(a, found);
 }
@@ -4907,9 +4915,18 @@ fn sendMessage(a: *App) void {
         } else {
             // WAZI-61: client_msg_id correlates the optimistic bubble with
             // Slack's echo and the send result, even for duplicate texts.
-            a.slack_client_seq +%= 1;
-            var cmid_buffer: [40]u8 = undefined;
-            const client_msg_id = std.fmt.bufPrint(&cmid_buffer, "wz{d}-{d}", .{ win.GetTickCount64(), a.slack_client_seq }) catch "";
+            // Slack expects a UUID here, so mint a random v4-shaped one.
+            var uuid_bytes: [16]u8 = undefined;
+            a.io.random(&uuid_bytes);
+            uuid_bytes[6] = (uuid_bytes[6] & 0x0f) | 0x40;
+            uuid_bytes[8] = (uuid_bytes[8] & 0x3f) | 0x80;
+            var cmid_buffer: [36]u8 = undefined;
+            const client_msg_id = std.fmt.bufPrint(&cmid_buffer, "{x:0>2}{x:0>2}{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}", .{
+                uuid_bytes[0],  uuid_bytes[1],  uuid_bytes[2],  uuid_bytes[3],
+                uuid_bytes[4],  uuid_bytes[5],  uuid_bytes[6],  uuid_bytes[7],
+                uuid_bytes[8],  uuid_bytes[9],  uuid_bytes[10], uuid_bytes[11],
+                uuid_bytes[12], uuid_bytes[13], uuid_bytes[14], uuid_bytes[15],
+            }) catch "";
             var job = WacliJob{ .kind = .slack_send, .started_ms = win.GetTickCount64() };
             job.jid.set(chat.jid.slice());
             job.extra.set(client_msg_id);
