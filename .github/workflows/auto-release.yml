@@ -135,23 +135,34 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # Revalidate main did not move under us since the checks above.
+          # Revalidate main against the remote, not the local checkout:
+          # both local reads stay equal even if main has moved on.
           sha="$(git rev-parse HEAD)"
-          if [ -n "${head_sha:-}" ] && [ "${sha}" != "${head_sha}" ]; then
-            echo "main moved during the run; aborting" >&2
+          remote_main="$(gh api "repos/${GITHUB_REPOSITORY}/commits/main" --jq .sha)"
+          if [ "${sha}" != "${remote_main}" ]; then
+            echo "main is now ${remote_main}, not the checked-out ${sha}; aborting" >&2
             exit 1
           fi
-          gh api "repos/${GITHUB_REPOSITORY}/git/refs" \
-            -f "ref=refs/tags/${next_tag}" -f "sha=${sha}" >/dev/null \
-            || echo "${next_tag} already points at this commit; proceeding"
+          if ! gh api "repos/${GITHUB_REPOSITORY}/git/refs" \
+            -f "ref=refs/tags/${next_tag}" -f "sha=${sha}" >/dev/null; then
+            # Refuse to publish a tag some concurrent run may have pointed
+            # elsewhere; only proceed if it already tags exactly this commit.
+            if [ "$(git rev-parse -q --verify "refs/tags/${next_tag}^{commit}")" != "${sha}" ]; then
+              echo "could not create ${next_tag} at ${sha}" >&2
+              exit 1
+            fi
+          fi
           # Single release path: the tag push is what starts release.yml.
-          # GITHUB_TOKEN ref creation is not guaranteed to fire the push
-          # trigger, so wait briefly for the release run and dispatch only as
-          # a fallback; the fallback can at worst double-start the same tag
-          # and release.yml is re-run safe (create-or-clobber upload).
+          # The push trigger fires from the ref creation (observed in the
+          # duplicate-release incident), so wait for a release run that is
+          # really this tag at this commit before falling back to a dispatch;
+          # release.yml is re-run safe (create-or-clobber upload) either way.
           for _ in 1 2 3 4 5 6; do
             sleep 10
-            if [ -n "$(gh run list -R "${GITHUB_REPOSITORY}" -w release --commit "${sha}" -L 1 --json databaseId -q 'length')" ]; then
+            started="$(gh run list -R "${GITHUB_REPOSITORY}" -w release \
+              --json event,headBranch,headSha \
+              -q "[.[] | select(.event == \"push\" and .headBranch == \"${next_tag}\" and .headSha == \"${sha}\")] | length")"
+            if [ "${started}" != "0" ]; then
               echo "release run started by the tag push"
               echo "### Released ${next_tag}" >> "$GITHUB_STEP_SUMMARY"
               exit 0
