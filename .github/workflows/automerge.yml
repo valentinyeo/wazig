@@ -58,7 +58,7 @@ jobs:
             if [ "${reason}" = "null" ]; then reason="could not evaluate PR state"; fi
             if [ -z "${reason}" ]; then
               gated=$(echo "${files_json}" | jq -r --argjson gate "$gating" '[.[] | select(. == $gate[])] | length' 2>/dev/null) || gated=""
-              if ! [ "${gated:-0}" -ge 0 ] 2>/dev/null || [ -z "${files_json}" ]; then
+              if [ -z "${files_json}" ] || ! [ -n "${gated}" ] || ! [ "${gated}" -ge 0 ] 2>/dev/null; then
                 reason="could not list PR files"
               elif [ "${gated}" -ge 1 ]; then
                 reason="edits a release-gating workflow, needs manual review"
@@ -83,7 +83,9 @@ jobs:
               fi
               ci_started=""
               for _ in 1 2 3; do
-                gh workflow run ci.yml -R "$REPO" --ref main
+                # -e is on: a transient dispatch failure must fall through
+                # to the retry, not kill the job with the PR already merged.
+                gh workflow run ci.yml -R "$REPO" --ref main || echo "#$pr: dispatch attempt failed; retrying"
                 sleep 15
                 # Only a numeric count of at least one successful run counts;
                 # a failed query must not be read as "ci started".
