@@ -65,12 +65,27 @@ jobs:
 
       - name: Skip if this commit is already released
         if: env.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           # One release tag per commit: a rerun or a second successful CI run
-          # for the same HEAD must not mint another version.
-          if git tag -l 'v*' --points-at HEAD | grep -qE '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'; then
-            echo "HEAD already carries a release tag"
-            echo "skip=true" >> "$GITHUB_ENV"
+          # for the same HEAD must not mint another version. But if a previous
+          # attempt tagged this commit and never started release.yml (the
+          # push trigger is not guaranteed for GITHUB_TOKEN refs), finish the
+          # job here instead of skipping: dispatch at the existing tag.
+          tag="$(git tag -l 'v*' --points-at HEAD | grep -E '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' | tail -1 || true)"
+          if [ -n "${tag}" ]; then
+            started="$(gh run list -R "${GITHUB_REPOSITORY}" -w release \
+              --json event,headBranch,headSha \
+              -q "[.[] | select(.event == \"push\" and .headBranch == \"${tag}\" and .headSha == \"$(git rev-parse HEAD)\")] | length")"
+            if [ "${started}" != "0" ]; then
+              echo "HEAD already carries a release tag and release.yml is running"
+              echo "skip=true" >> "$GITHUB_ENV"
+            else
+              echo "HEAD is tagged ${tag} but never released; dispatching release.yml"
+              gh workflow run release.yml -R "${GITHUB_REPOSITORY}" --ref "${tag}"
+              exit 0
+            fi
           fi
 
       - name: Release only when the app itself changed
@@ -146,10 +161,22 @@ jobs:
           if ! gh api "repos/${GITHUB_REPOSITORY}/git/refs" \
             -f "ref=refs/tags/${next_tag}" -f "sha=${sha}" >/dev/null; then
             # Refuse to publish a tag some concurrent run may have pointed
-            # elsewhere; only proceed if it already tags exactly this commit.
-            if [ "$(git rev-parse -q --verify "refs/tags/${next_tag}^{commit}")" != "${sha}" ]; then
-              echo "could not create ${next_tag} at ${sha}" >&2
+            # elsewhere; compare against the remote ref, not local state,
+            # and only proceed if it already tags exactly this commit.
+            remote_tag="$(gh api "repos/${GITHUB_REPOSITORY}/git/refs/tags/${next_tag}" --jq .object.sha 2>/dev/null || true)"
+            if [ -z "${remote_tag}" ]; then
+              echo "could not create ${next_tag} and it does not exist remotely" >&2
               exit 1
+            fi
+            if [ "${remote_tag}" != "${sha}" ]; then
+              # Annotated tags point at a tag object; peel it to the commit.
+              if [ "$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${remote_tag}" --jq .object.type 2>/dev/null || true)" = "tag" ]; then
+                remote_tag="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${remote_tag}" --jq .object.sha)"
+              fi
+              if [ "${remote_tag}" != "${sha}" ]; then
+                echo "${next_tag} exists remotely but not at ${sha}" >&2
+                exit 1
+              fi
             fi
           fi
           # Single release path: the tag push is what starts release.yml.
