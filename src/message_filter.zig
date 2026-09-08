@@ -17,6 +17,13 @@ pub const Row = struct {
 /// text, an attachment, a delete notice, or a reaction to merge into its
 /// target message. Everything else is a protocol or system event and is
 /// hidden.
+pub fn isRealMessage(row: Row) bool {
+    if (row.id.len == 0) return false;
+    return row.text.len > 0 or row.media_type.len > 0 or
+        row.filename.len > 0 or row.local_path.len > 0 or row.revoked or
+        row.reaction_to.len > 0;
+}
+
 /// wacli stores the literal "(message)" for message payloads it cannot parse
 /// (view-once, contacts, group invites and other protobuf fields it does not
 /// handle). stripPlaceholder turns it back into no text so isRealMessage can
@@ -25,13 +32,6 @@ pub const Row = struct {
 pub fn stripPlaceholder(text: []const u8) []const u8 {
     if (std.mem.eql(u8, text, "(message)")) return "";
     return text;
-}
-
-pub fn isRealMessage(row: Row) bool {
-    if (row.id.len == 0) return false;
-    return row.text.len > 0 or row.media_type.len > 0 or
-        row.filename.len > 0 or row.local_path.len > 0 or row.revoked or
-        row.reaction_to.len > 0;
 }
 
 const std = @import("std");
@@ -61,8 +61,9 @@ test "protocol stub without content is hidden" {
 test "wacli placeholder counts as no text" {
     try std.testing.expectEqualStrings("", stripPlaceholder("(message)"));
     try std.testing.expectEqualStrings("hello", stripPlaceholder("hello"));
-    // A human typing the literal text keeps it, and only the exact full
-    // string is a placeholder.
+    // Text that merely contains the placeholder keeps rendering; a human
+    // sending exactly "(message)" is indistinguishable from the unparseable
+    // payload and is dropped (accepted false positive).
     try std.testing.expectEqualStrings("(message) later", stripPlaceholder("(message) later"));
     // Placeholder without media is hidden, placeholder with media stays.
     try std.testing.expect(!isRealMessage(.{ .id = "ABC7", .text = stripPlaceholder("(message)") }));
