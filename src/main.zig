@@ -15,6 +15,7 @@ const paste_image = @import("paste_image.zig");
 const scrollbar = @import("scrollbar.zig");
 const message_filter = @import("message_filter.zig");
 const chat_cache = @import("chat_cache.zig");
+const unfurl = @import("unfurl.zig");
 
 const webp = @cImport({
     @cInclude("src/webp/decode.h");
@@ -49,6 +50,7 @@ const wm_update_ready = win.WM_APP + 2;
 const wm_wacli_done = win.WM_APP + 3;
 const wm_slack_event = win.WM_APP + 4;
 const wm_slack_reload = win.WM_APP + 5;
+const wm_unfurl_done = win.WM_APP + 6;
 const wacli_queue_size = 8;
 const max_wacli_args = 16;
 const wacli_arg_cap = 512;
@@ -255,6 +257,30 @@ const LinkSpan = struct {
     url: WideText(519) = .{},
 };
 
+// WAZI-68: unfurled video-link cards. Thumbnails, titles and stream URLs
+// live in this cache keyed by (provider, id), never inside Message structs:
+// the message array is rebuilt on every refresh while the cache survives,
+// and a shared entry also deduplicates repeated links in one chat.
+const UnfurlEntry = struct {
+    provider: unfurl.Provider = .none,
+    id: Utf8Text(unfurl.max_id_len) = .{},
+    title: WideText(159) = .{},
+    author: WideText(63) = .{},
+    play_url: WideText(1023) = .{},
+    thumb: ?win.HBITMAP = null,
+    status: enum { loading, ready, failed } = .loading,
+    // A fetch may be skipped while the concurrency cap is full; a later
+    // paint retries until this flips true.
+    fetch_started: bool = false,
+};
+
+const max_unfurl_entries = 24;
+const max_unfurl_fetches = 3;
+// Fixed card size keeps layout stable while metadata is still loading.
+const unfurl_card_width: i32 = 320;
+const unfurl_card_height: i32 = 100;
+const unfurl_thumb_width: i32 = 160;
+
 const WordSpan = struct {
     rect: win.RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 },
     start: u32 = 0,
@@ -325,6 +351,12 @@ const Message = struct {
     transcript_state: enum { none, loading, ready, failed } = .none,
     links: [8]LinkSpan = [_]LinkSpan{.{}} ** 8,
     link_count: usize = 0,
+    // WAZI-68: video links unfurl into a card; bitmaps live in the App-level
+    // unfurl cache keyed by provider+id.
+    unfurl_provider: unfurl.Provider = .none,
+    unfurl_id: Utf8Text(unfurl.max_id_len) = .{},
+    unfurl_canonical: Utf8Text(unfurl.max_canonical_len) = .{},
+    unfurl_card_hit: win.RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 },
     word_rects: [256]WordSpan = [_]WordSpan{.{}} ** 256,
     word_count: usize = 0,
     tg_file_id: i32 = 0,
@@ -584,6 +616,12 @@ const App = struct {
     wic_factory: [*c]win.IWICImagingFactory = null,
     player_window: ?win.HWND = null,
     mf_player: ?*win.IMFPMediaPlayer = null,
+    // WAZI-68 fullscreen state for the video player window.
+    player_saved_placement: win.WINDOWPLACEMENT = undefined,
+    player_fullscreen: bool = false,
+    unfurl_entries: [max_unfurl_entries]UnfurlEntry = [_]UnfurlEntry{.{}} ** max_unfurl_entries,
+    unfurl_entry_count: usize = 0,
+    unfurl_evict_slot: usize = 0,
     reply_to: Utf8Text(191) = .{},
     reply_sender: Utf8Text(191) = .{},
     displayed_jid: Utf8Text(191) = .{},
@@ -4823,10 +4861,22 @@ fn playerProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win
     const a = app_ptr orelse return win.DefWindowProcW(hwnd, message, wparam, lparam);
     switch (message) {
         win.WM_KEYDOWN => {
-            if (wparam == 27) { // escape
-                closePlayer(a);
+            if (wparam == win.VK_F11) {
+                togglePlayerFullscreen(a, hwnd);
                 return 0;
             }
+            if (wparam == 27) { // escape: leave fullscreen first, then close
+                if (a.player_fullscreen) {
+                    togglePlayerFullscreen(a, hwnd);
+                } else {
+                    closePlayer(a);
+                }
+                return 0;
+            }
+        },
+        win.WM_LBUTTONDBLCLK => {
+            togglePlayerFullscreen(a, hwnd);
+            return 0;
         },
         win.WM_SIZE => {
             // MFPlay does not move its video surface on its own.
@@ -4865,14 +4915,50 @@ fn playVideoInline(a: *App, message: *const Message) void {
     const size = clampPlayerSize(@intCast(@max(message.bitmap_width, 0)), @intCast(@max(message.bitmap_height, 0)));
     var rect = win.RECT{ .left = 0, .top = 0, .right = @intCast(size[0]), .bottom = @intCast(size[1]) };
     _ = win.AdjustWindowRect(&rect, win.WS_OVERLAPPEDWINDOW, 0);
-    const width = rect.right - rect.left;
-    const height = rect.bottom - rect.top;
+    const hwnd = openPlayerWindow(a, rect.right - rect.left, rect.bottom - rect.top) orelse {
+        setStatus(a, "Could not open the video player");
+        return;
+    };
+    var player: ?*win.IMFPMediaPlayer = null;
+    const hr = win.MFPCreateMediaPlayer(message.local_path.ptr(), 1, win.MFP_OPTION_NONE, &player_callback, hwnd, &player);
+    if (hr < 0 or player == null) {
+        setStatus(a, "Video playback is not available for this file");
+        a.player_window = null;
+        _ = win.DestroyWindow(hwnd);
+        return;
+    }
+    a.mf_player = player;
+    _ = win.ShowWindow(hwnd, win.SW_SHOW);
+}
 
+// WAZI-68: play a resolved stream URL (YouTube googlevideo, provider CDNs)
+// in the same MFPlay window used for downloaded videos.
+fn playUnfurlVideo(a: *App, entry: *const UnfurlEntry) void {
+    if (entry.play_url.len == 0) return;
+    if (a.player_window != null) closePlayer(a);
+    const hwnd = openPlayerWindow(a, 800, 450) orelse {
+        setStatus(a, "Could not open the video player");
+        return;
+    };
+    var player: ?*win.IMFPMediaPlayer = null;
+    const hr = win.MFPCreateMediaPlayer(entry.play_url.ptr(), 1, win.MFP_OPTION_NONE, &player_callback, hwnd, &player);
+    if (hr < 0 or player == null) {
+        setStatus(a, "This video cannot play in the app");
+        a.player_window = null;
+        _ = win.DestroyWindow(hwnd);
+        return;
+    }
+    a.mf_player = player;
+    _ = win.ShowWindow(hwnd, win.SW_SHOW);
+}
+
+fn openPlayerWindow(a: *App, width: i32, height: i32) ?win.HWND {
     if (!player_class_registered) {
         const class_brush = win.CreateSolidBrush(color_bg);
         var class = win.WNDCLASSEXW{
             .cbSize = @sizeOf(win.WNDCLASSEXW),
-            .style = win.CS_HREDRAW | win.CS_VREDRAW,
+            // Double clicks toggle fullscreen, so the class must see them.
+            .style = win.CS_HREDRAW | win.CS_VREDRAW | win.CS_DBLCLKS,
             .lpfnWndProc = playerProc,
             .hInstance = a.instance,
             .hCursor = win.LoadCursorW(null, @ptrFromInt(32512)),
@@ -4882,8 +4968,7 @@ fn playVideoInline(a: *App, message: *const Message) void {
         };
         if (win.RegisterClassExW(&class) == 0) {
             if (class_brush) |brush| _ = win.DeleteObject(brush);
-            setStatus(a, "Could not open the video player");
-            return;
+            return null;
         }
         player_class_registered = true;
     }
@@ -4900,21 +4985,449 @@ fn playVideoInline(a: *App, message: *const Message) void {
         null,
         a.instance,
         null,
-    ) orelse {
-        setStatus(a, "Could not open the video player");
-        return;
-    };
+    ) orelse return null;
     a.player_window = hwnd;
-    var player: ?*win.IMFPMediaPlayer = null;
-    const hr = win.MFPCreateMediaPlayer(message.local_path.ptr(), 1, win.MFP_OPTION_NONE, &player_callback, hwnd, &player);
-    if (hr < 0 or player == null) {
-        setStatus(a, "Video playback is not available for this file");
-        a.player_window = null;
-        _ = win.DestroyWindow(hwnd);
+    return hwnd;
+}
+
+// Fullscreen for the video player: borderless window covering the monitor,
+// remembered placement restored on exit. ESC exits fullscreen first.
+fn togglePlayerFullscreen(a: *App, hwnd: win.HWND) void {
+    const style = win.GetWindowLongPtrW(hwnd, win.GWL_STYLE);
+    if (!a.player_fullscreen) {
+        var placement = std.mem.zeroes(win.WINDOWPLACEMENT);
+        placement.length = @sizeOf(win.WINDOWPLACEMENT);
+        if (win.GetWindowPlacement(hwnd, &placement) == 0) return;
+        const monitor = win.MonitorFromWindow(hwnd, win.MONITOR_DEFAULTTONEAREST);
+        var info = std.mem.zeroes(win.MONITORINFO);
+        info.cbSize = @sizeOf(win.MONITORINFO);
+        if (win.GetMonitorInfoW(monitor, &info) == 0) return;
+        a.player_saved_placement = placement;
+        const overlapped: isize = @intCast(win.WS_OVERLAPPEDWINDOW);
+        const popup: isize = @intCast(win.WS_POPUP);
+        _ = win.SetWindowLongPtrW(hwnd, win.GWL_STYLE, (style & ~overlapped) | popup);
+        _ = win.SetWindowPos(
+            hwnd,
+            null,
+            info.rcMonitor.left,
+            info.rcMonitor.top,
+            info.rcMonitor.right - info.rcMonitor.left,
+            info.rcMonitor.bottom - info.rcMonitor.top,
+            win.SWP_FRAMECHANGED | win.SWP_NOOWNERZORDER,
+        );
+        a.player_fullscreen = true;
+    } else {
+        const overlapped: isize = @intCast(win.WS_OVERLAPPEDWINDOW);
+        const popup: isize = @intCast(win.WS_POPUP);
+        _ = win.SetWindowLongPtrW(hwnd, win.GWL_STYLE, (style & ~popup) | overlapped);
+        _ = win.SetWindowPlacement(hwnd, &a.player_saved_placement);
+        _ = win.SetWindowPos(hwnd, null, 0, 0, 0, 0, win.SWP_FRAMECHANGED | win.SWP_NOMOVE | win.SWP_NOSIZE | win.SWP_NOZORDER | win.SWP_NOOWNERZORDER);
+        a.player_fullscreen = false;
+    }
+    if (a.mf_player) |player| _ = player.lpVtbl.*.UpdateVideo.?(player);
+}
+
+fn detectUnfurl(message: *Message) void {
+    if (message.unfurl_provider != .none or message.link_count == 0) return;
+    var buffer: [1024]u8 = undefined;
+    const url_length = std.unicode.utf16LeToUtf8(&buffer, message.links[0].url.slice()) catch return;
+    const info = unfurl.classify(buffer[0..url_length]);
+    if (info.provider == .none) return;
+    message.unfurl_provider = info.provider;
+    message.unfurl_id.set(info.idSlice());
+    message.unfurl_canonical.set(info.canonicalSlice());
+}
+
+fn unfurlEntryFor(a: *App, message: *Message) ?*UnfurlEntry {
+    for (a.unfurl_entries[0..a.unfurl_entry_count]) |*entry| {
+        if (entry.provider == message.unfurl_provider and
+            std.mem.eql(u8, entry.id.slice(), message.unfurl_id.slice()))
+        {
+            if (!entry.fetch_started and message.unfurl_canonical.len > 0) {
+                startUnfurlFetch(a, entry, message.unfurl_canonical.slice());
+            }
+            return entry;
+        }
+    }
+    var entry: *UnfurlEntry = undefined;
+    if (a.unfurl_entry_count < max_unfurl_entries) {
+        entry = &a.unfurl_entries[a.unfurl_entry_count];
+        a.unfurl_entry_count += 1;
+    } else {
+        // Cache full: reuse the oldest slot. Its bitmap is deleted here on
+        // the UI thread; no other thread owns entry bitmaps.
+        entry = &a.unfurl_entries[a.unfurl_evict_slot];
+        a.unfurl_evict_slot = (a.unfurl_evict_slot + 1) % max_unfurl_entries;
+        if (entry.thumb) |thumb| _ = win.DeleteObject(thumb);
+        entry.* = .{};
+    }
+    entry.provider = message.unfurl_provider;
+    entry.id.set(message.unfurl_id.slice());
+    // The original message link is the fetch target; classify() already
+    // vetted its host against the page allowlist.
+    if (message.unfurl_canonical.len > 0) {
+        var canonical_buffer: [unfurl.max_canonical_len]u8 = undefined;
+        @memcpy(canonical_buffer[0..message.unfurl_canonical.len], message.unfurl_canonical.slice());
+        startUnfurlFetch(a, entry, canonical_buffer[0..message.unfurl_canonical.len]);
+    }
+    return entry;
+}
+
+fn unfurlProviderLabel(provider: unfurl.Provider) []const u8 {
+    return switch (provider) {
+        .youtube => "YouTube",
+        .instagram => "Instagram",
+        .facebook => "Facebook",
+        .none => "Video",
+    };
+}
+
+fn unfurlPlaceholderColor(provider: unfurl.Provider) u32 {
+    return switch (provider) {
+        .youtube => rgb(197, 40, 40),
+        .instagram => rgb(225, 48, 108),
+        .facebook => rgb(24, 119, 242),
+        .none => rgb(59, 74, 84),
+    };
+}
+
+fn drawUnfurlCard(hdc: win.HDC, a: *App, message: *Message, x: i32, top: i32, width: i32) void {
+    const card_width = @min(@max(width, 200), unfurl_card_width);
+    const entry = unfurlEntryFor(a, message) orelse return;
+    const bottom = top + unfurl_card_height;
+    message.unfurl_card_hit = .{ .left = x, .top = top, .right = x + card_width, .bottom = bottom };
+    const card_brush = win.CreateSolidBrush(rgb(24, 34, 41)) orelse return;
+    defer _ = win.DeleteObject(card_brush);
+    const old_card = win.SelectObject(hdc, card_brush);
+    _ = win.RoundRect(hdc, x, top, x + card_width, bottom, 10, 10);
+    _ = win.SelectObject(hdc, old_card);
+
+    const thumb_right = x + unfurl_thumb_width;
+    if (entry.thumb) |thumb| {
+        const memory = win.CreateCompatibleDC(hdc) orelse return;
+        defer _ = win.DeleteDC(memory);
+        const old_bitmap = win.SelectObject(memory, thumb);
+        defer _ = win.SelectObject(memory, old_bitmap);
+        _ = win.SetStretchBltMode(hdc, win.HALFTONE);
+        _ = win.StretchBlt(hdc, x, top, unfurl_thumb_width, unfurl_card_height, memory, 0, 0, 320, 180, win.SRCCOPY);
+    } else {
+        // Placeholder: provider tint with a play circle until (or unless) a
+        // thumbnail arrives.
+        const tint = win.CreateSolidBrush(unfurlPlaceholderColor(message.unfurl_provider)) orelse return;
+        defer _ = win.DeleteObject(tint);
+        _ = win.FillRect(hdc, &.{ .left = x, .top = top, .right = thumb_right, .bottom = bottom }, tint);
+    }
+    // Play affordance over the thumbnail half.
+    const play_brush = win.CreateSolidBrush(rgb(255, 255, 255)) orelse return;
+    defer _ = win.DeleteObject(play_brush);
+    const old_play = win.SelectObject(hdc, play_brush);
+    const center_x = x + @divTrunc(unfurl_thumb_width, 2);
+    const center_y = top + @divTrunc(unfurl_card_height, 2);
+    var points = [3]win.POINT{
+        .{ .x = center_x - 9, .y = center_y - 13 },
+        .{ .x = center_x - 9, .y = center_y + 13 },
+        .{ .x = center_x + 15, .y = center_y },
+    };
+    _ = win.Polygon(hdc, &points, 3);
+    _ = win.SelectObject(hdc, old_play);
+
+    // Title and source on the right half.
+    _ = win.SelectObject(hdc, @ptrCast(a.font_small.?));
+    _ = win.SetTextColor(hdc, color_text);
+    var title: []const u16 = std.unicode.utf8ToUtf16LeStringLiteral("Loading…")[0..];
+    if (entry.status == .ready and entry.title.len > 0) {
+        title = entry.title.slice();
+    } else if (entry.status == .failed) {
+        title = std.unicode.utf8ToUtf16LeStringLiteral("Open in browser")[0..];
+    }
+    var title_rect = win.RECT{ .left = thumb_right + 10, .top = top + 10, .right = x + card_width - 10, .bottom = top + unfurl_card_height - 34 };
+    _ = win.DrawTextW(hdc, title.ptr, @intCast(title.len), &title_rect, win.DT_WORDBREAK | win.DT_END_ELLIPSIS);
+    _ = win.SetTextColor(hdc, color_muted);
+    var label_buffer: [96]u8 = undefined;
+    var author_utf8: [128]u8 = undefined;
+    const author_length = std.unicode.utf16LeToUtf8(&author_utf8, entry.author.slice()) catch 0;
+    const author = author_utf8[0..author_length];
+    const label = if (author.len > 0)
+        std.fmt.bufPrint(&label_buffer, "{s} · {s}", .{ unfurlProviderLabel(message.unfurl_provider), author }) catch "Video"
+    else
+        std.fmt.bufPrint(&label_buffer, "{s}", .{unfurlProviderLabel(message.unfurl_provider)}) catch "Video";
+    var label_wide = WideText(96){};
+    label_wide.set(a.allocator, label);
+    var label_rect = win.RECT{ .left = thumb_right + 10, .top = bottom - 28, .right = x + card_width - 10, .bottom = bottom - 8 };
+    _ = win.DrawTextW(hdc, label_wide.ptr(), @intCast(label_wide.len), &label_rect, win.DT_LEFT | win.DT_SINGLELINE | win.DT_END_ELLIPSIS);
+    _ = win.SelectObject(hdc, @ptrCast(a.font.?));
+}
+
+// Click on a card: play in place when a stream was resolved, otherwise open
+// the video externally (the ticket's fallback for refused embeds).
+fn openUnfurlCard(a: *App, message: *const Message) void {
+    for (a.unfurl_entries[0..a.unfurl_entry_count]) |*entry| {
+        if (entry.provider != message.unfurl_provider) continue;
+        if (!std.mem.eql(u8, entry.id.slice(), message.unfurl_id.slice())) continue;
+        if (entry.play_url.len > 0) {
+            playUnfurlVideo(a, entry);
+        } else if (message.unfurl_canonical.len > 0) {
+            const wide = utf8ToWide(a.allocator, message.unfurl_canonical.slice()) catch return;
+            defer a.allocator.free(wide);
+            openUrlWide(a, wide.ptr);
+        }
         return;
     }
-    a.mf_player = player;
-    _ = win.ShowWindow(hwnd, win.SW_SHOW);
+}
+
+// ===== background unfurl fetches (WAZI-68) =====
+
+var unfurl_fetch_count = std.atomic.Value(u32).init(0);
+
+const UnfurlContext = struct {
+    hwnd: win.HWND,
+    provider: u8,
+    id: []u8,
+    canonical: []u8,
+};
+
+const UnfurlResult = struct {
+    provider: u8 = 0,
+    id: [unfurl.max_id_len]u8 = undefined,
+    id_len: usize = 0,
+    ok: bool = false,
+    title: [160]u8 = undefined,
+    title_len: usize = 0,
+    author: [64]u8 = undefined,
+    author_len: usize = 0,
+    play_url: [1024]u8 = undefined,
+    play_len: usize = 0,
+    thumb: ?[]u8 = null,
+};
+
+fn startUnfurlFetch(a: *App, entry: *UnfurlEntry, url_utf8: []const u8) void {
+    if (a.hwnd == null) {
+        entry.status = .failed;
+        return;
+    }
+    // Bounded concurrency: over the cap the entry stays .loading and a later
+    // paint (new entry creation path) retries; no fetch storm while scrolling.
+    if (unfurl_fetch_count.load(.monotonic) >= max_unfurl_fetches) return;
+    const page = std.heap.page_allocator;
+    const url = page.dupe(u8, url_utf8) catch {
+        entry.status = .failed;
+        return;
+    };
+    const id = page.dupe(u8, entry.id.slice()) catch {
+        page.free(url);
+        entry.status = .failed;
+        return;
+    };
+    const ctx = page.create(UnfurlContext) catch {
+        page.free(url);
+        page.free(id);
+        entry.status = .failed;
+        return;
+    };
+    ctx.* = .{ .hwnd = a.hwnd.?, .provider = @intFromEnum(entry.provider), .id = id, .canonical = url };
+    const thread = std.Thread.spawn(.{ .stack_size = 512 * 1024 }, unfurlThreadMain, .{ctx}) catch {
+        page.free(url);
+        page.free(id);
+        page.destroy(ctx);
+        entry.status = .failed;
+        return;
+    };
+    thread.detach();
+    entry.fetch_started = true;
+    _ = unfurl_fetch_count.fetchAdd(1, .monotonic);
+}
+
+// HTTPS GET with the unfurl allowlist enforced on the original URL. WinHTTP
+// redirects stay https-only (httpGet sets that policy); cross-host https
+// redirects are accepted but the target host was checked by classify() at
+// the entry point, so this fetch can only start from a known provider host.
+// ponytail: redirect targets are not re-allowlisted; tighten if a provider
+// starts redirecting off-domain.
+fn httpGetChecked(allocator: std.mem.Allocator, url: []const u8, comptime kind: unfurl.FetchKind, max_bytes: usize) ![]u8 {
+    switch (kind) {
+        .page => if (!unfurl.isPageFetchAllowed(url)) return error.UpdateBadUrl,
+        .image => if (!unfurl.isImageFetchAllowed(url)) return error.UpdateBadUrl,
+    }
+    const wide = try utf8ToWide(allocator, url);
+    defer allocator.free(wide);
+    var components: win.URL_COMPONENTSW = std.mem.zeroes(win.URL_COMPONENTSW);
+    components.dwStructSize = @sizeOf(win.URL_COMPONENTSW);
+    var host_buf: [256]u16 = undefined;
+    var path_buf: [2048]u16 = undefined;
+    var extra_buf: [1024]u16 = undefined;
+    components.lpszHostName = &host_buf;
+    components.dwHostNameLength = host_buf.len;
+    components.lpszUrlPath = &path_buf;
+    components.dwUrlPathLength = path_buf.len;
+    components.lpszExtraInfo = &extra_buf;
+    components.dwExtraInfoLength = extra_buf.len;
+    if (win.WinHttpCrackUrl(wide.ptr, @intCast(wide.len), 0, &components) == 0) return error.UpdateBadUrl;
+    if (components.nScheme != win.INTERNET_SCHEME_HTTPS) return error.UpdateBadUrl;
+    if (components.dwUrlPathLength + components.dwExtraInfoLength >= path_buf.len) return error.UpdateBadUrl;
+    host_buf[components.dwHostNameLength] = 0;
+    std.mem.copyForwards(u16, path_buf[components.dwUrlPathLength..], extra_buf[0..components.dwExtraInfoLength]);
+    const path_total = components.dwUrlPathLength + components.dwExtraInfoLength;
+    path_buf[path_total] = 0;
+    return httpGet(
+        allocator,
+        host_buf[0..components.dwHostNameLength :0].ptr,
+        path_buf[0..path_total :0].ptr,
+        lit("User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)\r\nAccept: */*\r\n"),
+        max_bytes,
+    );
+}
+
+fn copyInto(dest: []u8, source: []const u8) usize {
+    const length = @min(dest.len, source.len);
+    @memcpy(dest[0..length], source[0..length]);
+    return length;
+}
+
+fn unfurlThreadMain(ctx: *UnfurlContext) void {
+    const page = std.heap.page_allocator;
+    defer {
+        page.free(ctx.canonical);
+        page.free(ctx.id);
+        page.destroy(ctx);
+    }
+    const allocator = page;
+    const result = allocator.create(UnfurlResult) catch {
+        _ = unfurl_fetch_count.fetchSub(1, .monotonic);
+        return;
+    };
+    result.* = .{ .provider = ctx.provider };
+    result.id_len = copyInto(&result.id, ctx.id);
+    const provider: unfurl.Provider = @enumFromInt(ctx.provider);
+    var small_buffer: [unfurl.max_canonical_len]u8 = undefined;
+
+    switch (provider) {
+        .youtube => {
+            const info = unfurl.classify(ctx.canonical);
+            if (info.provider == .youtube) {
+                if (unfurl.oembedEndpoint(&info, &small_buffer)) |endpoint| {
+                    if (httpGetChecked(allocator, endpoint, .page, 16384)) |body| {
+                        defer allocator.free(body);
+                        var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch null;
+                        if (parsed) |*document| {
+                            defer document.deinit();
+                            if (document.value.object.get("title")) |title| {
+                                if (title == .string) result.title_len = copyInto(&result.title, title.string);
+                            }
+                            if (document.value.object.get("author_name")) |author| {
+                                if (author == .string) result.author_len = copyInto(&result.author, author.string);
+                            }
+                        }
+                    } else |_| {}
+                }
+                // Best-effort direct stream: when YouTube refuses (signature,
+                // age gate, PO tokens) the card falls back to external open.
+                if (httpGetChecked(allocator, ctx.canonical, .page, 1024 * 1024)) |page_body| {
+                    defer allocator.free(page_body);
+                    var stream_buffer: [2048]u8 = undefined;
+                    if (unfurl.extractYoutubeStream(page_body, &stream_buffer)) |stream| {
+                        result.play_len = copyInto(&result.play_url, stream);
+                    }
+                } else |_| {}
+                if (unfurl.thumbnailUrl(&info, &small_buffer)) |thumb_url| {
+                    if (httpGetChecked(allocator, thumb_url, .image, 2 * 1024 * 1024)) |bytes| {
+                        result.thumb = bytes;
+                    } else |_| {}
+                }
+            }
+        },
+        .instagram, .facebook => {
+            if (httpGetChecked(allocator, ctx.canonical, .page, 256 * 1024)) |page_body| {
+                defer allocator.free(page_body);
+                if (unfurl.scrapeOgMeta(page_body, "og:video")) |stream| {
+                    if (unfurl.isStreamUrlAllowed(stream)) result.play_len = copyInto(&result.play_url, stream);
+                }
+                const image_key: []const u8 = if (unfurl.scrapeOgMeta(page_body, "og:image:secure_url")) |image|
+                    image
+                else if (unfurl.scrapeOgMeta(page_body, "og:image")) |image|
+                    image
+                else
+                    "";
+                if (image_key.len > 0 and unfurl.isImageFetchAllowed(image_key)) {
+                    if (httpGetChecked(allocator, image_key, .image, 2 * 1024 * 1024)) |bytes| {
+                        result.thumb = bytes;
+                    } else |_| {}
+                }
+            } else |_| {}
+        },
+        .none => {},
+    }
+    result.ok = result.title_len > 0 or result.play_len > 0 or result.thumb != null;
+    _ = unfurl_fetch_count.fetchSub(1, .monotonic);
+    if (win.PostMessageW(ctx.hwnd, wm_unfurl_done, 0, @bitCast(@intFromPtr(result))) == 0) {
+        if (result.thumb) |bytes| page.free(bytes);
+        page.destroy(result);
+    }
+}
+
+// Thumbnail decode: WIC from memory into a 320x180 PBGRA DIB (2x the card
+// area, so it stays crisp when the window is scaled up).
+fn decodeUnfurlThumb(a: *App, bytes: []const u8) ?win.HBITMAP {
+    if (a.wic_factory == null or bytes.len == 0) return null;
+    var stream: [*c]win.IWICStream = null;
+    if (a.wic_factory.*.lpVtbl.*.CreateStream.?(a.wic_factory, &stream) < 0 or stream == null) return null;
+    defer _ = stream.*.lpVtbl.*.Release.?(stream);
+    if (stream.*.lpVtbl.*.InitializeFromMemory.?(stream, @constCast(bytes.ptr), @intCast(bytes.len)) < 0) return null;
+    var decoder: [*c]win.IWICBitmapDecoder = null;
+    if (a.wic_factory.*.lpVtbl.*.CreateDecoderFromStream.?(a.wic_factory, @ptrCast(stream), null, win.WICDecodeMetadataCacheOnLoad, &decoder) < 0 or decoder == null) return null;
+    defer _ = decoder.*.lpVtbl.*.Release.?(decoder);
+    var frame: [*c]win.IWICBitmapFrameDecode = null;
+    if (decoder.*.lpVtbl.*.GetFrame.?(decoder, 0, &frame) < 0 or frame == null) return null;
+    defer _ = frame.*.lpVtbl.*.Release.?(frame);
+    var converter: [*c]win.IWICFormatConverter = null;
+    if (a.wic_factory.*.lpVtbl.*.CreateFormatConverter.?(a.wic_factory, &converter) < 0 or converter == null) return null;
+    defer _ = converter.*.lpVtbl.*.Release.?(converter);
+    if (converter.*.lpVtbl.*.Initialize.?(converter, @ptrCast(frame), &win.GUID_WICPixelFormat32bppPBGRA, win.WICBitmapDitherTypeNone, null, 0, win.WICBitmapPaletteTypeCustom) < 0) return null;
+    var scaler: [*c]win.IWICBitmapScaler = null;
+    if (a.wic_factory.*.lpVtbl.*.CreateBitmapScaler.?(a.wic_factory, &scaler) < 0 or scaler == null) return null;
+    defer _ = scaler.*.lpVtbl.*.Release.?(scaler);
+    const target_w: u32 = 320;
+    const target_h: u32 = 180;
+    if (scaler.*.lpVtbl.*.Initialize.?(scaler, @ptrCast(converter), target_w, target_h, win.WICBitmapInterpolationModeFant) < 0) return null;
+    var pixels: [target_w * target_h * 4]u8 = undefined;
+    if (scaler.*.lpVtbl.*.CopyPixels.?(@ptrCast(scaler), null, target_w * 4, pixels.len, &pixels) < 0) return null;
+    var info = std.mem.zeroes(win.BITMAPINFO);
+    info.bmiHeader.biSize = @sizeOf(win.BITMAPINFOHEADER);
+    info.bmiHeader.biWidth = @intCast(target_w);
+    info.bmiHeader.biHeight = -@as(i32, @intCast(target_h));
+    info.bmiHeader.biPlanes = 1;
+    info.bmiHeader.biBitCount = 32;
+    info.bmiHeader.biCompression = win.BI_RGB;
+    var bits: ?*anyopaque = null;
+    const bitmap = win.CreateDIBSection(null, &info, win.DIB_RGB_COLORS, &bits, null, 0) orelse return null;
+    if (bits == null) {
+        _ = win.DeleteObject(bitmap);
+        return null;
+    }
+    @memcpy(@as([*]u8, @ptrCast(bits.?))[0..pixels.len], &pixels);
+    return bitmap;
+}
+
+fn applyUnfurlResult(a: *App, result: *UnfurlResult) void {
+    defer {
+        if (result.thumb) |bytes| std.heap.page_allocator.free(bytes);
+        std.heap.page_allocator.destroy(result);
+    }
+    const provider: unfurl.Provider = @enumFromInt(result.provider);
+    for (a.unfurl_entries[0..a.unfurl_entry_count]) |*entry| {
+        if (entry.provider != provider) continue;
+        if (!std.mem.eql(u8, entry.id.slice(), result.id[0..result.id_len])) continue;
+        entry.status = if (result.ok) .ready else .failed;
+        if (result.title_len > 0) entry.title.set(a.allocator, result.title[0..result.title_len]);
+        if (result.author_len > 0) entry.author.set(a.allocator, result.author[0..result.author_len]);
+        if (result.play_len > 0 and unfurl.isStreamUrlAllowed(result.play_url[0..result.play_len])) {
+            entry.play_url.set(a.allocator, result.play_url[0..result.play_len]);
+        }
+        if (result.thumb) |bytes| entry.thumb = decodeUnfurlThumb(a, bytes);
+        if (a.canvas) |canvas| _ = win.InvalidateRect(canvas, null, win.FALSE);
+        return;
+    }
+    // No matching entry: the message scrolled away and the slot was reused.
+    // Nothing to repaint; the result (and its thumbnail bytes) just expires.
 }
 
 fn advanceGifs(a: *App) void {
@@ -5988,6 +6501,13 @@ fn handleCanvasClick(a: *App, hwnd: win.HWND, x: i32, y: i32) void {
                 _ = win.InvalidateRect(hwnd, null, win.TRUE);
                 return;
             }
+        }
+        const card = item.unfurl_card_hit;
+        if (x >= card.left and x <= card.right and y >= card.top and y <= card.bottom) {
+            a.selected_message = index;
+            openUnfurlCard(a, item);
+            _ = win.InvalidateRect(hwnd, null, win.TRUE);
+            return;
         }
         if (x >= bubble.left and x <= bubble.right and y >= bubble.top and y <= bubble.bottom) {
             for (item.links[0..item.link_count]) |*span| {
@@ -7887,6 +8407,11 @@ fn measureMessage(hdc: win.HDC, a: *App, message: *const Message, width: i32, sh
     _ = win.SelectObject(hdc, @ptrCast(a.font.?));
     const header_height: i32 = if (show_sender) 34 else 12;
     var height = wrapMixedSink(hdc, a, if (message.text.len > 0) message.text.ptr() else lit(" "), if (message.text.len > 0) @intCast(message.text.len) else 1, width - 24, false, 0, 0, message) + header_height;
+    // WAZI-68: a video link unfurls into a fixed-size card below the text.
+    // Links are collected during the measure pass above, so classify here;
+    // once classified the result is sticky for the message's lifetime.
+    if (message.unfurl_provider == .none and message.link_count > 0) detectUnfurl(@constCast(message));
+    if (message.unfurl_provider != .none) height += unfurl_card_height + 6;
     if (message.bitmap_height > 0) {
         height += message.bitmap_height + 8;
     } else if (message.media_type.len > 0) height += 54;
@@ -8170,6 +8695,7 @@ fn drawCanvas(hwnd: win.HWND, a: *App) void {
         const message = &a.messages[index];
         message.media_hit = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
         message.bubble_hit = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
+        message.unfurl_card_hit = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
         message.link_count = 0;
         message.word_count = 0;
         const show_sender = showSenderName(a, index);
@@ -8374,7 +8900,13 @@ fn drawCanvas(hwnd: win.HWND, a: *App) void {
         _ = win.SelectObject(hdc, @ptrCast(a.font.?));
         _ = win.SetTextColor(hdc, color_text);
         const text_len: c_int = if (message.text.len > 0) @intCast(message.text.len) else 1;
-        _ = wrapMixedSink(hdc, a, if (message.text.len > 0) message.text.ptr() else lit(" "), text_len, right - left - 24, true, left + 12, text_top, message);
+        const text_height = wrapMixedSink(hdc, a, if (message.text.len > 0) message.text.ptr() else lit(" "), text_len, right - left - 24, true, left + 12, text_top, message);
+        // WAZI-68: the unfurled video card sits below the text; its height
+        // was reserved in measureMessage, so no other block moves.
+        if (message.unfurl_provider != .none) {
+            drawUnfurlCard(hdc, a, message, left + 12, text_top + text_height + 4, right - left - 24);
+            text_top += text_height + unfurl_card_height + 6;
+        }
         if (a.sel_message != null and a.sel_message.? == index and a.sel_anchor_word != a.sel_focus_word) {
             const lo = @min(a.sel_anchor_word, a.sel_focus_word);
             const hi = @max(a.sel_anchor_word, a.sel_focus_word);
@@ -8748,6 +9280,11 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
             loadSlackTokens(a);
             refreshSlackWorkspace(a);
             startSlackSocket(a);
+            return 0;
+        },
+        wm_unfurl_done => {
+            const result: *UnfurlResult = @ptrFromInt(@as(usize, @bitCast(lparam)));
+            applyUnfurlResult(a, result);
             return 0;
         },
         win.WM_POWERBROADCAST => {
