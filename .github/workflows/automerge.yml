@@ -49,7 +49,7 @@ jobs:
             reason=$(echo "$info" | jq -r '
               if .isDraft then "draft"
               elif ([.labels[].name] | index("hold")) then "hold label"
-              elif ([.files[].path] | index(".github/workflows/automerge.yml")) then "edits automerge itself"
+              elif ([.files[].path] | index(".github/workflows/automerge.yml", ".github/workflows/ci.yml", ".github/workflows/release.yml", ".github/workflows/auto-release.yml")) then "edits a release-gating workflow, needs manual review"
               elif .mergeable != "MERGEABLE" then "not mergeable (\(.mergeable))"
               else "" end')
             if [ -n "$blocked" ]; then reason="required checks not green: ${blocked}"; fi
@@ -69,7 +69,10 @@ jobs:
               for _ in 1 2 3; do
                 gh workflow run ci.yml -R "$REPO" --ref main
                 sleep 15
-                if [ "$(gh run list -R "$REPO" -w ci -b main --commit "$merged_oid" -L 1 --json databaseId -q 'length')" != "0" ]; then
+                # Only a numeric count of at least one successful run counts;
+                # a failed query must not be read as "ci started".
+                count=$(gh run list -R "$REPO" -w ci -b main --commit "$merged_oid" --json databaseId,conclusion -q '[.[] | select(.conclusion == "success")] | length' 2>/dev/null) || count=""
+                if [ "${count:-0}" -ge 1 ] 2>/dev/null; then
                   echo "#$pr: ci dispatched on main (${merged_oid})"
                   ci_started=1
                   break

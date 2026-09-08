@@ -172,11 +172,12 @@ jobs:
               # Annotated tags point at a tag object; peel to the commit,
               # recursing if a tag was made pointing at another tag.
               for _ in 1 2 3; do
-                obj_type="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${remote_tag}" --jq .object.type 2>/dev/null || true)"
+                read -r obj_type obj_sha < <(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${remote_tag}" --jq '"\(.object.type) \(.object.sha)"' 2>/dev/null || echo "missing -")
+                if [ "${obj_type}" = "commit" ]; then remote_tag="${obj_sha}"; break; fi
                 if [ "${obj_type}" != "tag" ]; then break; fi
-                remote_tag="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${remote_tag}" --jq .object.sha)"
+                remote_tag="${obj_sha}"
               done
-              if [ "${obj_type}" = "tag" ] || [ "${remote_tag}" != "${sha}" ]; then
+              if [ "${remote_tag}" != "${sha}" ]; then
                 echo "${next_tag} exists remotely but not at ${sha}" >&2
                 exit 1
               fi
