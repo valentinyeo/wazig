@@ -4,6 +4,10 @@ name: release
 on:
   push:
     tags: ["v*"]
+  # Fallback only: auto-release normally relies on the tag push to start us,
+  # but GITHUB_TOKEN ref creation does not reliably fire the push trigger, so
+  # auto-release dispatches us at the tag after confirming the push did not.
+  workflow_dispatch:
 permissions:
   contents: read
 jobs:

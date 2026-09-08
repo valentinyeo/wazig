@@ -104,7 +104,7 @@ jobs:
         run: |
           sha="$(git rev-parse HEAD)"
           echo "head_sha=${sha}" >> "$GITHUB_ENV"
-          if [ -z "$(gh run list -R "${GITHUB_REPOSITORY}" -w ci -b main --commit "${sha}" --json databaseId,conclusion -q '[.[] | select(.conclusion == "success")] | length')" ]; then
+          if [ "$(gh run list -R "${GITHUB_REPOSITORY}" -w ci -b main --commit "${sha}" --json databaseId,conclusion -q '[.[] | select(.conclusion == "success")] | length')" = "0" ]; then
             echo "no successful ci run for main HEAD ${sha}; refusing to tag" >&2
             exit 1
           fi

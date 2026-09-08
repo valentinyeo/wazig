@@ -65,15 +65,23 @@ jobs:
               # dispatch the intermediate commit may miss its own release;
               # only main HEAD is ever tagged anyway.
               merged_oid=$(gh pr view "$pr" -R "$REPO" --json mergeCommit -q .mergeCommit.oid)
+              ci_started=""
               for _ in 1 2 3; do
                 gh workflow run ci.yml -R "$REPO" --ref main
                 sleep 15
                 if [ -n "$(gh run list -R "$REPO" -w ci -b main --commit "$merged_oid" -L 1 --json databaseId -q 'length')" ]; then
                   echo "#$pr: ci dispatched on main (${merged_oid})"
+                  ci_started=1
                   break
                 fi
                 echo "#$pr: ci run not visible yet, retrying dispatch"
               done
+              # Without ci on the merged commit the release pipeline never
+              # fires, so a silent failure here must not look like success.
+              if [ -z "$ci_started" ]; then
+                echo "#$pr: could not start ci on main after 3 dispatches" >&2
+                exit 1
+              fi
             else
               echo "#$pr: merge failed"
             fi
