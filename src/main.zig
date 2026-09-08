@@ -9414,7 +9414,16 @@ fn clearStaleOrphans() void {
                 var user_time: win.FILETIME = undefined;
                 var path_buf: [519]u16 = undefined;
                 var path_len: win.DWORD = path_buf.len;
-                if (win.GetProcessTimes(handle, &created, &exit_time, &kernel_time, &user_time) != 0 and
+                var orphan_session: win.DWORD = 0;
+                var self_session: win.DWORD = 0;
+                // EnumWindows only sees this desktop, so a live copy in
+                // another user session would look windowless here; only ever
+                // reclaim orphans within our own session.
+                const same_session = win.ProcessIdToSessionId(pid, &orphan_session) != 0 and
+                    win.ProcessIdToSessionId(self_pid, &self_session) != 0 and
+                    orphan_session == self_session;
+                if (same_session and
+                    win.GetProcessTimes(handle, &created, &exit_time, &kernel_time, &user_time) != 0 and
                     update.isStaleOrphan(self_pid, pid, containsPid(visible[0..visible_count], pid), filetimeAgeSeconds(created)) and
                     win.QueryFullProcessImageNameW(handle, 0, &path_buf, &path_len) != 0 and
                     eqlWideIgnoreCase(path_buf[0..path_len], exe_buf[0..exe_len]))
@@ -9486,16 +9495,17 @@ fn performUpdate(io: std.Io) !UpdateOutcome {
     // One updater at a time across every running copy of the app.
     const mutex = win.CreateMutexW(null, win.FALSE, lit("Local\\MessagesUpdateMutex")) orelse return error.UpdateMutexFailed;
     defer _ = win.CloseHandle(mutex);
-    var acquired = update.classifyMutexWait(win.WaitForSingleObject(mutex, 0)) == .acquired;
-    if (!acquired) {
+    var wait = update.classifyMutexWait(win.WaitForSingleObject(mutex, 0));
+    if (wait == .busy) {
         // WAZI-66: a windowless orphan from an earlier swap holds the mutex
         // (and the .old binary) forever, so contention used to look like
         // "no update available". End stale orphans, wait once more, and only
         // then report a distinct blocked outcome.
         clearStaleOrphans();
-        acquired = update.classifyMutexWait(win.WaitForSingleObject(mutex, 10_000)) == .acquired;
-        if (!acquired) return .blocked;
+        wait = update.classifyMutexWait(win.WaitForSingleObject(mutex, 10_000));
     }
+    if (wait == .failed) return error.UpdateMutexFailed;
+    if (wait != .acquired) return .blocked;
     defer _ = win.ReleaseMutex(mutex);
 
     var exe_wide_buf: [519]u16 = undefined;

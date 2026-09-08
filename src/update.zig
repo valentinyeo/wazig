@@ -306,10 +306,15 @@ test isZipAssetName {
 /// distinct blocked outcome, never as a silent "no update available".
 pub const wait_abandoned: u32 = 0x80;
 
-pub const MutexWait = enum { acquired, busy };
+pub const MutexWait = enum { acquired, busy, failed };
 
+/// WAZI-66: WAIT_ABANDONED (0x80) still grants ownership because the
+/// previous holder died. A timeout is contention; a wait failure is not
+/// contention and must not surface as "another copy is running".
 pub fn classifyMutexWait(result: u32) MutexWait {
-    return if (result == 0 or result == wait_abandoned) .acquired else .busy;
+    if (result == 0 or result == wait_abandoned) return .acquired;
+    if (result == 0xFFFFFFFF) return .failed; // WAIT_FAILED
+    return .busy;
 }
 
 /// A running copy of the app is a stale orphan (WAZI-66) when it is not us,
@@ -326,10 +331,11 @@ pub fn isStaleOrphan(self_pid: u32, pid: u32, has_visible_window: bool, age_seco
 test classifyMutexWait {
     try std.testing.expectEqual(MutexWait.acquired, classifyMutexWait(0)); // WAIT_OBJECT_0
     try std.testing.expectEqual(MutexWait.acquired, classifyMutexWait(0x80)); // WAIT_ABANDONED
-    // Contention and failure must be a blocked outcome, never "no update".
+    // Contention is a blocked outcome, never "no update".
     try std.testing.expectEqual(MutexWait.busy, classifyMutexWait(0x102)); // WAIT_TIMEOUT
-    try std.testing.expectEqual(MutexWait.busy, classifyMutexWait(0xFFFFFFFF)); // WAIT_FAILED
     try std.testing.expectEqual(MutexWait.busy, classifyMutexWait(7));
+    // A failed wait is not contention and must not claim another copy is running.
+    try std.testing.expectEqual(MutexWait.failed, classifyMutexWait(0xFFFFFFFF));
 }
 
 test isStaleOrphan {
