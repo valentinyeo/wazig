@@ -6940,8 +6940,12 @@ fn drawEmojiRun(hdc: win.HDC, emoji_font: win.HFONT, text_ascent: i32, line_heig
         if (!draw or emoji_draw.draw(hdc, slice, cursor, y, text_ascent, em)) return run_metrics.width;
     }
     // WAZI-65: colour fallback is never silent; each new reason shows once.
-    if (emoji_draw.takeNotice()) |notice| {
-        if (app_ptr) |app| setStatus(app, notice);
+    // Only announce on real paint passes: measuring passes cannot show the
+    // status text and must not consume the one-shot notice.
+    if (draw) {
+        if (app_ptr) |app| {
+            if (emoji_draw.takeNotice()) |notice| setStatus(app, notice);
+        }
     }
     _ = win.SelectObject(hdc, @ptrCast(emoji_font));
     if (draw) _ = win.TextOutW(hdc, cursor, y, slice.ptr, @intCast(slice.len));

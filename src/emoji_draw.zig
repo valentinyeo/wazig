@@ -33,7 +33,7 @@ const FormatEntry = struct { em: i32, format: ?*win.IDWriteTextFormat = null };
 
 /// Stages where the colour path can bail, in call order. Each maps to a
 /// plain-language reason the status bar and Ctrl+K palette can show (WAZI-65).
-const ErrorStage = enum { d2d_factory, dwrite_factory, render_target, bind, format, draw };
+const ErrorStage = enum { d2d_factory, dwrite_factory, render_target, bind, format, layout, draw };
 
 const State = struct {
     factory: ?*win.ID2D1Factory = null,
@@ -70,6 +70,7 @@ fn stageText(stage: ErrorStage) []const u8 {
         .render_target => "the drawing surface could not be created",
         .bind => "the drawing surface could not attach to the window",
         .format => "the emoji font (Segoe UI Emoji) could not be loaded",
+        .layout => "the emoji layout could not be measured",
         .draw => "the colour drawing call failed",
     };
 }
@@ -209,19 +210,19 @@ pub fn metrics(text: []const u16, em: i32) ?Metrics {
     var layout: ?*win.IDWriteTextLayout = null;
     const dwrite = state.dwrite.?;
     if (dwrite.*.lpVtbl.*.CreateTextLayout.?(dwrite, text.ptr, @intCast(text.len), format, 4096.0, 256.0, &layout) != 0 or layout == null) {
-        _ = fail(.draw);
+        _ = fail(.layout);
         return null;
     }
     defer _ = layout.?.*.lpVtbl.*.Release.?(layout.?);
     var text_metrics: win.DWRITE_TEXT_METRICS = undefined;
     if (layout.?.*.lpVtbl.*.GetMetrics.?(layout.?, &text_metrics) != 0) {
-        _ = fail(.draw);
+        _ = fail(.layout);
         return null;
     }
     var line: win.DWRITE_LINE_METRICS = undefined;
     var line_count: u32 = 0;
     if (layout.?.*.lpVtbl.*.GetLineMetrics.?(layout.?, &line, 1, &line_count) != 0 or line_count == 0) {
-        _ = fail(.draw);
+        _ = fail(.layout);
         return null;
     }
     // No clearError here: measurement proves the text engine only. Render
