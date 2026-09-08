@@ -212,8 +212,9 @@ jobs:
             sleep 10
             started="$(gh run list -R "${GITHUB_REPOSITORY}" -w release --commit "${sha}" -L 50 \
               --json event,headBranch,headSha \
-              -q "[.[] | select((.event == \"push\" or .event == \"workflow_dispatch\") and .headBranch == \"${next_tag}\")] | length")"
-            if [ "${started}" != "0" ]; then
+              -q "[.[] | select((.event == \"push\" or .event == \"workflow_dispatch\") and .headBranch == \"${next_tag}\")] | length" 2>/dev/null)" || started=""
+            if ! [ "${started:-0}" -ge 1 ] 2>/dev/null; then started="0"; fi
+            if [ "${started}" -ge 1 ]; then
               echo "release run started by the tag push"
               echo "### Released ${next_tag}" >> "$GITHUB_STEP_SUMMARY"
               exit 0
