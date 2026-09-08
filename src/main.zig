@@ -2373,13 +2373,20 @@ fn removeMessageAt(a: *App, index: usize) void {
 
 /// Drop the bubble the moment our own echo arrives (it can beat the HTTP
 /// response); correlate by client_msg_id, falling back to text match only
-/// when Slack sent no id. The response then finds no pending and becomes a
-/// no-op.
+/// when Slack sent no id. Failed bubbles match too: Slack may have accepted
+/// a send the HTTP layer reported as failed, and the echo is authoritative.
 fn dropPendingForEcho(a: *App, event: *slack_win.Event) void {
     const cmid = event.clientMsgIdSlice();
     var index: ?usize = null;
     if (cmid.len > 0) {
-        index = pendingByClientMsgId(a, cmid);
+        for (a.messages[0..a.message_count], 0..) |*message, i| {
+            if (message.from_me and message.send_state != .none and
+                std.mem.eql(u8, message.timestamp.slice(), cmid))
+            {
+                index = i;
+                break;
+            }
+        }
     } else {
         const oldest = oldestPendingSend(a) orelse return;
         const message = &a.messages[oldest];
