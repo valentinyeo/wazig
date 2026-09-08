@@ -72,7 +72,12 @@ fn logStage(stage: ErrorStage) void {
     const total = local_len + suffix.len;
     path[total] = 0;
     // Ignore the "already exists" error; only a missing directory matters.
+    // Temporarily terminate the "\Wazig" prefix so the directory path, not
+    // the log path, is what CreateDirectoryW sees.
+    const after_dir = path[local_len + 7];
+    path[local_len + 7] = 0;
     _ = win.CreateDirectoryW(path[0 .. local_len + 7 :0].ptr, null);
+    path[local_len + 7] = after_dir;
     var clock = std.mem.zeroes(win.SYSTEMTIME);
     win.GetLocalTime(&clock);
     var line_buf: [256]u8 = undefined;
