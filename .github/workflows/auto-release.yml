@@ -63,10 +63,22 @@ jobs:
               echo "skip=true" >> "$GITHUB_ENV" ;;
           esac
 
+      - name: Skip if this commit is already released
+        if: env.skip != 'true'
+        run: |
+          # One release tag per commit: a rerun or a second successful CI run
+          # for the same HEAD must not mint another version.
+          if git tag -l 'v*' --points-at HEAD | grep -qE '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'; then
+            echo "HEAD already carries a release tag"
+            echo "skip=true" >> "$GITHUB_ENV"
+          fi
+
       - name: Release only when the app itself changed
         if: env.skip != 'true'
         run: |
-          last="$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -1)"
+          # Strict vX.Y.Z only: prerelease or four-part tags must never feed
+          # the version bump.
+          last="$(git tag -l 'v*' | grep -E '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' | sort -V | tail -1)"
           if [ -z "${last}" ]; then
             echo "no previous tag, treating as releasable"
             echo "last_tag=v0.0.0" >> "$GITHUB_ENV"
@@ -83,6 +95,20 @@ jobs:
             echo "skip=true" >> "$GITHUB_ENV"
           fi
 
+      - name: Prove manual runs point at a CI-green main HEAD
+        # A manual dispatch is not trusted: like the automatic path, it may
+        # only tag a commit for which a completed, successful ci run exists.
+        if: env.skip != 'true' && github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sha="$(git rev-parse HEAD)"
+          echo "head_sha=${sha}" >> "$GITHUB_ENV"
+          if [ -z "$(gh run list -R "${GITHUB_REPOSITORY}" -w ci -b main --commit "${sha}" --json databaseId,conclusion -q '[.[] | select(.conclusion == "success")] | length')" ]; then
+            echo "no successful ci run for main HEAD ${sha}; refusing to tag" >&2
+            exit 1
+          fi
+
       - name: Work out the next version
         if: env.skip != 'true'
         env:
@@ -97,14 +123,9 @@ jobs:
           esac
           next="v${major}.${minor}.${patch}"
           if git rev-parse -q --verify "refs/tags/${next}" >/dev/null; then
-            if [ "$(git rev-parse "refs/tags/${next}^{commit}")" = "$(git rev-parse HEAD)" ]; then
-              # Rerun after a failed dispatch: the tag is ours, redispatch it.
-              echo "${next} already tags this commit; redispatching release"
-            else
-              echo "${next} already exists, refusing to move it"
-              echo "skip=true" >> "$GITHUB_ENV"
-              exit 0
-            fi
+            echo "${next} already exists, refusing to move it"
+            echo "skip=true" >> "$GITHUB_ENV"
+            exit 0
           fi
           echo "next_tag=${next}" >> "$GITHUB_ENV"
           echo "Releasing ${last_tag} -> ${next}"
@@ -114,13 +135,29 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # A tag pushed with GITHUB_TOKEN does not trigger other workflows,
-          # so create the ref via the REST API and dispatch release.yml at
-          # the tag ourselves. Dispatching at the tag ref means release.yml
-          # builds exactly the tagged commit and names it after the tag.
+          # Revalidate main did not move under us since the checks above.
+          sha="$(git rev-parse HEAD)"
+          if [ -n "${head_sha:-}" ] && [ "${sha}" != "${head_sha}" ]; then
+            echo "main moved during the run; aborting" >&2
+            exit 1
+          fi
           gh api "repos/${GITHUB_REPOSITORY}/git/refs" \
-            -f "ref=refs/tags/${next_tag}" -f "sha=$(git rev-parse HEAD)" >/dev/null \
-            || echo "${next_tag} already points at this commit; proceeding to dispatch"
-          gh workflow run release.yml --ref "${next_tag}" -R "${GITHUB_REPOSITORY}"
+            -f "ref=refs/tags/${next_tag}" -f "sha=${sha}" >/dev/null \
+            || echo "${next_tag} already points at this commit; proceeding"
+          # Single release path: the tag push is what starts release.yml.
+          # GITHUB_TOKEN ref creation is not guaranteed to fire the push
+          # trigger, so wait briefly for the release run and dispatch only as
+          # a fallback; the fallback can at worst double-start the same tag
+          # and release.yml is re-run safe (create-or-clobber upload).
+          for _ in 1 2 3 4 5 6; do
+            sleep 10
+            if [ -n "$(gh run list -R "${GITHUB_REPOSITORY}" -w release --commit "${sha}" -L 1 --json databaseId -q 'length')" ]; then
+              echo "release run started by the tag push"
+              echo "### Released ${next_tag}" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+          done
+          echo "push trigger did not start release.yml; dispatching it at the tag"
+          gh workflow run release.yml -R "${GITHUB_REPOSITORY}" --ref "${next_tag}"
           echo "### Released ${next_tag}" >> "$GITHUB_STEP_SUMMARY"
           echo "Tag created and the release workflow dispatched on it." >> "$GITHUB_STEP_SUMMARY"

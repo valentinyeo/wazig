@@ -4,18 +4,15 @@ name: release
 on:
   push:
     tags: ["v*"]
-  # Tag pushes made by the actions bot never trigger workflows, so
-  # auto-release.yml dispatches us at the tag ref instead.
-  workflow_dispatch:
 permissions:
   contents: read
 jobs:
   build:
     name: build
     runs-on: ubuntu-latest
-    # Dispatches are allowed only so auto-release can start us on a tag ref;
-    # a dispatch on a branch must never publish untagged code.
-    if: github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
+    # Dispatches on a branch must never publish untagged code; the tag-shape
+    # check below also enforces strict vX.Y.Z.
+    if: github.ref_type == 'tag'
     timeout-minutes: 120
     env:
       TDLIB_COMMIT: d1085f9cebc5a62379991ae1652673954f229c1f
@@ -25,11 +22,11 @@ jobs:
         with:
           version: 0.16.0
       - name: Check tag shape
+        # Strict: no prerelease suffixes, no four-part versions, no leading
+        # zeros; the MSI ProductVersion below needs exactly three integers.
         run: |
-          case "${GITHUB_REF_NAME}" in
-            v[0-9]*.[0-9]*.[0-9]*) ;;
-            *) echo "tag ${GITHUB_REF_NAME} is not vX.Y.Z" >&2; exit 1 ;;
-          esac
+          echo "${GITHUB_REF_NAME}" | grep -Eq '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' \
+            || { echo "tag ${GITHUB_REF_NAME} is not strict vX.Y.Z" >&2; exit 1; }
       - name: Install toolchain
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq g++-mingw-w64-x86-64 gperf php-cli cmake ninja-build

@@ -17,6 +17,9 @@ concurrency:
 permissions:
   contents: write
   pull-requests: write
+  # Dispatching ci.yml on main after a GITHUB_TOKEN merge, which suppresses
+  # the push-triggered ci run the release pipeline depends on.
+  actions: write
   checks: read
 jobs:
   automerge:
@@ -29,15 +32,49 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           set -uo pipefail
+          # A PR merges only when every release-gating check is present and
+          # green on its current head: pending, skipped, or failed copies of
+          # a required check block, and duplicate names cannot hide a red run.
+          required='["ci","tdlib","windows-smoke","code-review"]'
           for pr in $(gh pr list -R "$REPO" --state open --json number -q '.[].number'); do
-            info=$(gh pr view "$pr" -R "$REPO" --json isDraft,labels,additions,deletions,files,mergeable,statusCheckRollup)
+            info=$(gh pr view "$pr" -R "$REPO" --json isDraft,labels,additions,deletions,files,mergeable,statusCheckRollup,headRefOid)
+            head_oid=$(echo "$info" | jq -r .headRefOid)
+            blocked=$(echo "$info" | jq -r --argjson req "$required" '
+              ([.statusCheckRollup[]] as $roll
+               | [ $req[] as $r
+                   | if ([ $roll[] | select(.name == $r and .conclusion == "SUCCESS") ] | length) == 0
+                       or ([ $roll[] | select(.name == $r and .conclusion != "SUCCESS") ] | length) > 0
+                     then $r else empty end ] )
+              | join(",")')
             reason=$(echo "$info" | jq -r '
               if .isDraft then "draft"
               elif ([.labels[].name] | index("hold")) then "hold label"
               elif ([.files[].path] | index(".github/workflows/automerge.yml")) then "edits automerge itself"
               elif .mergeable != "MERGEABLE" then "not mergeable (\(.mergeable))"
-              elif ([.statusCheckRollup[] | select(.name == "ci" and .conclusion == "SUCCESS")] | length) == 0 then "ci not green"
               else "" end')
+            if [ -n "$blocked" ]; then reason="required checks not green: ${blocked}"; fi
             if [ -n "$reason" ]; then echo "#$pr: skip ($reason)"; continue; fi
-            if gh pr merge "$pr" -R "$REPO" --squash --delete-branch; then echo "#$pr: merged"; else echo "#$pr: merge failed"; fi
+            # --match-head-commit closes the race: if the PR head changes
+            # between the checks we read and the merge, GitHub refuses it.
+            if gh pr merge "$pr" -R "$REPO" --squash --delete-branch --match-head-commit "$head_oid"; then
+              echo "#$pr: merged"
+              # The GITHUB_TOKEN merge suppresses the push-triggered ci on
+              # main; start it for the resulting commit so the auto-release
+              # pipeline still fires. ponytail: workflow_dispatch runs at the
+              # current main head, so if main advances between merge and
+              # dispatch the intermediate commit may miss its own release;
+              # only main HEAD is ever tagged anyway.
+              merged_oid=$(gh pr view "$pr" -R "$REPO" --json mergeCommit -q .mergeCommit.oid)
+              for _ in 1 2 3; do
+                gh workflow run ci.yml -R "$REPO" --ref main
+                sleep 15
+                if [ -n "$(gh run list -R "$REPO" -w ci -b main --commit "$merged_oid" -L 1 --json databaseId -q 'length')" ]; then
+                  echo "#$pr: ci dispatched on main (${merged_oid})"
+                  break
+                fi
+                echo "#$pr: ci run not visible yet, retrying dispatch"
+              done
+            else
+              echo "#$pr: merge failed"
+            fi
           done
