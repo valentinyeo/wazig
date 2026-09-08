@@ -24,6 +24,7 @@ concurrency:
 
 permissions:
   contents: write
+  actions: write
 
 jobs:
   tag:
@@ -105,10 +106,16 @@ jobs:
 
       - name: Tag it
         if: env.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git tag -a "${next_tag}" -m "${next_tag}"
-          git push origin "${next_tag}"
+          # A tag pushed with GITHUB_TOKEN does not trigger other workflows,
+          # so create the ref via the REST API and dispatch release.yml at
+          # the tag ourselves. Dispatching at the tag ref means release.yml
+          # builds exactly the tagged commit and names it after the tag.
+          gh api "repos/${GITHUB_REPOSITORY}/git/refs" \
+            -f "ref=refs/tags/${next_tag}" -f "sha=$(git rev-parse HEAD)" >/dev/null \
+            || { echo "${next_tag} already exists, refusing to move it"; exit 1; }
+          gh workflow run release.yml --ref "${next_tag}" -R "${GITHUB_REPOSITORY}"
           echo "### Released ${next_tag}" >> "$GITHUB_STEP_SUMMARY"
-          echo "Tag pushed; the release workflow builds and publishes it." >> "$GITHUB_STEP_SUMMARY"
+          echo "Tag created and the release workflow dispatched on it." >> "$GITHUB_STEP_SUMMARY"

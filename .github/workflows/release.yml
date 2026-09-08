@@ -4,6 +4,9 @@ name: release
 on:
   push:
     tags: ["v*"]
+  # Tag pushes made by the actions bot never trigger workflows, so
+  # auto-release.yml dispatches us at the tag ref instead.
+  workflow_dispatch:
 permissions:
   contents: read
 jobs:
