@@ -69,7 +69,7 @@ jobs:
               for _ in 1 2 3; do
                 gh workflow run ci.yml -R "$REPO" --ref main
                 sleep 15
-                if [ -n "$(gh run list -R "$REPO" -w ci -b main --commit "$merged_oid" -L 1 --json databaseId -q 'length')" ]; then
+                if [ "$(gh run list -R "$REPO" -w ci -b main --commit "$merged_oid" -L 1 --json databaseId -q 'length')" != "0" ]; then
                   echo "#$pr: ci dispatched on main (${merged_oid})"
                   ci_started=1
                   break
