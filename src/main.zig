@@ -9901,8 +9901,21 @@ fn performUpdate(io: std.Io) !UpdateOutcome {
             _ = win.MoveFileExW(exe_old_wide.ptr, exe_here_wide.ptr, win.MOVEFILE_REPLACE_EXISTING);
         }
         _ = win.DeleteFileW(exe_new_wide.ptr);
-        // A .old backup left by a completed swap is safe to drop now.
-        _ = win.DeleteFileW(exe_old_wide.ptr);
+        // A .old backup left by a completed swap is safe to drop now. When the
+        // delete leaves the file behind, a stale orphan copy still locks it
+        // (WAZI-66): end the orphans here too — not only on mutex contention —
+        // and retry, so the commit rename onto .old cannot hit a locked file.
+        const exe_present = win.GetFileAttributesW(exe_here_wide.ptr) != win.INVALID_FILE_ATTRIBUTES;
+        const old_delete_succeeded = win.DeleteFileW(exe_old_wide.ptr) != 0;
+        const old_present = win.GetFileAttributesW(exe_old_wide.ptr) != win.INVALID_FILE_ATTRIBUTES;
+        switch (update.oldBackupAction(exe_present, old_present, old_delete_succeeded)) {
+            .restore => _ = win.MoveFileExW(exe_old_wide.ptr, exe_here_wide.ptr, win.MOVEFILE_REPLACE_EXISTING),
+            .clear_orphans_and_retry => {
+                clearStaleOrphans();
+                _ = win.DeleteFileW(exe_old_wide.ptr);
+            },
+            .none => {},
+        }
     }
 
     const api_headers = try utf8ToWide(allocator, "User-Agent: Messages updater\r\nAccept: application/vnd.github+json\r\n");
