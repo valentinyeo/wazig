@@ -77,7 +77,7 @@ jobs:
           if [ -n "${tag}" ]; then
             started="$(gh run list -R "${GITHUB_REPOSITORY}" -w release \
               --json event,headBranch,headSha \
-              -q "[.[] | select(.event == \"push\" and .headBranch == \"${tag}\" and .headSha == \"$(git rev-parse HEAD)\")] | length")"
+              -q "[.[] | select((.event == \"push\" or .event == \"workflow_dispatch\") and .headBranch == \"${tag}\" and .headSha == \"$(git rev-parse HEAD)\")] | length")"
             if [ "${started}" != "0" ]; then
               echo "HEAD already carries a release tag and release.yml is running"
               echo "skip=true" >> "$GITHUB_ENV"
@@ -169,11 +169,14 @@ jobs:
               exit 1
             fi
             if [ "${remote_tag}" != "${sha}" ]; then
-              # Annotated tags point at a tag object; peel it to the commit.
-              if [ "$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${remote_tag}" --jq .object.type 2>/dev/null || true)" = "tag" ]; then
+              # Annotated tags point at a tag object; peel to the commit,
+              # recursing if a tag was made pointing at another tag.
+              for _ in 1 2 3; do
+                obj_type="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${remote_tag}" --jq .object.type 2>/dev/null || true)"
+                if [ "${obj_type}" != "tag" ]; then break; fi
                 remote_tag="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${remote_tag}" --jq .object.sha)"
-              fi
-              if [ "${remote_tag}" != "${sha}" ]; then
+              done
+              if [ "${obj_type}" = "tag" ] || [ "${remote_tag}" != "${sha}" ]; then
                 echo "${next_tag} exists remotely but not at ${sha}" >&2
                 exit 1
               fi
@@ -188,7 +191,7 @@ jobs:
             sleep 10
             started="$(gh run list -R "${GITHUB_REPOSITORY}" -w release \
               --json event,headBranch,headSha \
-              -q "[.[] | select(.event == \"push\" and .headBranch == \"${next_tag}\" and .headSha == \"${sha}\")] | length")"
+              -q "[.[] | select((.event == \"push\" or .event == \"workflow_dispatch\") and .headBranch == \"${next_tag}\" and .headSha == \"${sha}\")] | length")"
             if [ "${started}" != "0" ]; then
               echo "release run started by the tag push"
               echo "### Released ${next_tag}" >> "$GITHUB_STEP_SUMMARY"
