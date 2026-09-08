@@ -299,3 +299,39 @@ test isZipAssetName {
     try std.testing.expect(!isZipAssetName("SHA256SUMS.txt"));
     try std.testing.expect(!isZipAssetName("Other-v1.0.0.zip"));
 }
+
+/// WAZI-66: outcome of waiting on the global updater mutex. WAIT_ABANDONED
+/// (0x80) still grants ownership because the previous holder died; a timeout
+/// or failure means a live copy holds it. Contention must surface as a
+/// distinct blocked outcome, never as a silent "no update available".
+pub const wait_abandoned: u32 = 0x80;
+
+pub const MutexWait = enum { acquired, busy };
+
+pub fn classifyMutexWait(result: u32) MutexWait {
+    return if (result == 0 or result == wait_abandoned) .acquired else .busy;
+}
+
+/// A running copy of the app is a stale orphan (WAZI-66) when it is not us
+/// and shows no visible window: it was left behind by an earlier update swap,
+/// still locks the old binary, and can hold the update mutex indefinitely.
+pub fn isStaleOrphan(self_pid: u32, pid: u32, has_visible_window: bool) bool {
+    return pid != self_pid and !has_visible_window;
+}
+
+test classifyMutexWait {
+    try std.testing.expectEqual(MutexWait.acquired, classifyMutexWait(0)); // WAIT_OBJECT_0
+    try std.testing.expectEqual(MutexWait.acquired, classifyMutexWait(0x80)); // WAIT_ABANDONED
+    // Contention and failure must be a blocked outcome, never "no update".
+    try std.testing.expectEqual(MutexWait.busy, classifyMutexWait(0x102)); // WAIT_TIMEOUT
+    try std.testing.expectEqual(MutexWait.busy, classifyMutexWait(0xFFFFFFFF)); // WAIT_FAILED
+    try std.testing.expectEqual(MutexWait.busy, classifyMutexWait(7));
+}
+
+test isStaleOrphan {
+    // The real app always has a visible window and is never killed.
+    try std.testing.expect(!isStaleOrphan(100, 100, true));
+    try std.testing.expect(!isStaleOrphan(100, 200, true));
+    // A windowless other copy is the orphan left behind by an update swap.
+    try std.testing.expect(isStaleOrphan(100, 200, false));
+}

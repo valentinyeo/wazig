@@ -8,6 +8,7 @@ pub const c = @cImport({
     @cDefine("COBJMACROS", "1");
     @cInclude("windows.h");
     @cInclude("windowsx.h");
+    @cInclude("tlhelp32.h");
     @cInclude("commctrl.h");
     @cInclude("dwmapi.h");
     @cInclude("shellapi.h");

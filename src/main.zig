@@ -7944,7 +7944,7 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
         wm_update_ready => {
             // wparam: 1 installed, 2 newer version found (lparam = *UpdateAvailable),
             // 3 no update, 4 check failed automatically, 5 check failed manually
-            // (lparam = static @errorName text).
+            // (lparam = static @errorName text), 6 blocked by another running copy.
             a.update_check_running = false;
             switch (wparam) {
                 1 => {
@@ -7965,6 +7965,10 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
                     a.update_failures = 0;
                     var none_buf: [96]u8 = undefined;
                     setStatus(a, std.fmt.bufPrint(&none_buf, "You are on v{s} - this is the newest version", .{app_version}) catch "No updates found");
+                },
+                6 => {
+                    a.update_failures = 0;
+                    setStatus(a, "Update blocked: another copy of Messages is running - close other copies and try again");
                 },
                 4, 5 => {
                     const name: [*:0]const u8 = @ptrFromInt(@as(usize, @bitCast(lparam)));
@@ -9128,7 +9132,7 @@ const UpdateContext = struct {
     install: bool,
 };
 
-const UpdateOutcome = enum { none, installed };
+const UpdateOutcome = enum { none, blocked, installed };
 
 /// A newer release found by a check: enough to ask the user, nothing more.
 /// The install path re-checks, so a stale download URL is never used.
@@ -9188,7 +9192,12 @@ fn updateThreadMain(ctx: *UpdateContext) void {
             postUpdateFailure(ctx.hwnd, ctx.manual, err);
             return;
         };
-        _ = win.PostMessageW(ctx.hwnd, wm_update_ready, if (outcome == .installed) 1 else 3, 0);
+        if (outcome == .blocked) logUpdateFailure("update blocked by another running copy");
+        _ = win.PostMessageW(ctx.hwnd, wm_update_ready, switch (outcome) {
+            .installed => @as(u32, 1),
+            .blocked => 6,
+            .none => 3,
+        }, 0);
         return;
     }
     const maybe_update = checkForUpdate(allocator) catch |err| {
@@ -9363,6 +9372,83 @@ fn httpGetUrl(allocator: std.mem.Allocator, url_wide: []const u16, headers: [*:0
     );
 }
 
+/// WAZI-66: end windowless leftover copies of this exact executable. An
+/// orphan from an earlier update swap still locks the .old binary and can
+/// hold the update mutex indefinitely. Only processes running the same exe
+/// path with no visible window are terminated; a real copy of the app in
+/// another window always keeps a visible window and is never touched.
+fn clearStaleOrphans() void {
+    const self_pid = win.GetCurrentProcessId();
+    var exe_buf: [519]u16 = undefined;
+    const exe_len: usize = @intCast(win.GetModuleFileNameW(null, &exe_buf, exe_buf.len));
+    if (exe_len == 0 or exe_len >= exe_buf.len) return;
+
+    // First pass: pids that own a visible window anywhere on the desktop.
+    // The list is bounded; if it overflows we skip orphan cleanup entirely
+    // rather than risk misreading a live copy as windowless.
+    var visible: [64]win.DWORD = undefined;
+    var visible_count: usize = 0;
+    var visible_overflow = false;
+    const ctx = VisibleWindowScan{ .pids = &visible, .count = &visible_count, .overflow = &visible_overflow };
+    _ = win.EnumWindows(visibleWindowProc, @bitCast(@intFromPtr(&ctx)));
+    if (visible_overflow) return;
+
+    const TH32CS_SNAPPROCESS = 0x00000002;
+    const snapshot = win.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) orelse return;
+    defer _ = win.CloseHandle(snapshot);
+    var entry = std.mem.zeroes(win.PROCESSENTRY32W);
+    entry.dwSize = @sizeOf(win.PROCESSENTRY32W);
+    if (win.Process32FirstW(snapshot, &entry) == 0) return;
+    while (true) {
+        const pid = entry.th32ProcessID;
+        if (pid != self_pid and isWindowlessProcess(visible[0..visible_count], pid)) {
+            var path_buf: [519]u16 = undefined;
+            var path_len: win.DWORD = path_buf.len;
+            const handle = win.OpenProcess(win.PROCESS_QUERY_LIMITED_INFORMATION | win.PROCESS_TERMINATE, win.FALSE, pid);
+            if (handle != null and handle != win.INVALID_HANDLE_VALUE) {
+                if (win.QueryFullProcessImageNameW(handle, 0, &path_buf, &path_len) != 0 and
+                    path_len == exe_len and std.mem.eql(u16, path_buf[0..exe_len], exe_buf[0..exe_len]))
+                {
+                    // Terminating is the only way an orphan releases the
+                    // mutex it took as a windowless instance.
+                    _ = win.TerminateProcess(handle, 1);
+                    _ = win.WaitForSingleObject(handle, 5000);
+                }
+                _ = win.CloseHandle(handle);
+            }
+        }
+        if (win.Process32NextW(snapshot, &entry) == 0) break;
+    }
+}
+
+const VisibleWindowScan = struct {
+    pids: []win.DWORD,
+    count: *usize,
+    overflow: *bool,
+};
+
+fn visibleWindowProc(hwnd: win.HWND, lparam: win.LPARAM) callconv(.winapi) win.BOOL {
+    if (win.IsWindowVisible(hwnd) != 0) {
+        const scan: *VisibleWindowScan = @ptrFromInt(@as(usize, @bitCast(lparam)));
+        var pid: win.DWORD = 0;
+        _ = win.GetWindowThreadProcessId(hwnd, &pid);
+        if (scan.count.* >= scan.pids.len) {
+            scan.overflow.* = true;
+            return 0; // Stop enumerating; the caller will not kill anything.
+        }
+        scan.pids[scan.count.*] = pid;
+        scan.count.* += 1;
+    }
+    return 1;
+}
+
+fn isWindowlessProcess(visible_pids: []const win.DWORD, pid: win.DWORD) bool {
+    for (visible_pids) |visible_pid| {
+        if (visible_pid == pid) return false;
+    }
+    return update.isStaleOrphan(win.GetCurrentProcessId(), pid, false);
+}
+
 fn performUpdate(io: std.Io) !UpdateOutcome {
     const allocator = std.heap.page_allocator;
     const current = update.parseVersion(app_version) orelse return error.UpdateBadVersion;
@@ -9370,9 +9456,16 @@ fn performUpdate(io: std.Io) !UpdateOutcome {
     // One updater at a time across every running copy of the app.
     const mutex = win.CreateMutexW(null, win.FALSE, lit("Local\\MessagesUpdateMutex")) orelse return error.UpdateMutexFailed;
     defer _ = win.CloseHandle(mutex);
-    // WAIT_ABANDONED still grants ownership (the previous holder died); treat it as acquired.
-    const wait_result = win.WaitForSingleObject(mutex, 0);
-    if (wait_result != win.WAIT_OBJECT_0 and wait_result != 0x80) return .none;
+    var acquired = update.classifyMutexWait(win.WaitForSingleObject(mutex, 0)) == .acquired;
+    if (!acquired) {
+        // WAZI-66: a windowless orphan from an earlier swap holds the mutex
+        // (and the .old binary) forever, so contention used to look like
+        // "no update available". End stale orphans, wait once more, and only
+        // then report a distinct blocked outcome.
+        clearStaleOrphans();
+        acquired = update.classifyMutexWait(win.WaitForSingleObject(mutex, 10_000)) == .acquired;
+        if (!acquired) return .blocked;
+    }
     defer _ = win.ReleaseMutex(mutex);
 
     var exe_wide_buf: [519]u16 = undefined;
