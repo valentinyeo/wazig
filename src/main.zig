@@ -2962,15 +2962,32 @@ fn persistPendingReads(a: *App) void {
 fn loadPendingReads(a: *App) void {
     if (a.read_path.len == 0) return;
     // If the previous shutdown's swap failed, the complete queue is still in
-    // the temp file: promote it before reading. A missing temp fails here
-    // harmlessly.
+    // the temp file: promote it before reading. A completed write always
+    // ends with a newline (the write loop and flush are verified before the
+    // swap), so a temp without one is a crash mid-write — discard it rather
+    // than clobber the last known-good queue with a partial file. A missing
+    // temp fails here harmlessly.
     const temp_path = std.fmt.allocPrint(a.allocator, "{s}.new", .{a.read_path}) catch return;
     defer a.allocator.free(temp_path);
     const temp_wide = std.unicode.utf8ToUtf16LeAllocZ(a.allocator, temp_path) catch return;
     defer a.allocator.free(temp_wide);
     const target_wide = std.unicode.utf8ToUtf16LeAllocZ(a.allocator, a.read_path) catch return;
     defer a.allocator.free(target_wide);
-    _ = win.MoveFileExW(temp_wide.ptr, target_wide.ptr, win.MOVEFILE_REPLACE_EXISTING | win.MOVEFILE_WRITE_THROUGH);
+    if (win.GetFileAttributesW(temp_wide.ptr) != win.INVALID_FILE_ATTRIBUTES) {
+        const temp_handle = win.CreateFileW(temp_wide.ptr, win.GENERIC_READ, 0, null, win.OPEN_EXISTING, win.FILE_ATTRIBUTE_NORMAL, null);
+        if (temp_handle != win.INVALID_HANDLE_VALUE and temp_handle != null) {
+            var size: win.LARGE_INTEGER = undefined;
+            var last_byte: u8 = 0;
+            var got: win.DWORD = 0;
+            const readable = win.GetFileSizeEx(temp_handle, &size) != 0 and size.QuadPart > 0 and
+                win.SetFilePointerEx(temp_handle, .{ .QuadPart = -1 }, null, win.FILE_END) != 0 and
+                win.ReadFile(temp_handle, @ptrCast(&last_byte), 1, &got, null) != 0 and got == 1 and last_byte == '\n';
+            _ = win.CloseHandle(temp_handle);
+            if (readable) {
+                _ = win.MoveFileExW(temp_wide.ptr, target_wide.ptr, win.MOVEFILE_REPLACE_EXISTING | win.MOVEFILE_WRITE_THROUGH);
+            } else _ = win.DeleteFileW(temp_wide.ptr);
+        }
+    }
     const handle = win.CreateFileW(target_wide.ptr, win.GENERIC_READ, win.FILE_SHARE_READ, null, win.OPEN_EXISTING, win.FILE_ATTRIBUTE_NORMAL, null);
     if (handle == win.INVALID_HANDLE_VALUE or handle == null) return;
     defer _ = win.CloseHandle(handle);
