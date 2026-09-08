@@ -1270,7 +1270,13 @@ fn ensureWebPBitmap(a: *App, message: *Message) void {
     var pixels = webp.WebPDecodeRGBA(data.ptr, data.len, &width, &height);
     if (pixels == null) {
         if (webp_detect.firstAnimationFrame(data)) |frame| {
-            pixels = webp.WebPDecodeRGBA(frame.ptr, frame.len, &width, &height);
+            var frame_features: webp.WebPBitstreamFeatures = undefined;
+            if (webp.WebPGetFeatures(frame.ptr, frame.len, &frame_features) == webp.VP8_STATUS_OK and
+                frame_features.width > 0 and frame_features.height > 0 and
+                @as(i64, frame_features.width) * @as(i64, frame_features.height) <= 16 * 1024 * 1024)
+            {
+                pixels = webp.WebPDecodeRGBA(frame.ptr, frame.len, &width, &height);
+            }
         }
     }
     defer webp.WebPFree(pixels);
