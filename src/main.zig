@@ -1876,6 +1876,9 @@ fn handleTgAuthError(a: *App, error_text: []const u8) void {
     else if (std.mem.indexOf(u8, error_text, "2FA password") != null)
         .password
     else {
+        // Unknown error: unblock the dialog so the user can retry the same
+        // step instead of staying locked on the "checking" state.
+        tgLoginRetryInput(a);
         tgLoginShowError(a, error_text);
         return;
     };
@@ -1960,6 +1963,15 @@ fn tgLoginSetChecking(a: *App) void {
     if (win.GetDlgItem(window, id_tg_next)) |next| _ = win.EnableWindow(next, 0);
     const prompt = win.GetDlgItem(window, id_tg_prompt) orelse return;
     _ = win.SetWindowTextW(prompt, lit("Checking with Telegram..."));
+}
+
+/// Unblocks the dialog for another try on the same step (unknown errors).
+fn tgLoginRetryInput(a: *App) void {
+    const window = a.tg_login_window orelse return;
+    const edit = win.GetDlgItem(window, id_tg_edit) orelse return;
+    _ = win.EnableWindow(edit, 1);
+    if (win.GetDlgItem(window, id_tg_next)) |next| _ = win.EnableWindow(next, 1);
+    _ = win.SetFocus(edit);
 }
 
 fn openTelegramLogin(a: *App, mode: TgLoginMode) void {
