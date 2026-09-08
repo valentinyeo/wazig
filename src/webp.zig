@@ -38,7 +38,7 @@ pub fn firstAnimationFrame(data: []const u8) ?[]const u8 {
             const bitstream_size = chunkSizeAt(data, inner) orelse return null;
             if (std.mem.startsWith(u8, data[inner .. inner + 4], "VP8")) {
                 inner += 8;
-                if (inner + bitstream_size > data.len) return null;
+                if (bitstream_size > data.len - inner) return null;
                 return data[inner .. inner + bitstream_size];
             }
             return null;
