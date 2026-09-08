@@ -10062,9 +10062,11 @@ fn performUpdate(io: std.Io) !UpdateOutcome {
         return error.UpdateCopyFailed;
     }
     // The new exe is in place; now the support files. On a failure the old
-    // exe comes back — closest to the pre-update state. ponytail: a full
-    // per-file rollback journal is out of scope; leftover temps and a stale
-    // .old are cleared on the next update attempt.
+    // exe comes back — closest to the pre-update state. ponytail: no per-file
+    // rollback journal, deliberately — the only files beside the exe are the
+    // two IBM Plex fonts and the OFL license, so a partially renamed support
+    // set leaves the app runnable and is redone on the next update attempt.
+    // Leftover temps and a stale .old are also cleared there.
     for (pending.items, 0..) |p, i| {
         if (i == exe_i) continue;
         if (win.MoveFileExW(p.temp.ptr, p.dest.ptr, win.MOVEFILE_REPLACE_EXISTING) == 0) {
