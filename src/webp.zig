@@ -26,15 +26,18 @@ pub fn firstAnimationFrame(data: []const u8) ?[]const u8 {
             // ANMF payload: 16-byte frame header, then optional ALPH chunk and
             // the VP8/VP8L chunk.
             if (size > data.len - offset - 8) return null;
+            const frame_end = offset + 8 + size;
             var inner = offset + 8 + 16;
+            if (inner + 8 > frame_end) return null;
             const inner_size = chunkSizeAt(data, inner) orelse return null;
             if (std.mem.eql(u8, data[inner .. inner + 4], "ALPH")) {
                 // ponytail: the bare VP8 payload decodes without the alpha
                 // plane, so lossy-with-alpha stickers lose transparency; the
                 // upgrade path is WebPAnimDecoder (vendor src/demux).
-                if (inner_size > data.len - inner - 8) return null;
+                if (8 + inner_size > frame_end - inner) return null;
                 inner += 8 + inner_size + (inner_size & 1);
             }
+            if (inner + 8 > frame_end) return null;
             const bitstream_size = chunkSizeAt(data, inner) orelse return null;
             if (std.mem.startsWith(u8, data[inner .. inner + 4], "VP8")) {
                 inner += 8;
