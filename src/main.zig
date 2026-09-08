@@ -13,6 +13,7 @@ const webp_detect = @import("webp.zig");
 const paste_image = @import("paste_image.zig");
 const scrollbar = @import("scrollbar.zig");
 const message_filter = @import("message_filter.zig");
+const chat_cache = @import("chat_cache.zig");
 
 const webp = @cImport({
     @cInclude("src/webp/decode.h");
@@ -338,7 +339,7 @@ const Message = struct {
 // posts a WacliResult pointer back with wm_wacli_done; the UI thread parses
 // and applies it. Jobs carry a generation token so a stale answer can never
 // overwrite a newer view.
-const WacliJobKind = enum(u8) { chats, groups, messages, reaction, slack_workspace, slack_users, slack_history, slack_replies, slack_send, slack_attach, slack_download, slack_auth };
+const WacliJobKind = enum(u8) { chats, groups, messages, reaction, slack_workspace, slack_users, slack_history, slack_replies, slack_send, slack_attach, slack_download, slack_auth, cache_tag };
 const wacli_kind_count = @typeInfo(WacliJobKind).@"enum".fields.len;
 
 const WacliJob = struct {
@@ -622,6 +623,13 @@ const App = struct {
     chats_pending_flags: u8 = 0,
     msg_cache: [max_msg_cache]MsgCacheEntry = [_]MsgCacheEntry{.{}} ** max_msg_cache,
     msg_cache_len: usize = 0,
+    // Hashed linked WhatsApp account: cache files are scoped to it, so a
+    // store that switches accounts can never paint the other account's data.
+    cache_tag: Utf8Text(32) = .{},
+    // Bumped on every account-change event; a pending probe result with an
+    // older generation is stale and must never install a tag.
+    cache_tag_gen: u64 = 0,
+    cache_tag_probe_again: bool = false,
     store_watch_path: WideText(519) = .{},
     last_store_write: u64 = 0,
 };
@@ -1288,6 +1296,15 @@ fn msgCacheStore(a: *App, jid: []const u8, data: []const u8) void {
     if (entry.data) |old| a.allocator.free(old);
     entry.jid.set(jid);
     entry.data = copy;
+    // Also persist for the next launch (WAZI-67). The file carries the jid
+    // and it is verified on read, so a hash collision can only waste a file,
+    // never show the wrong chat.
+    if (msgCacheDiskPath(a, jid)) |path| {
+        defer a.allocator.free(path);
+        const envelope = chat_cache.envelope(a.allocator, jid, data) catch return;
+        defer a.allocator.free(envelope);
+        writeCacheFileAtomic(a, path, envelope);
+    }
 }
 
 fn timestampPart(timestamp: []const u8, start: usize, length: usize) ?u16 {
@@ -1404,7 +1421,11 @@ fn refreshChats(a: *App) void {
     a.chats_pending_flags = flags;
 }
 
-fn applyChats(a: *App, raw: []const u8) void {
+/// Returns true only when the payload was fully parsed into the chat list,
+/// so the caller can decide whether it is safe to persist as the launch
+/// snapshot (WAZI-67): a malformed response must never overwrite the last
+/// valid cache.
+fn applyChats(a: *App, raw: []const u8) bool {
     var query_wide: [256]u16 = [_]u16{0} ** 256;
     const query_len = if (a.search) |search| @as(usize, @intCast(win.GetWindowTextW(search, &query_wide, query_wide.len))) else 0;
     const query_utf8 = if (query_len > 0) std.unicode.utf16LeToUtf8Alloc(a.allocator, query_wide[0..query_len]) catch null else null;
@@ -1412,17 +1433,17 @@ fn applyChats(a: *App, raw: []const u8) void {
 
     var parsed = std.json.parseFromSlice(std.json.Value, a.allocator, raw, .{}) catch {
         setStatus(a, "Unable to read chats from wacli");
-        return;
+        return false;
     };
     defer parsed.deinit();
     const root = switch (parsed.value) {
         .object => |o| o,
-        else => return,
+        else => return false,
     };
-    const data_value = root.get("data") orelse return;
+    const data_value = root.get("data") orelse return false;
     const data = switch (data_value) {
         .array => |items| items,
-        else => return,
+        else => return false,
     };
     if (!a.pins_loaded) {
         a.pins_loaded = true;
@@ -1563,6 +1584,7 @@ fn applyChats(a: *App, raw: []const u8) void {
         const status = std.fmt.bufPrint(&status_buffer, "{d} chats", .{a.chat_count}) catch "Chats loaded";
         setStatus(a, status);
     }
+    return true;
 }
 
 // --------------------------------------------------------------- Telegram
@@ -3852,6 +3874,204 @@ fn writeFileWin(path_utf8: []const u8, data: []const u8) void {
     _ = win.WriteFile(handle, data.ptr, @intCast(data.len), &written, null);
 }
 
+// WAZI-67 cache helpers: last good chats read and per-chat message reads
+// survive a relaunch (an update included) so the app never opens blank.
+// Files live in %LOCALAPPDATA%\Messages, which the updater never touches,
+// and are named for the linked account so two accounts on one PC can never
+// see each other's cached data.
+
+fn messagesDirPath(a: *App, part: []const u8) ?[]u8 {
+    const dir = std.fs.path.dirname(a.avatar_dir) orelse return null;
+    return std.fs.path.join(a.allocator, &.{ dir, part }) catch null;
+}
+
+// Write to a same-directory temp file, then replace: a crash mid-write can
+// never leave a truncated cache visible to the next launch.
+fn writeCacheFileAtomic(a: *App, path: []const u8, data: []const u8) void {
+    const tmp = std.fmt.allocPrint(a.allocator, "{s}.{x}.tmp", .{ path, win.GetTickCount64() }) catch return;
+    defer a.allocator.free(tmp);
+    const tmp_wide = std.unicode.utf8ToUtf16LeAllocZ(a.allocator, tmp) catch return;
+    defer a.allocator.free(tmp_wide);
+    const handle = win.CreateFileW(tmp_wide.ptr, win.GENERIC_WRITE, 0, null, win.CREATE_ALWAYS, win.FILE_ATTRIBUTE_NORMAL, null);
+    if (handle == win.INVALID_HANDLE_VALUE or handle == null) return;
+    var written: win.DWORD = 0;
+    const wrote = win.WriteFile(handle, data.ptr, @intCast(data.len), &written, null) != 0 and written == data.len;
+    const flushed = win.FlushFileBuffers(handle) != 0;
+    _ = win.CloseHandle(handle);
+    if (!wrote or !flushed) {
+        _ = win.DeleteFileW(tmp_wide.ptr);
+        return;
+    }
+    const path_wide = std.unicode.utf8ToUtf16LeAllocZ(a.allocator, path) catch return;
+    defer a.allocator.free(path_wide);
+    // Sharing violations (antivirus, a stuck reader) must never be fatal;
+    // the next successful read simply overwrites the cache again.
+    if (win.MoveFileExW(tmp_wide.ptr, path_wide.ptr, win.MOVEFILE_REPLACE_EXISTING | win.MOVEFILE_WRITE_THROUGH) == 0) {
+        _ = win.DeleteFileW(tmp_wide.ptr);
+    }
+}
+
+// Delete one account's launch-cache files before its tag is dropped: the
+// 14-day prune only visits directories whose tag it knows, so unlinking an
+// account without this would strand its message snapshots forever.
+fn deleteAccountCaches(a: *App) void {
+    const tag = a.cache_tag.slice();
+    if (tag.len == 0) return;
+    var name_buffer: [64]u8 = undefined;
+    if (std.fmt.bufPrint(&name_buffer, "chats-{s}.json", .{tag})) |name| {
+        if (messagesDirPath(a, name)) |path| {
+            defer a.allocator.free(path);
+            deleteFileUtf8(path);
+        }
+    } else |_| {}
+    if (std.fmt.bufPrint(&name_buffer, "msg-cache-{s}", .{tag})) |dir_name| {
+        if (messagesDirPath(a, dir_name)) |dir_path| {
+            defer a.allocator.free(dir_path);
+            std.Io.Dir.cwd().deleteTree(a.io, dir_path) catch {};
+        }
+    } else |_| {}
+}
+
+fn chatsCachePath(a: *App) ?[]u8 {
+    const tag = a.cache_tag.slice();
+    if (tag.len == 0) return null; // identity unknown: cache disabled
+    var name_buffer: [64]u8 = undefined;
+    const name = std.fmt.bufPrint(&name_buffer, "chats-{s}.json", .{tag}) catch return null;
+    return messagesDirPath(a, name);
+}
+
+fn saveChatsCache(a: *App, raw: []const u8) void {
+    const path = chatsCachePath(a) orelse return;
+    defer a.allocator.free(path);
+    writeCacheFileAtomic(a, path, raw);
+    removeOtherChatsCaches(a, path);
+}
+
+// The cache file is named for the linked account; when the account changes
+// the old snapshot would linger forever, so drop every chats-*.json that is
+// not the file just written.
+fn removeOtherChatsCaches(a: *App, keep_path: []const u8) void {
+    const dir = std.fs.path.dirname(a.avatar_dir) orelse return;
+    const pattern = messagesDirPath(a, "chats-*.json") orelse return;
+    defer a.allocator.free(pattern);
+    const wide = std.unicode.utf8ToUtf16LeAllocZ(a.allocator, pattern) catch return;
+    defer a.allocator.free(wide);
+    var find: win.WIN32_FIND_DATAW = undefined;
+    const handle = win.FindFirstFileW(wide.ptr, &find);
+    if (handle == win.INVALID_HANDLE_VALUE or handle == null) return;
+    defer _ = win.FindClose(handle);
+    while (true) {
+        const name_len = std.mem.indexOfScalar(u16, &find.cFileName, 0) orelse find.cFileName.len;
+        const candidate = std.unicode.utf16LeToUtf8Alloc(a.allocator, find.cFileName[0..name_len]) catch break;
+        defer a.allocator.free(candidate);
+        if (std.fs.path.join(a.allocator, &.{ dir, candidate })) |full| {
+            defer a.allocator.free(full);
+            if (!std.mem.eql(u8, full, keep_path)) deleteFileUtf8(full);
+        } else |_| {}
+        if (win.FindNextFileW(handle, &find) == 0) break;
+    }
+}
+
+fn loadChatsCache(a: *App) void {
+    const path = chatsCachePath(a) orelse return;
+    defer a.allocator.free(path);
+    const data = readFileWin(a.allocator, path, msg_cache_max_bytes) orelse return;
+    defer a.allocator.free(data);
+    // applyChats returns without mutating state on a parse failure, so a
+    // corrupt snapshot just falls through to the live read.
+    _ = applyChats(a, data);
+}
+
+fn msgCacheDirName(a: *App, buffer: []u8) ?[]const u8 {
+    // Empty tag means the account identity is unknown: the cache is off.
+    if (a.cache_tag.len == 0) return null;
+    return std.fmt.bufPrint(buffer, "msg-cache-{s}", .{a.cache_tag.slice()}) catch null;
+}
+
+fn msgCacheDiskPath(a: *App, jid: []const u8) ?[]u8 {
+    var dir_buffer: [64]u8 = undefined;
+    const dir_name = msgCacheDirName(a, &dir_buffer) orelse return null;
+    const dir_path = messagesDirPath(a, dir_name) orelse return null;
+    defer a.allocator.free(dir_path);
+    const dir_wide = std.unicode.utf8ToUtf16LeAllocZ(a.allocator, dir_path) catch return null;
+    defer a.allocator.free(dir_wide);
+    _ = win.CreateDirectoryW(dir_wide.ptr, null);
+    var name_buffer: [32]u8 = undefined;
+    const name = std.fmt.bufPrint(&name_buffer, "{x:0>16}.msg", .{std.hash.Wyhash.hash(0, jid)}) catch return null;
+    return std.fs.path.join(a.allocator, &.{ dir_path, name }) catch null;
+}
+
+fn loadMsgCacheDisk(a: *App, jid: []const u8) ?[]u8 {
+    const path = msgCacheDiskPath(a, jid) orelse return null;
+    defer a.allocator.free(path);
+    const data = readFileWin(a.allocator, path, msg_cache_max_bytes) orelse return null;
+    defer a.allocator.free(data);
+    const payload = chat_cache.payloadFor(data, jid) orelse return null;
+    return a.allocator.dupe(u8, payload) catch null;
+}
+
+// Same 14-day window as the media cache: message snapshots older than that
+// are pruned at startup so the folders cannot grow without bound. Every
+// account's directory is visited, because an account that was replaced
+// without the remove flow leaves its snapshots behind. The scan is capped;
+// it never follows subdirectories or reparse points.
+fn pruneStaleMsgCache(a: *App) void {
+    const dir = std.fs.path.dirname(a.avatar_dir) orelse return;
+    const dirs_pattern = messagesDirPath(a, "msg-cache-*") orelse return;
+    defer a.allocator.free(dirs_pattern);
+    const dirs_wide = std.unicode.utf8ToUtf16LeAllocZ(a.allocator, dirs_pattern) catch return;
+    defer a.allocator.free(dirs_wide);
+    var dirs: win.WIN32_FIND_DATAW = undefined;
+    const dirs_handle = win.FindFirstFileW(dirs_wide.ptr, &dirs);
+    if (dirs_handle == win.INVALID_HANDLE_VALUE or dirs_handle == null) return;
+    defer _ = win.FindClose(dirs_handle);
+    const now = nowUnixSeconds();
+    var scanned: usize = 0;
+    while (scanned < 4096) : (scanned += 1) {
+        if ((dirs.dwFileAttributes & win.FILE_ATTRIBUTE_DIRECTORY) != 0 and
+            (dirs.dwFileAttributes & win.FILE_ATTRIBUTE_REPARSE_POINT) == 0)
+        {
+            pruneStaleInDir(a, dir, &dirs, now, &scanned);
+        }
+        if (win.FindNextFileW(dirs_handle, &dirs) == 0) break;
+    }
+}
+
+fn pruneStaleInDir(a: *App, parent: []const u8, entry: *const win.WIN32_FIND_DATAW, now: i64, scanned: *usize) void {
+    const name_len = std.mem.indexOfScalar(u16, &entry.cFileName, 0) orelse entry.cFileName.len;
+    const dir_name = std.unicode.utf16LeToUtf8Alloc(a.allocator, entry.cFileName[0..name_len]) catch return;
+    defer a.allocator.free(dir_name);
+    const dir_path = std.fs.path.join(a.allocator, &.{ parent, dir_name }) catch return;
+    defer a.allocator.free(dir_path);
+    var pattern_buffer: [80]u8 = undefined;
+    const dir_pattern = std.fmt.bufPrint(&pattern_buffer, "{s}\\*", .{dir_path}) catch return;
+    const wide = std.unicode.utf8ToUtf16LeAllocZ(a.allocator, dir_pattern) catch return;
+    defer a.allocator.free(wide);
+    var find: win.WIN32_FIND_DATAW = undefined;
+    const handle = win.FindFirstFileW(wide.ptr, &find);
+    if (handle == win.INVALID_HANDLE_VALUE or handle == null) return;
+    defer _ = win.FindClose(handle);
+    while (scanned.* < 4096) : (scanned.* += 1) {
+        const is_dir = (find.dwFileAttributes & win.FILE_ATTRIBUTE_DIRECTORY) != 0;
+        if (!is_dir and (find.dwFileAttributes & win.FILE_ATTRIBUTE_REPARSE_POINT) == 0) {
+            const ticks: i64 = (@as(i64, find.ftLastWriteTime.dwHighDateTime) << 32) | find.ftLastWriteTime.dwLowDateTime;
+            const written = @divTrunc(ticks - 116444736000000000, 10_000_000);
+            if (now - written > media_cache_days * 24 * 60 * 60) {
+                // FindFirstFileW returns bare names: join the cache directory
+                // or the delete would look in the process's current directory.
+                const file_len = std.mem.indexOfScalar(u16, &find.cFileName, 0) orelse find.cFileName.len;
+                const file_name = std.unicode.utf16LeToUtf8Alloc(a.allocator, find.cFileName[0..file_len]) catch continue;
+                defer a.allocator.free(file_name);
+                if (std.fs.path.join(a.allocator, &.{ dir_path, file_name })) |full| {
+                    defer a.allocator.free(full);
+                    deleteFileUtf8(full);
+                } else |_| {}
+            }
+        }
+        if (win.FindNextFileW(handle, &find) == 0) break;
+    }
+}
+
 fn saveTranscriptCache(a: *App, message: *const Message) void {
     const path_utf8 = std.unicode.utf16LeToUtf8Alloc(a.allocator, message.local_path.slice()) catch return;
     defer a.allocator.free(path_utf8);
@@ -4377,8 +4597,15 @@ fn refreshMessages(a: *App) void {
     if (chat_changed) stopAudio(a);
     // Instant first paint: render the chat's last known response from the
     // cache while the fresh read runs in the worker. Only the fresh result
-    // (final) runs mark-as-read.
-    if (msgCacheGet(a, chat.jid.slice())) |cached| applyMessageData(a, cached, false);
+    // (final) runs mark-as-read. The disk snapshot (WAZI-67) covers the
+    // first open of a chat after a relaunch, before the in-memory cache
+    // has been warmed.
+    if (msgCacheGet(a, chat.jid.slice())) |cached| {
+        applyMessageData(a, cached, false);
+    } else if (loadMsgCacheDisk(a, chat.jid.slice())) |cached| {
+        defer a.allocator.free(cached);
+        applyMessageData(a, cached, false);
+    }
     a.messages_gen += 1;
     var job = WacliJob{ .kind = .messages, .gen = a.messages_gen };
     job.jid.set(chat.jid.slice());
@@ -4501,6 +4728,24 @@ fn applyMessageData(a: *App, raw: []const u8, final: bool) void {
     if (final) markChatRead(a);
 }
 
+// Re-verify the linked account after the store was replaced, so the launch
+// cache is scoped to the account actually linked now. A failed probe keeps
+// the cache disabled for the rest of the session (fail-safe direction);
+// a restart recomputes it from scratch.
+fn enqueueCacheTagProbe(a: *App) void {
+    // Invalidate any probe already in flight before the pending check: an
+    // account change while one is queued must never let the old answer
+    // install its tag, and a fresh probe must follow the pending one.
+    a.cache_tag_gen += 1;
+    if (wacliPendingGet(a, .cache_tag) > 0) {
+        a.cache_tag_probe_again = true;
+        return;
+    }
+    var job = WacliJob{ .kind = .cache_tag, .gen = a.cache_tag_gen };
+    wacliJobArgs(&job, &.{ a.wacli_path, "--json", "--read-only", "auth", "status" });
+    wacliEnqueue(a, job, false);
+}
+
 fn startSync(a: *App) void {
     // Hold off while any write job is pending: they pause live sync and
     // serialize on the store lock, so don't fight them. checkSync restarts
@@ -4509,6 +4754,11 @@ fn startSync(a: *App) void {
         // Pairing (re)creates the store; sync resumes automatically then.
         if (!whatsappStorePresent(a)) return;
         a.accounts_maintenance = false;
+        // The store was replaced, so the linked account may differ now.
+        // Drop the cache tag - which disables launch-cache reads and writes
+        // - until a fresh auth status verifies the new account (WAZI-67).
+        a.cache_tag.set("");
+        enqueueCacheTagProbe(a);
     }
     if (a.sync_child != null or a.read_child != null or a.pending_read_count > 0 or
         mediaBusy(a) or a.send_child != null or a.pending_send_count > 0 or
@@ -6342,6 +6592,17 @@ fn removeWhatsAppAccount(a: *App) void {
     }
     // Keep auto-reconnect off: the store is gone until pairing runs again.
     a.accounts_maintenance = true;
+    deleteAccountCaches(a);
+    // The in-memory message ring is keyed only by chat jid, which a shared
+    // group can survive an account switch: free it too, or pairing another
+    // account could paint the previous account's messages.
+    for (a.msg_cache[0..a.msg_cache_len]) |*entry| {
+        if (entry.data) |data| a.allocator.free(data);
+        entry.data = null;
+    }
+    a.msg_cache_len = 0;
+    a.cache_tag.set("");
+    a.cache_tag_gen += 1;
     a.chat_count = 0;
     a.selected_chat = 0;
     a.selected_message = null;
@@ -7996,7 +8257,9 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
                     } else if (result.gen == a.chats_gen) {
                         // A queued job with older archive/unread flags must
                         // not repaint over a newer one.
-                        applyChats(a, result.data);
+                        // Persist the validated read so the next launch
+                        // (an update included) opens with this list (WAZI-67).
+                        if (applyChats(a, result.data)) saveChatsCache(a, result.data);
                     }
                 },
                 .messages => {
@@ -8011,6 +8274,31 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
                     }
                 },
                 .reaction => applyReaction(a, result),
+                .cache_tag => {
+                    if (result.ok and result.gen == a.cache_tag_gen) {
+                        var parsed = std.json.parseFromSlice(std.json.Value, a.allocator, result.data, .{}) catch return 0;
+                        defer parsed.deinit();
+                        const root = switch (parsed.value) {
+                            .object => |object| object,
+                            else => return 0,
+                        };
+                        const linked = switch (root.get("linked_jid") orelse return 0) {
+                            .string => |value| value,
+                            else => return 0,
+                        };
+                        if (linked.len > 0) {
+                            var tag_buffer: [32]u8 = undefined;
+                            const tag = std.fmt.bufPrint(&tag_buffer, "{x:0>16}", .{std.hash.Wyhash.hash(0, linked)}) catch return 0;
+                            a.cache_tag.set(tag);
+                        }
+                    }
+                    // An account changed while this probe was queued: run the
+                    // deferred one now that the pending slot is free.
+                    if (a.cache_tag_probe_again) {
+                        a.cache_tag_probe_again = false;
+                        enqueueCacheTagProbe(a);
+                    }
+                },
                 .slack_workspace => if (result.ok) {
                     applySlackWorkspace(a, result.data);
                     refreshChats(a);
@@ -8143,6 +8431,10 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
                 if (a.wacli_slack_thread == null) setStatus(a, "Slack worker failed to start; sends run inline");
             }
             refreshGroups(a);
+            // WAZI-67: paint the previous chat list before the first wacli
+            // read lands, then prune message snapshots older than 14 days.
+            loadChatsCache(a);
+            pruneStaleMsgCache(a);
             refreshChats(a);
             refreshMessages(a);
             _ = storeChanged(a);
@@ -8829,6 +9121,61 @@ fn mediaWasFetched(a: *const App, chat_jid: []const u8, message_id: []const u8) 
     return a.media_fetched.wasPlayedRaw(played.Set.pairKey(chat_jid, message_id));
 }
 
+/// Identity of the linked WhatsApp account, hashed for cache filenames
+/// (WAZI-67). One read-only `auth status` spawn; when WhatsApp is not paired
+/// or the read fails the tag is "none" and caches still work under that tag.
+const cache_tag_timeout_ms: win.DWORD = 5000;
+
+/// Identity of the linked WhatsApp account, hashed for cache filenames
+/// (WAZI-67). One read-only `auth status` spawn, hard-bounded to 5 seconds
+/// because it runs before the window exists and a hung child must never
+/// block startup. When WhatsApp is not paired or the read fails the result
+/// is null and the launch cache stays disabled: a snapshot written for an
+/// unknown account must never be shown under the identity of a later
+/// unknown-or-different account.
+fn findCacheTag(init: std.process.Init, wacli_path: []u8, scratch_dir: []const u8) !?[]u8 {
+    const out_path = try std.fs.path.join(init.gpa, &.{ scratch_dir, "auth-status.tmp" });
+    defer init.gpa.free(out_path);
+    const cwd = std.Io.Dir.cwd();
+    var out_file = cwd.createFile(init.io, out_path, .{}) catch return null;
+    const child = std.process.spawn(init.io, .{
+        .argv = &.{ wacli_path, "--json", "--read-only", "auth", "status" },
+        .stdin = .ignore,
+        .stdout = .{ .file = out_file },
+        .stderr = .ignore,
+        .create_no_window = true,
+    }) catch {
+        out_file.close(init.io);
+        return null;
+    };
+    // The child inherited the handle; drop the parent's copy before reading
+    // so the file pointer each side sees cannot interfere.
+    out_file.close(init.io);
+    const handle = child.id orelse return null;
+    defer _ = win.CloseHandle(handle);
+    if (win.WaitForSingleObject(handle, cache_tag_timeout_ms) != win.WAIT_OBJECT_0) {
+        _ = win.TerminateProcess(handle, 1);
+        return null;
+    }
+    var code: win.DWORD = 0;
+    if (win.GetExitCodeProcess(handle, &code) == 0 or code != 0) return null;
+    const data = readFileWin(init.gpa, out_path, 64 * 1024) orelse return null;
+    defer init.gpa.free(data);
+    deleteFileUtf8(out_path);
+    var parsed = std.json.parseFromSlice(std.json.Value, init.gpa, data, .{}) catch return null;
+    defer parsed.deinit();
+    const linked = switch (parsed.value) {
+        .object => |object| object.get("linked_jid") orelse return null,
+        else => return null,
+    };
+    const jid = switch (linked) {
+        .string => |value| value,
+        else => return null,
+    };
+    if (jid.len == 0) return null;
+    return try std.fmt.allocPrint(init.gpa, "{x:0>16}", .{std.hash.Wyhash.hash(0, jid)});
+}
+
 fn findWacli(init: std.process.Init, allocator: std.mem.Allocator) ![]u8 {
     const local = init.environ_map.get("LOCALAPPDATA") orelse return error.MissingLocalAppData;
     return std.fs.path.join(allocator, &.{ local, "Programs", "wacli", "wacli.exe" });
@@ -8911,6 +9258,8 @@ pub fn main(init: std.process.Init) !void {
     defer init.gpa.free(wacli_path);
     const avatar_dir = try createAvatarDirectory(init, init.gpa);
     defer init.gpa.free(avatar_dir);
+    const cache_tag = try findCacheTag(init, wacli_path, std.fs.path.dirname(avatar_dir) orelse return error.MissingMessagesDir);
+    defer if (cache_tag) |tag| init.gpa.free(tag);
     const slack_media_dir = try createSlackMediaDirectory(init, init.gpa);
     defer init.gpa.free(slack_media_dir);
     const store_watch_path = try createStoreWatchPath(init, init.gpa);
@@ -8934,6 +9283,7 @@ pub fn main(init: std.process.Init) !void {
     if (openrouter_model.len == 0) openrouter_model = "openai/gpt-5.6-luna";
     var app = App{ .allocator = init.gpa, .io = init.io, .instance = instance, .wacli_path = wacli_path, .avatar_dir = avatar_dir, .slack_media_dir = slack_media_dir, .deepgram_configured = deepgram_key.len > 0, .deepgram_key = deepgram_key, .openrouter_key = openrouter_key, .openrouter_model = openrouter_model, .openrouter_configured = openrouter_key.len > 0, .dictation_language = loadDictationLanguage(), .font_scale = loadFontScale() };
     app.wacli_dir.set(wacli_dir);
+    if (cache_tag) |tag| app.cache_tag.set(tag);
     loadEmojiRecents(&app);
     if (init.environ_map.get("LOCALAPPDATA")) |local| {
         if (std.fs.path.join(init.gpa, &.{ local, "Messages", "telegram" })) |telegram_dir| {
