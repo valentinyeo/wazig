@@ -46,13 +46,24 @@ jobs:
                        or ([ $roll[] | select(.name == $r and .conclusion != "SUCCESS") ] | length) > 0
                      then $r else empty end ] )
               | join(",")')
-            reason=$(echo "$info" | jq -r --argjson gate '[".github/workflows/automerge.yml", ".github/workflows/ci.yml", ".github/workflows/release.yml", ".github/workflows/auto-release.yml"]' '
+            # gh pr view truncates the file list at 100, which could hide a
+            # gating workflow edit behind a big diff; list every file instead.
+            gating='[".github/workflows/automerge.yml", ".github/workflows/ci.yml", ".github/workflows/release.yml", ".github/workflows/auto-release.yml"]'
+            files_json=$(gh api "repos/$REPO/pulls/$pr/files?per_page=100" --paginate --slurp --jq 'add | map(.filename)' 2>/dev/null) || files_json=""
+            reason=$(echo "$info" | jq -r '
               if .isDraft then "draft"
               elif ([.labels[].name] | index("hold")) then "hold label"
-              elif ([.files[].path] | map(select(. == $gate[])) | length) > 0 then "edits a release-gating workflow, needs manual review"
               elif .mergeable != "MERGEABLE" then "not mergeable (\(.mergeable))"
-              else "" end')
-            if [ "${reason}" = "null" ] || [ -z "${reason}" ] && [ "$(echo "$info" | jq -r '.isDraft, .mergeable' | head -c 0)x" = "x" ]; then :; fi
+              else "" end') || reason="could not evaluate PR state"
+            if [ "${reason}" = "null" ]; then reason="could not evaluate PR state"; fi
+            if [ -z "${reason}" ]; then
+              gated=$(echo "${files_json}" | jq -r --argjson gate "$gating" '[.[] | select(. == $gate[])] | length' 2>/dev/null) || gated=""
+              if ! [ "${gated:-0}" -ge 0 ] 2>/dev/null || [ -z "${files_json}" ]; then
+                reason="could not list PR files"
+              elif [ "${gated}" -ge 1 ]; then
+                reason="edits a release-gating workflow, needs manual review"
+              fi
+            fi
             if [ -n "$blocked" ]; then reason="required checks not green: ${blocked}"; fi
             if [ -n "$reason" ]; then echo "#$pr: skip ($reason)"; continue; fi
             # --match-head-commit closes the race: if the PR head changes

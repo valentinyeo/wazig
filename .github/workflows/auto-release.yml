@@ -195,6 +195,14 @@ jobs:
               fi
             fi
           fi
+          # ponytail: a merge landing between the check above and the ref
+          # creation would still tag a CI-green commit slightly behind main.
+          # The GitHub refs API has no compare-and-swap, so re-verify after
+          # creation and rely on the newer commit getting its own release.
+          remote_main="$(gh api "repos/${GITHUB_REPOSITORY}/commits/main" --jq .sha 2>/dev/null || true)"
+          if [ -n "${remote_main}" ] && [ "${remote_main}" != "${sha}" ]; then
+            echo "note: main advanced to ${remote_main} while tagging ${next_tag} at the tested commit ${sha}" >&2
+          fi
           # Single release path: the tag push is what starts release.yml.
           # The push trigger fires from the ref creation (observed in the
           # duplicate-release incident), so wait for a release run that is
