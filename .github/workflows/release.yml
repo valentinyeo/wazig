@@ -4,12 +4,18 @@ name: release
 on:
   push:
     tags: ["v*"]
+  # Tag pushes made by the actions bot never trigger workflows, so
+  # auto-release.yml dispatches us at the tag ref instead.
+  workflow_dispatch:
 permissions:
   contents: read
 jobs:
   build:
     name: build
     runs-on: ubuntu-latest
+    # Dispatches are allowed only so auto-release can start us on a tag ref;
+    # a dispatch on a branch must never publish untagged code.
+    if: github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
     timeout-minutes: 120
     env:
       TDLIB_COMMIT: d1085f9cebc5a62379991ae1652673954f229c1f
