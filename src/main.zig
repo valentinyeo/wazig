@@ -426,8 +426,9 @@ const App = struct {
     send: ?win.HWND = null,
     emoji_btn: ?win.HWND = null,
     dictate: ?win.HWND = null,
-    btn_hover: [3]bool = .{ false, false, false },
-    btn_prev_proc: [3]usize = .{ 0, 0, 0 },
+    // 0-2: composer buttons, 3-4: Slack setup dialog buttons.
+    btn_hover: [5]bool = .{ false, false, false, false, false },
+    btn_prev_proc: [5]usize = .{ 0, 0, 0, 0, 0 },
     tooltips: ?win.HWND = null,
     status: ?win.HWND = null,
     palette: ?win.HWND = null,
@@ -672,6 +673,32 @@ fn subclassComposerButton(a: *App, hwnd: ?win.HWND, index: usize) void {
     a.btn_prev_proc[index] = @bitCast(prev);
 }
 
+fn paintRoundedButton(hdc: win.HDC, rect: win.RECT, face: win.COLORREF, text_color: win.COLORREF, font: win.HFONT, frame: ?win.COLORREF, text: []const u16) void {
+    const radius: i32 = 10;
+    const rgn = win.CreateRoundRectRgn(rect.left, rect.top, rect.right + 1, rect.bottom + 1, radius, radius) orelse return;
+    defer _ = win.DeleteObject(rgn);
+    const brush = win.CreateSolidBrush(face) orelse return;
+    defer _ = win.DeleteObject(brush);
+    _ = win.FillRgn(hdc, rgn, brush);
+    if (frame) |frame_color| {
+        const frame_brush = win.CreateSolidBrush(frame_color) orelse return;
+        defer _ = win.DeleteObject(frame_brush);
+        _ = win.FrameRgn(hdc, rgn, frame_brush, 1, 1);
+    }
+    if (text.len > 0) {
+        _ = win.SetBkMode(hdc, win.TRANSPARENT);
+        _ = win.SetTextColor(hdc, text_color);
+        _ = win.SelectObject(hdc, @ptrCast(font));
+        var label_rect = rect;
+        _ = win.DrawTextW(hdc, text.ptr, @intCast(text.len), &label_rect, win.DT_CENTER | win.DT_SINGLELINE | win.DT_VCENTER);
+    }
+}
+
+fn buttonLabel(item: *win.DRAWITEMSTRUCT, buffer: []u16) []const u16 {
+    const text_len = win.GetWindowTextW(item.hwndItem, buffer.ptr, @intCast(buffer.len));
+    return buffer[0..@intCast(text_len)];
+}
+
 fn drawComposerButton(a: *App, item: *win.DRAWITEMSTRUCT) void {
     const index: usize = if (item.CtlID == id_dictate) 0 else if (item.CtlID == id_send) 1 else 2;
     const pressed = (item.itemState & win.ODS_SELECTED) != 0;
@@ -681,26 +708,28 @@ fn drawComposerButton(a: *App, item: *win.DRAWITEMSTRUCT) void {
     // the rounded corners don't leave square artifacts.
     _ = win.FillRect(item.hDC, &item.rcItem, a.brush_bg.?);
     const face: win.COLORREF = if (pressed or (index == 0 and dictating)) color_outgoing else if (a.btn_hover[index]) color_selected else color_raised;
-    const radius: i32 = 10;
-    const rgn = win.CreateRoundRectRgn(item.rcItem.left, item.rcItem.top, item.rcItem.right + 1, item.rcItem.bottom + 1, radius, radius) orelse return;
-    defer _ = win.DeleteObject(rgn);
-    const brush = win.CreateSolidBrush(face) orelse return;
-    defer _ = win.DeleteObject(brush);
-    _ = win.FillRgn(item.hDC, rgn, brush);
-    if (focused) {
-        const accent = win.CreateSolidBrush(color_accent) orelse return;
-        defer _ = win.DeleteObject(accent);
-        _ = win.FrameRgn(item.hDC, rgn, accent, 1, 1);
-    }
     var text_buffer: [32]u16 = undefined;
-    const text_len = win.GetWindowTextW(item.hwndItem, &text_buffer, text_buffer.len);
-    if (text_len > 0) {
-        _ = win.SetBkMode(item.hDC, win.TRANSPARENT);
-        _ = win.SetTextColor(item.hDC, if (index == 0 and dictating and !pressed) color_accent else color_text);
-        _ = win.SelectObject(item.hDC, @ptrCast(if (index == 2) a.font_emoji.? else a.font_bold.?));
-        var label_rect = item.rcItem;
-        _ = win.DrawTextW(item.hDC, &text_buffer, text_len, &label_rect, win.DT_CENTER | win.DT_SINGLELINE | win.DT_VCENTER);
-    }
+    paintRoundedButton(
+        item.hDC,
+        item.rcItem,
+        face,
+        if (index == 0 and dictating and !pressed) color_accent else color_text,
+        if (index == 2) a.font_emoji.? else a.font_bold.?,
+        if (focused) color_accent else null,
+        buttonLabel(item, &text_buffer),
+    );
+}
+
+fn drawSetupButton(a: *App, item: *win.DRAWITEMSTRUCT) void {
+    const index: usize = if (item.CtlID == id_slack_save) 3 else 4;
+    const pressed = (item.itemState & win.ODS_SELECTED) != 0;
+    const focused = (item.itemState & win.ODS_FOCUS) != 0;
+    _ = win.FillRect(item.hDC, &item.rcItem, a.brush_panel.?);
+    const face: win.COLORREF = if (pressed) color_outgoing else if (a.btn_hover[index]) color_selected else color_raised;
+    // Save is the default action; keep its accent outline even without focus.
+    const frame: ?win.COLORREF = if (index == 3 or focused) color_accent else null;
+    var text_buffer: [32]u16 = undefined;
+    paintRoundedButton(item.hDC, item.rcItem, face, color_text, a.font_bold.?, frame, buttonLabel(item, &text_buffer));
 }
 
 fn setFont(hwnd: ?win.HWND, font: ?win.HFONT) void {
@@ -2391,6 +2420,18 @@ fn pickImageFile(a: *App) ?WideText(519) {
     return result;
 }
 
+fn layoutSetupButtons(hwnd: win.HWND) void {
+    var client: win.RECT = undefined;
+    _ = win.GetClientRect(hwnd, &client);
+    const btn_w: i32 = 90;
+    const btn_h: i32 = 30;
+    const gap: i32 = 8;
+    const margin: i32 = 16;
+    const bottom = client.bottom - margin - btn_h;
+    if (win.GetDlgItem(hwnd, id_slack_cancel)) |c| _ = win.MoveWindow(c, client.right - margin - btn_w, bottom, btn_w, btn_h, win.TRUE);
+    if (win.GetDlgItem(hwnd, id_slack_save)) |s| _ = win.MoveWindow(s, client.right - margin - 2 * btn_w - gap, bottom, btn_w, btn_h, win.TRUE);
+}
+
 fn slackSetupProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.LPARAM) callconv(.winapi) isize {
     const a = app_ptr orelse return win.DefWindowProcW(hwnd, message, @bitCast(wparam), @bitCast(lparam));
     switch (message) {
@@ -2399,9 +2440,36 @@ fn slackSetupProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam:
             _ = win.CreateWindowExW(0, lit("EDIT"), null, win.WS_CHILD | win.WS_VISIBLE | win.WS_BORDER | win.ES_AUTOHSCROLL | win.ES_PASSWORD, 16, 38, 360, 26, hwnd, controlId(id_slack_user_edit), a.instance, null);
             _ = win.CreateWindowExW(0, lit("STATIC"), lit("App token (xapp-) for Socket Mode"), win.WS_CHILD | win.WS_VISIBLE, 16, 74, 360, 20, hwnd, null, a.instance, null);
             _ = win.CreateWindowExW(0, lit("EDIT"), null, win.WS_CHILD | win.WS_VISIBLE | win.WS_BORDER | win.ES_AUTOHSCROLL | win.ES_PASSWORD, 16, 96, 360, 26, hwnd, controlId(id_slack_app_edit), a.instance, null);
-            _ = win.CreateWindowExW(0, lit("BUTTON"), lit("Save"), win.WS_CHILD | win.WS_VISIBLE | win.BS_DEFPUSHBUTTON, 16, 136, 90, 30, hwnd, controlId(id_slack_save), a.instance, null);
-            _ = win.CreateWindowExW(0, lit("BUTTON"), lit("Cancel"), win.WS_CHILD | win.WS_VISIBLE | win.BS_PUSHBUTTON, 116, 136, 90, 30, hwnd, controlId(id_slack_cancel), a.instance, null);
+            const save = win.CreateWindowExW(0, lit("BUTTON"), lit("Save"), win.WS_CHILD | win.WS_VISIBLE | win.WS_TABSTOP | win.BS_OWNERDRAW | win.BS_DEFPUSHBUTTON, 0, 0, 90, 30, hwnd, controlId(id_slack_save), a.instance, null);
+            const cancel = win.CreateWindowExW(0, lit("BUTTON"), lit("Cancel"), win.WS_CHILD | win.WS_VISIBLE | win.WS_TABSTOP | win.BS_OWNERDRAW, 0, 0, 90, 30, hwnd, controlId(id_slack_cancel), a.instance, null);
+            setFont(save, a.font_bold);
+            setFont(cancel, a.font_bold);
+            subclassComposerButton(a, save, 3);
+            subclassComposerButton(a, cancel, 4);
+            layoutSetupButtons(hwnd);
             return 0;
+        },
+        win.WM_SIZE => {
+            layoutSetupButtons(hwnd);
+            return 0;
+        },
+        win.WM_ERASEBKGND => {
+            var client: win.RECT = undefined;
+            _ = win.GetClientRect(hwnd, &client);
+            _ = win.FillRect(winHandle(win.HDC, @as(usize, @bitCast(wparam))), &client, a.brush_panel.?);
+            return 1;
+        },
+        win.WM_DRAWITEM => {
+            const item: *win.DRAWITEMSTRUCT = winHandle(*win.DRAWITEMSTRUCT, @as(usize, @bitCast(lparam)));
+            if (item.CtlID == id_slack_save or item.CtlID == id_slack_cancel) drawSetupButton(a, item);
+            return 1;
+        },
+        win.WM_CTLCOLORSTATIC, win.WM_CTLCOLOREDIT => {
+            const hdc: win.HDC = winHandle(win.HDC, wparam);
+            _ = win.SetTextColor(hdc, color_text);
+            _ = win.SetBkColor(hdc, color_panel);
+            if (a.brush_panel) |brush| return @bitCast(@intFromPtr(brush));
+            return @bitCast(@intFromPtr(win.GetStockObject(win.BLACK_BRUSH)));
         },
         win.WM_COMMAND => {
             const id = loword(wparam);
@@ -2481,6 +2549,12 @@ fn openSlackSetup(a: *App) void {
             break;
         }
         if (got < 0) break;
+        // Dialog navigation (Tab between fields, Enter presses the default
+        // Save button) works only when the pump routes through IsDialogMessage.
+        if (win.IsDialogMessageW(wnd, &msg) != 0) {
+            if (a.slack_setup_window == null) break;
+            continue;
+        }
         _ = win.TranslateMessage(&msg);
         _ = win.DispatchMessageW(&msg);
         if (a.slack_setup_window == null) break;
