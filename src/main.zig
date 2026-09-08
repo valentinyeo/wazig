@@ -2961,9 +2961,17 @@ fn persistPendingReads(a: *App) void {
 /// draining via startNextMarkRead.
 fn loadPendingReads(a: *App) void {
     if (a.read_path.len == 0) return;
-    const wide = std.unicode.utf8ToUtf16LeAllocZ(a.allocator, a.read_path) catch return;
-    defer a.allocator.free(wide);
-    const handle = win.CreateFileW(wide.ptr, win.GENERIC_READ, win.FILE_SHARE_READ, null, win.OPEN_EXISTING, win.FILE_ATTRIBUTE_NORMAL, null);
+    // If the previous shutdown's swap failed, the complete queue is still in
+    // the temp file: promote it before reading. A missing temp fails here
+    // harmlessly.
+    const temp_path = std.fmt.allocPrint(a.allocator, "{s}.new", .{a.read_path}) catch return;
+    defer a.allocator.free(temp_path);
+    const temp_wide = std.unicode.utf8ToUtf16LeAllocZ(a.allocator, temp_path) catch return;
+    defer a.allocator.free(temp_wide);
+    const target_wide = std.unicode.utf8ToUtf16LeAllocZ(a.allocator, a.read_path) catch return;
+    defer a.allocator.free(target_wide);
+    _ = win.MoveFileExW(temp_wide.ptr, target_wide.ptr, win.MOVEFILE_REPLACE_EXISTING | win.MOVEFILE_WRITE_THROUGH);
+    const handle = win.CreateFileW(target_wide.ptr, win.GENERIC_READ, win.FILE_SHARE_READ, null, win.OPEN_EXISTING, win.FILE_ATTRIBUTE_NORMAL, null);
     if (handle == win.INVALID_HANDLE_VALUE or handle == null) return;
     defer _ = win.CloseHandle(handle);
     var buffer: [4 * 1024]u8 = undefined;

@@ -20,6 +20,7 @@ pub fn parse(contents: []const u8, out: *[max_pending_reads][max_jid_len + 1]u8)
     var lines = std.mem.tokenizeAny(u8, contents, "\r\n");
     while (lines.next()) |line| {
         if (line.len == 0 or line.len > max_jid_len) continue;
+        if (std.mem.indexOfScalar(u8, line, 0) != null) continue;
         if (std.mem.indexOfScalar(u8, line, '@') == null) continue;
         var seen = false;
         for (out[0..count]) |entry| {
