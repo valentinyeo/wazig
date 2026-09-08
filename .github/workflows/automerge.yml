@@ -18,6 +18,7 @@ permissions:
   contents: write
   pull-requests: write
   checks: read
+  actions: write
 jobs:
   automerge:
     runs-on: ubuntu-latest
@@ -48,6 +49,7 @@ jobs:
               # A swallowed dispatch failure would leave main untested, so
               # retry once and let a second failure fail the job loudly.
               gh workflow run ci.yml --ref main -R "$REPO" \
-                || gh workflow run ci.yml --ref main -R "$REPO"
+                || { sleep 5; gh workflow run ci.yml --ref main -R "$REPO"; } \
+                || { echo "failed to dispatch ci on main; main left untested" >&2; exit 1; }
             else echo "#$pr: merge failed"; fi
           done
