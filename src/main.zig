@@ -591,6 +591,12 @@ const App = struct {
     played_path: []u8 = &.{},
     media_fetched: played.Set = .{},
     media_fetched_path: []u8 = &.{},
+    // Mirrors the pending mark-read queue so reads that never reached the
+    // store survive a restart (WAZI-74).
+    read_path: []u8 = &.{},
+    // Set after repeated wacli spawn failures: stop retrying reads this
+    // session, but keep the queue file so they retry next launch.
+    read_queue_dead: bool = false,
     // The wacli worker thread shares allocator and io with the UI thread:
     // safe because start.zig provides c_allocator and std.Io.Threaded, both
     // thread-safe. wacli_pending is only touched under wacli_mutex.
@@ -2848,6 +2854,7 @@ fn markChatRead(a: *App) void {
         return;
     }
     if (!chat.unread and chat.unread_count == 0) return;
+    if (a.read_queue_dead) return;
     // Clear the badge once the request is queued or already in flight; if
     // the queue is full, keep the unread state so the next view retries.
     var already_queued = false;
@@ -2860,6 +2867,7 @@ fn markChatRead(a: *App) void {
             a.pending_reads[a.pending_read_count].set(chat.jid.slice());
             a.read_retries[a.pending_read_count] = 0;
             a.pending_read_count += 1;
+            persistPendingReads(a);
         }
         chat.unread = false;
         chat.unread_count = 0;
@@ -2878,6 +2886,7 @@ fn removeFirstPendingRead(a: *App) void {
     a.pending_read_count -= 1;
     a.pending_reads[a.pending_read_count] = .{};
     a.read_retries[a.pending_read_count] = 0;
+    persistPendingReads(a);
 }
 
 // A failed write goes back in the queue (up to 3 attempts) instead of being
@@ -2897,7 +2906,70 @@ fn requeueFailedRead(a: *App) bool {
     a.pending_reads[a.pending_read_count] = jid;
     a.read_retries[a.pending_read_count] = retries;
     a.pending_read_count += 1;
+    persistPendingReads(a);
     return true;
+}
+
+// The pending mark-read queue mirrors to disk on every change: a read that
+// is still queued or in flight when the app closes must retry next launch,
+// because the store's unread state only clears once the write lands.
+fn persistPendingReads(a: *App) void {
+    if (a.read_path.len == 0) return;
+    const wide = std.unicode.utf8ToUtf16LeAllocZ(a.allocator, a.read_path) catch return;
+    defer a.allocator.free(wide);
+    const handle = win.CreateFileW(wide.ptr, win.GENERIC_WRITE, win.FILE_SHARE_READ, null, win.CREATE_ALWAYS, win.FILE_ATTRIBUTE_NORMAL, null);
+    if (handle == win.INVALID_HANDLE_VALUE or handle == null) return;
+    defer _ = win.CloseHandle(handle);
+    var buffer: [max_pending_reads * 192]u8 = undefined;
+    var total: usize = 0;
+    for (a.pending_reads[0..a.pending_read_count]) |entry| {
+        const jid = entry.slice();
+        if (jid.len == 0) continue;
+        @memcpy(buffer[total..][0..jid.len], jid);
+        total += jid.len;
+        buffer[total] = '\n';
+        total += 1;
+    }
+    var written: win.DWORD = 0;
+    _ = win.WriteFile(handle, &buffer, @intCast(total), &written, null);
+}
+
+/// Fills `out` from the one-jid-per-line queue file, dropping duplicates and
+/// entries that do not fit. Runs at startup, before the frame loop starts
+/// draining via startNextMarkRead.
+pub fn parsePendingReads(contents: []const u8, out: *[max_pending_reads]Utf8Text(191)) usize {
+    var count: usize = 0;
+    var lines = std.mem.tokenizeAny(u8, contents, "\r\n");
+    while (lines.next()) |line| {
+        if (line.len == 0 or line.len > 191) continue;
+        var seen = false;
+        for (out[0..count]) |entry| {
+            if (std.mem.eql(u8, entry.slice(), line)) seen = true;
+        }
+        if (seen) continue;
+        out[count].set(line);
+        count += 1;
+        if (count == max_pending_reads) break;
+    }
+    return count;
+}
+
+fn loadPendingReads(a: *App) void {
+    if (a.read_path.len == 0) return;
+    const wide = std.unicode.utf8ToUtf16LeAllocZ(a.allocator, a.read_path) catch return;
+    defer a.allocator.free(wide);
+    const handle = win.CreateFileW(wide.ptr, win.GENERIC_READ, win.FILE_SHARE_READ, null, win.OPEN_EXISTING, win.FILE_ATTRIBUTE_NORMAL, null);
+    if (handle == win.INVALID_HANDLE_VALUE or handle == null) return;
+    defer _ = win.CloseHandle(handle);
+    var buffer: [4 * 1024]u8 = undefined;
+    var total: usize = 0;
+    while (total < buffer.len) {
+        var got: win.DWORD = 0;
+        if (win.ReadFile(handle, buffer[total..].ptr, @intCast(buffer.len - total), &got, null) == 0) break;
+        if (got == 0) break;
+        total += got;
+    }
+    a.pending_read_count = parsePendingReads(buffer[0..total], &a.pending_reads);
 }
 
 // The mark-read write used to run on the UI thread with the sync child
@@ -2907,26 +2979,31 @@ fn startNextMarkRead(a: *App) void {
     if (a.read_child != null or a.pending_read_count == 0) return;
     // Media downloads hold the store lock for up to 60s while a mark-read
     // write waits only 10s, so a read started next to them loses the lock
-    // and its write is dropped. Wait for a free slot instead; the unread
-    // badge is already cleared locally and refreshChats keeps it cleared
-    // while the read is pending.
+    // and its write is dropped. Jobs are serialized by the gates above, but
+    // a download that races us to the lock can still hold it: wait up to
+    // 70s, longer than the longest known hold, instead of losing the write.
+    // Anything still queued when the app closes persists to disk and
+    // retries next launch (WAZI-74).
     if (a.send_child != null or a.pending_send_count > 0 or
         a.archive_child != null or a.pending_archive_count > 0 or
         avatarBusy(a) or mediaBusy(a)) return;
     stopSync(a);
     const child = std.process.spawn(a.io, .{
-        .argv = &.{ a.wacli_path, "--json", "--lock-wait", "10s", "chats", "mark-read", "--chat", a.pending_reads[0].slice() },
+        .argv = &.{ a.wacli_path, "--json", "--lock-wait", "70s", "chats", "mark-read", "--chat", a.pending_reads[0].slice() },
         .stdin = .ignore,
         .stdout = .ignore,
         .stderr = .ignore,
         .create_no_window = true,
     }) catch {
-        // Give up after repeated spawn failures: drop the queue, restore
-        // the real unread badges via refreshChats, and let live sync run so
-        // a broken wacli cannot keep the app's sync permanently stopped.
+        // Give up after repeated spawn failures: clear the in-memory queue,
+        // restore the real unread badges via refreshChats, and let live sync
+        // run so a broken wacli cannot keep the app's sync permanently
+        // stopped. The queue file is untouched, so the reads retry next
+        // launch instead of being lost.
         a.read_spawn_failures += 1;
         if (a.read_spawn_failures >= 3) {
             a.pending_read_count = 0;
+            a.read_queue_dead = true;
             a.read_spawn_failures = 0;
             startSync(a);
             refreshChats(a);
@@ -2940,8 +3017,8 @@ fn startNextMarkRead(a: *App) void {
 }
 
 // The mark-read child gates every other background job, so a hung wacli must
-// not wedge the app: the lock wait is capped at 10s, so 30s means it is stuck.
-const read_timeout_ms: u64 = 30_000;
+// not wedge the app: the lock wait is capped at 70s, so 90s means it is stuck.
+const read_timeout_ms: u64 = 90_000;
 
 fn checkMarkRead(a: *App) void {
     if (a.read_child) |*child| {
@@ -3850,7 +3927,7 @@ fn readFileWin(allocator: std.mem.Allocator, path_utf8: []const u8, max_bytes: u
     var total: usize = 0;
     while (total < buffer.len) {
         var got: win.DWORD = 0;
-        if (win.ReadFile(handle, buffer.ptr + total, @intCast(buffer.len - total), &got, null) == 0) break;
+        if (win.ReadFile(handle, buffer[total..].ptr, @intCast(buffer.len - total), &got, null) == 0) break;
         if (got == 0) break;
         total += got;
     }
@@ -8700,6 +8777,10 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
             a.archive_child = null;
             if (a.read_child) |*child| child.kill(a.io);
             a.read_child = null;
+            // Flush reads that never reached the store: the write may have
+            // been queued, in flight, or killed mid-run, and mark-read is
+            // idempotent so retrying next launch is always safe (WAZI-74).
+            persistPendingReads(a);
             // ponytail: the Socket Mode thread stops at its next frame or at
             // process exit, whichever comes first; upgrade path is a stored
             // socket handle closed here to unblock the receive immediately.
@@ -9080,7 +9161,7 @@ fn loadHashSet(a: *App, path: []const u8, set: *played.Set) void {
     var total: usize = 0;
     while (total < buffer.len) {
         var got: win.DWORD = 0;
-        if (win.ReadFile(handle, buffer.ptr + total, @intCast(buffer.len - total), &got, null) == 0) break;
+        if (win.ReadFile(handle, buffer[total..].ptr, @intCast(buffer.len - total), &got, null) == 0) break;
         if (got == 0) break;
         total += got;
     }
@@ -9315,6 +9396,8 @@ pub fn main(init: std.process.Init) !void {
     loadPlayed(&app);
     app.media_fetched_path = findMediaFetchedPath(init, init.gpa);
     loadHashSet(&app, app.media_fetched_path, &app.media_fetched);
+    app.read_path = hashStorePath(init, init.gpa, "pending-reads.txt");
+    loadPendingReads(&app);
     app.store_watch_path.set(init.gpa, store_watch_path);
     app_ptr = &app;
     defer app_ptr = null;
@@ -10183,4 +10266,22 @@ test "sender name shows only at the start of a same-sender run" {
     a.messages[1].from_me = false;
     a.messages[1].sender_jid.set("111@g.us");
     try std.testing.expect(!showSenderName(&a, 2));
+}
+
+test "parsePendingReads dedupes, caps, and skips junk lines" {
+    var out: [max_pending_reads]Utf8Text(191) = [_]Utf8Text(191){.{}} ** max_pending_reads;
+    const count = parsePendingReads("123@s.whatsapp.net\n\nbad-but-not-a-jid\n123@s.whatsapp.net\n456@g.us\n", &out);
+    try std.testing.expectEqual(@as(usize, 2), count);
+    try std.testing.expectEqualStrings("123@s.whatsapp.net", out[0].slice());
+    try std.testing.expectEqualStrings("456@g.us", out[1].slice());
+    // Entries past the queue capacity are dropped, not overflowed.
+    var overflow: [max_pending_reads]Utf8Text(191) = [_]Utf8Text(191){.{}} ** max_pending_reads;
+    var contents: std.ArrayList(u8) = .empty;
+    defer contents.deinit(std.testing.allocator);
+    var index: usize = 0;
+    while (index < max_pending_reads + 3) : (index += 1) {
+        try contents.print(std.testing.allocator, "{d}@s.whatsapp.net\n", .{index});
+    }
+    const capped = parsePendingReads(contents.items, &overflow);
+    try std.testing.expectEqual(@as(usize, max_pending_reads), capped);
 }
