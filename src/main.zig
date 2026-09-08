@@ -8472,6 +8472,21 @@ fn toggleSelectedTranscript(a: *App) void {
     setStatus(a, "Select a voice message with Alt+J/K first");
 }
 
+fn restoreComposeCaret(a: *App) void {
+    const compose = a.compose orelse return;
+    if (win.GetFocus() != compose) return;
+    // Alt+J/K hotkeys are consumed before the edit control sees them, but the
+    // caret can still be left hidden (menu-mode leftover or system-key churn).
+    // A focus pair makes the edit control destroy and recreate its caret, so
+    // blinking resumes; the selection is preserved.
+    var start: usize = 0;
+    var end: usize = 0;
+    _ = win.SendMessageW(compose, win.EM_GETSEL, @intFromPtr(&start), @bitCast(@intFromPtr(&end)));
+    _ = win.SendMessageW(compose, win.WM_KILLFOCUS, 0, 0);
+    _ = win.SendMessageW(compose, win.WM_SETFOCUS, 0, 0);
+    _ = win.SendMessageW(compose, win.EM_SETSEL, @bitCast(start), @bitCast(end));
+}
+
 fn handleKeyboard(a: *App, message: *const win.MSG) bool {
     if (message.message != win.WM_KEYDOWN and message.message != win.WM_SYSKEYDOWN) return false;
     const key: u32 = @intCast(message.wParam);
@@ -8608,6 +8623,7 @@ fn handleKeyboard(a: *App, message: *const win.MSG) bool {
     }
     if (alt and (key == 'J' or key == 'K')) {
         selectMessage(a, if (key == 'J') 1 else -1);
+        restoreComposeCaret(a);
         return true;
     }
     if (alt and key == 'G') {
@@ -8620,6 +8636,7 @@ fn handleKeyboard(a: *App, message: *const win.MSG) bool {
             a.last_alt_g_ms = now_ms;
             setStatus(a, "Press Alt+G again to jump to the latest message");
         }
+        restoreComposeCaret(a);
         return true;
     }
     if (control and key == 'O') {
