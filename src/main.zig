@@ -632,6 +632,13 @@ const App = struct {
     cache_tag_probe_again: bool = false,
     store_watch_path: WideText(519) = .{},
     last_store_write: u64 = 0,
+    // WAZI-67: a chats read that fails on the first launch after an update
+    // used to leave the sidebar empty until a manual restart, because the
+    // retry only fired when the wacli store file changed. Each failure
+    // schedules one further read two refresh ticks later, three rounds at
+    // most, so the reads stay bounded even when wacli keeps failing.
+    chats_read_retry_ticks: u32 = 0,
+    chats_read_attempts: u32 = 0,
 };
 
 var app_ptr: ?*App = null;
@@ -4021,13 +4028,20 @@ fn removeOtherChatsCaches(a: *App, keep_path: []const u8) void {
 }
 
 fn loadChatsCache(a: *App) void {
-    const path = chatsCachePath(a) orelse return;
+    const path = chatsCachePath(a) orelse {
+        appendLaunchLog(a, "cache-load skipped: no account tag");
+        return;
+    };
     defer a.allocator.free(path);
-    const data = readFileWin(a.allocator, path, msg_cache_max_bytes) orelse return;
+    const data = readFileWin(a.allocator, path, msg_cache_max_bytes) orelse {
+        appendLaunchLog(a, "cache-load: chats snapshot missing");
+        return;
+    };
     defer a.allocator.free(data);
-    // applyChats returns without mutating state on a parse failure, so a
-    // corrupt snapshot just falls through to the live read.
-    _ = applyChats(a, data);
+    const applied = applyChats(a, data);
+    var log_buffer: [64]u8 = undefined;
+    const log_line = std.fmt.bufPrint(&log_buffer, "cache-load: {d} bytes, applied={}", .{ data.len, applied }) catch "cache-load: logged";
+    appendLaunchLog(a, log_line);
 }
 
 fn msgCacheDirName(a: *App, buffer: []u8) ?[]const u8 {
@@ -8308,14 +8322,43 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
             switch (result.kind) {
                 .groups => if (result.ok) applyGroups(a, result.data),
                 .chats => {
-                    if (!result.ok) {
+                    // A stale failure must not restart the retry cycle or
+                    // repaint the status over a newer read (same rule as the
+                    // success path below).
+                    if (!result.ok and result.gen == a.chats_gen) {
                         setStatus(a, "Unable to read chats from wacli");
-                    } else if (result.gen == a.chats_gen) {
+                        // WAZI-67: refreshChats used to re-run only when the
+                        // wacli store changed, so a read that failed once at
+                        // the very first launch after an update left the
+                        // sidebar empty until a manual restart. Schedule one
+                        // further read, three rounds at most.
+                        if (a.chats_read_attempts < 3) {
+                            a.chats_read_attempts += 1;
+                            a.chats_read_retry_ticks = 2;
+                            var fail_buffer: [48]u8 = undefined;
+                            const fail_line = std.fmt.bufPrint(&fail_buffer, "chats-read: fail, retry {d}/3", .{a.chats_read_attempts}) catch "chats-read: fail";
+                            appendLaunchLog(a, fail_line);
+                        }
+                    } else if (result.ok and result.gen == a.chats_gen) {
                         // A queued job with older archive/unread flags must
                         // not repaint over a newer one.
                         // Persist the validated read so the next launch
                         // (an update included) opens with this list (WAZI-67).
-                        if (applyChats(a, result.data)) saveChatsCache(a, result.data);
+                        // A malformed payload (applyChats = false) leaves the
+                        // sidebar just as empty as a failed read, so it goes
+                        // through the same bounded retry.
+                        if (applyChats(a, result.data)) {
+                            a.chats_read_retry_ticks = 0;
+                            a.chats_read_attempts = 0;
+                            saveChatsCache(a, result.data);
+                            var log_buffer: [64]u8 = undefined;
+                            const log_line = std.fmt.bufPrint(&log_buffer, "chats-read: ok {d} bytes, {d} chats", .{ result.data.len, a.chat_count }) catch "chats-read: ok";
+                            appendLaunchLog(a, log_line);
+                        } else if (a.chats_read_attempts < 3) {
+                            a.chats_read_attempts += 1;
+                            a.chats_read_retry_ticks = 2;
+                            appendLaunchLog(a, "chats-read: malformed payload, retrying");
+                        }
                     }
                 },
                 .messages => {
@@ -8683,6 +8726,12 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
                     a.group_refresh_ticks = 0;
                 }
                 const changed = storeChanged(a);
+                // WAZI-67: bounded retry for a chats read that failed: one
+                // further read two ticks after each failure, three rounds.
+                if (a.chats_read_retry_ticks > 0) {
+                    a.chats_read_retry_ticks -= 1;
+                    if (a.chats_read_retry_ticks == 0) refreshChats(a);
+                }
                 if (changed and !a.chat_selection_pending) {
                     refreshChats(a);
                     if (!messagesAreCurrent(a)) refreshMessages(a);
@@ -9153,6 +9202,31 @@ fn appendHashLine(a: *App, path: []const u8, line: []const u8) void {
     _ = win.WriteFile(handle, line.ptr, @intCast(line.len), &written, null);
 }
 
+// ponytail: temporary WAZI-67 diagnostics, one line per launch event in
+// Messages/launch-log.txt, capped at 64 KiB. Remove once the blank
+// first-launch-after-update is root-caused and verified fixed.
+fn appendLaunchLog(a: *App, event: []const u8) void {
+    const path = messagesDirPath(a, "launch-log.txt") orelse return;
+    defer a.allocator.free(path);
+    const wide = std.unicode.utf8ToUtf16LeAllocZ(a.allocator, path) catch return;
+    defer a.allocator.free(wide);
+    // GENERIC_WRITE, not FILE_APPEND_DATA: the 64 KiB cap truncates through
+    // SetEndOfFile, which needs write-data access.
+    const handle = win.CreateFileW(wide.ptr, win.GENERIC_WRITE, win.FILE_SHARE_READ | win.FILE_SHARE_WRITE, null, win.OPEN_ALWAYS, win.FILE_ATTRIBUTE_NORMAL, null);
+    if (handle == win.INVALID_HANDLE_VALUE or handle == null) return;
+    defer _ = win.CloseHandle(handle);
+    var size: win.LARGE_INTEGER = undefined;
+    if (win.GetFileSizeEx(handle, &size) == 0) return;
+    if (size.QuadPart > 64 * 1024) {
+        const zero: win.LARGE_INTEGER = .{ .QuadPart = 0 };
+        if (win.SetFilePointerEx(handle, zero, null, win.FILE_BEGIN) == 0 or win.SetEndOfFile(handle) == 0) return;
+    } else if (win.SetFilePointerEx(handle, size, null, win.FILE_BEGIN) == 0) return;
+    var line_buffer: [192]u8 = undefined;
+    const line = std.fmt.bufPrint(&line_buffer, "{d} {s}\n", .{ nowUnixSeconds(), event }) catch return;
+    var written: win.DWORD = 0;
+    _ = win.WriteFile(handle, line.ptr, @intCast(line.len), &written, null);
+}
+
 fn loadPlayed(a: *App) void {
     loadHashSet(a, a.played_path, &a.played_set);
 }
@@ -9339,7 +9413,10 @@ pub fn main(init: std.process.Init) !void {
     if (openrouter_model.len == 0) openrouter_model = "openai/gpt-5.6-luna";
     var app = App{ .allocator = init.gpa, .io = init.io, .instance = instance, .wacli_path = wacli_path, .avatar_dir = avatar_dir, .slack_media_dir = slack_media_dir, .deepgram_configured = deepgram_key.len > 0, .deepgram_key = deepgram_key, .openrouter_key = openrouter_key, .openrouter_model = openrouter_model, .openrouter_configured = openrouter_key.len > 0, .dictation_language = loadDictationLanguage(), .font_scale = loadFontScale() };
     app.wacli_dir.set(wacli_dir);
-    if (cache_tag) |tag| app.cache_tag.set(tag);
+    if (cache_tag) |tag| {
+        app.cache_tag.set(tag);
+        appendLaunchLog(&app, "startup: account tag found");
+    } else appendLaunchLog(&app, "startup: no account tag (auth status failed or unlinked)");
     loadEmojiRecents(&app);
     if (init.environ_map.get("LOCALAPPDATA")) |local| {
         if (std.fs.path.join(init.gpa, &.{ local, "Messages", "telegram" })) |telegram_dir| {
