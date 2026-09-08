@@ -355,6 +355,7 @@ const Message = struct {
     // unfurl cache keyed by provider+id.
     unfurl_provider: unfurl.Provider = .none,
     unfurl_id: Utf8Text(unfurl.max_id_len) = .{},
+    unfurl_canonical: Utf8Text(unfurl.max_canonical_len) = .{},
     unfurl_card_hit: win.RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 },
     word_rects: [256]WordSpan = [_]WordSpan{.{}} ** 256,
     word_count: usize = 0,
@@ -620,6 +621,7 @@ const App = struct {
     player_fullscreen: bool = false,
     unfurl_entries: [max_unfurl_entries]UnfurlEntry = [_]UnfurlEntry{.{}} ** max_unfurl_entries,
     unfurl_entry_count: usize = 0,
+    unfurl_evict_slot: usize = 0,
     reply_to: Utf8Text(191) = .{},
     reply_sender: Utf8Text(191) = .{},
     displayed_jid: Utf8Text(191) = .{},
@@ -5026,6 +5028,7 @@ fn detectUnfurl(message: *Message) void {
     if (info.provider == .none) return;
     message.unfurl_provider = info.provider;
     message.unfurl_id.set(info.idSlice());
+    message.unfurl_canonical.set(info.canonicalSlice());
 }
 
 fn unfurlEntryFor(a: *App, message: *Message) ?*UnfurlEntry {
@@ -5033,8 +5036,8 @@ fn unfurlEntryFor(a: *App, message: *Message) ?*UnfurlEntry {
         if (entry.provider == message.unfurl_provider and
             std.mem.eql(u8, entry.id.slice(), message.unfurl_id.slice()))
         {
-            if (!entry.fetch_started and message.link_count > 0) {
-                startUnfurlFetch(a, entry, message.links[0].url.slice());
+            if (!entry.fetch_started and message.unfurl_canonical.len > 0) {
+                startUnfurlFetch(a, entry, message.unfurl_canonical.slice());
             }
             return entry;
         }
@@ -5046,7 +5049,8 @@ fn unfurlEntryFor(a: *App, message: *Message) ?*UnfurlEntry {
     } else {
         // Cache full: reuse the oldest slot. Its bitmap is deleted here on
         // the UI thread; no other thread owns entry bitmaps.
-        entry = &a.unfurl_entries[a.unfurl_entry_count % max_unfurl_entries];
+        entry = &a.unfurl_entries[a.unfurl_evict_slot];
+        a.unfurl_evict_slot = (a.unfurl_evict_slot + 1) % max_unfurl_entries;
         if (entry.thumb) |thumb| _ = win.DeleteObject(thumb);
         entry.* = .{};
     }
@@ -5054,7 +5058,11 @@ fn unfurlEntryFor(a: *App, message: *Message) ?*UnfurlEntry {
     entry.id.set(message.unfurl_id.slice());
     // The original message link is the fetch target; classify() already
     // vetted its host against the page allowlist.
-    if (message.link_count > 0) startUnfurlFetch(a, entry, message.links[0].url.slice());
+    if (message.unfurl_canonical.len > 0) {
+        var canonical_buffer: [unfurl.max_canonical_len]u8 = undefined;
+        @memcpy(canonical_buffer[0..message.unfurl_canonical.len], message.unfurl_canonical.slice());
+        startUnfurlFetch(a, entry, canonical_buffer[0..message.unfurl_canonical.len]);
+    }
     return entry;
 }
 
@@ -5151,8 +5159,10 @@ fn openUnfurlCard(a: *App, message: *const Message) void {
         if (!std.mem.eql(u8, entry.id.slice(), message.unfurl_id.slice())) continue;
         if (entry.play_url.len > 0) {
             playUnfurlVideo(a, entry);
-        } else if (message.link_count > 0) {
-            openUrlWide(a, message.links[0].url.ptr());
+        } else if (message.unfurl_canonical.len > 0) {
+            const wide = utf8ToWide(a.allocator, message.unfurl_canonical.slice()) catch return;
+            defer a.allocator.free(wide);
+            openUrlWide(a, wide.ptr);
         }
         return;
     }
@@ -5183,7 +5193,7 @@ const UnfurlResult = struct {
     thumb: ?[]u8 = null,
 };
 
-fn startUnfurlFetch(a: *App, entry: *UnfurlEntry, url_wide: []const u16) void {
+fn startUnfurlFetch(a: *App, entry: *UnfurlEntry, url_utf8: []const u8) void {
     if (a.hwnd == null) {
         entry.status = .failed;
         return;
@@ -5192,7 +5202,7 @@ fn startUnfurlFetch(a: *App, entry: *UnfurlEntry, url_wide: []const u16) void {
     // paint (new entry creation path) retries; no fetch storm while scrolling.
     if (unfurl_fetch_count.load(.monotonic) >= max_unfurl_fetches) return;
     const page = std.heap.page_allocator;
-    const url = std.unicode.utf16LeToUtf8Alloc(page, url_wide) catch {
+    const url = page.dupe(u8, url_utf8) catch {
         entry.status = .failed;
         return;
     };
@@ -5274,7 +5284,10 @@ fn unfurlThreadMain(ctx: *UnfurlContext) void {
         page.destroy(ctx);
     }
     const allocator = page;
-    const result = allocator.create(UnfurlResult) catch return;
+    const result = allocator.create(UnfurlResult) catch {
+        _ = unfurl_fetch_count.fetchSub(1, .monotonic);
+        return;
+    };
     result.* = .{ .provider = ctx.provider };
     result.id_len = copyInto(&result.id, ctx.id);
     const provider: unfurl.Provider = @enumFromInt(ctx.provider);
@@ -8880,12 +8893,12 @@ fn drawCanvas(hwnd: win.HWND, a: *App) void {
         _ = win.SelectObject(hdc, @ptrCast(a.font.?));
         _ = win.SetTextColor(hdc, color_text);
         const text_len: c_int = if (message.text.len > 0) @intCast(message.text.len) else 1;
-        _ = wrapMixedSink(hdc, a, if (message.text.len > 0) message.text.ptr() else lit(" "), text_len, right - left - 24, true, left + 12, text_top, message);
+        const text_height = wrapMixedSink(hdc, a, if (message.text.len > 0) message.text.ptr() else lit(" "), text_len, right - left - 24, true, left + 12, text_top, message);
         // WAZI-68: the unfurled video card sits below the text; its height
         // was reserved in measureMessage, so no other block moves.
         if (message.unfurl_provider != .none) {
-            drawUnfurlCard(hdc, a, message, left + 12, text_top + 4, right - left - 24);
-            text_top += unfurl_card_height + 6;
+            drawUnfurlCard(hdc, a, message, left + 12, text_top + text_height + 4, right - left - 24);
+            text_top += text_height + unfurl_card_height + 6;
         }
         if (a.sel_message != null and a.sel_message.? == index and a.sel_anchor_word != a.sel_focus_word) {
             const lo = @min(a.sel_anchor_word, a.sel_focus_word);

@@ -133,7 +133,7 @@ fn classifyYoutube(host: []const u8, path_and_more: []const u8, info: *Info) boo
     const query = queryOf(path_and_more);
     var id: []const u8 = "";
     if (std.ascii.eqlIgnoreCase(host, "youtu.be")) {
-        id = idUntilStop(path[1..], .youtube);
+        id = if (path.len > 1 and path[0] == '/') idUntilStop(path[1..], .youtube) else "";
     } else if (std.ascii.startsWithIgnoreCase(path, "/shorts/")) {
         id = idUntilStop(path["/shorts/".len..], .youtube);
     } else if (std.ascii.startsWithIgnoreCase(path, "/embed/")) {
@@ -179,7 +179,7 @@ fn classifyFacebook(host: []const u8, path_and_more: []const u8, info: *Info) bo
     var canonical_buffer: [max_canonical_len]u8 = undefined;
     var id: []const u8 = "";
     if (std.ascii.eqlIgnoreCase(host, "fb.watch")) {
-        id = idUntilStop(path[1..], .facebook);
+        id = if (path.len > 1 and path[0] == '/') idUntilStop(path[1..], .facebook) else "";
         if (id.len == 0) return false;
         const canonical = std.fmt.bufPrint(&canonical_buffer, "https://fb.watch/{s}/", .{id}) catch return false;
         return store(info, .facebook, id, canonical);
@@ -326,7 +326,7 @@ pub fn isStreamUrlAllowed(url: []const u8) bool {
 pub fn scrapeOgMeta(page: []const u8, key: []const u8) ?[]const u8 {
     var search_from: usize = 0;
     while (std.mem.indexOfPos(u8, page, search_from, "<meta")) |tag_start| {
-        const tag_end = (std.mem.indexOfPos(u8, page, tag_start, ">") orelse page.len) + 1;
+        const tag_end = std.mem.indexOfPos(u8, page, tag_start, ">") orelse page.len;
         search_from = tag_start + 5;
         const tag = page[tag_start..tag_end];
         const has_key = std.mem.indexOf(u8, tag, key) orelse continue;
@@ -442,6 +442,17 @@ test "classify rejects non-video pages and hostile hosts" {
     // Plain links stay plain.
     try std.testing.expectEqual(Provider.none, classify("https://example.com/watch?v=dQw4w9WgXcQ").provider);
     try std.testing.expectEqual(Provider.none, classify("").provider);
+}
+
+test "bare host URLs never panic" {
+    try std.testing.expectEqual(Provider.none, classify("https://youtu.be").provider);
+    try std.testing.expectEqual(Provider.none, classify("https://fb.watch").provider);
+    try std.testing.expectEqual(Provider.none, classify("https://www.instagram.com").provider);
+}
+
+test "scrapeOgMeta survives truncated html" {
+    try std.testing.expect(scrapeOgMeta("<html><meta property=\"og:video", "og:video") == null);
+    try std.testing.expect(scrapeOgMeta("<meta", "og:video") == null);
 }
 
 test "classify tolerates pasted punctuation" {
