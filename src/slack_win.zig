@@ -190,6 +190,31 @@ fn readResponse(allocator: std.mem.Allocator, request: win.HINTERNET, max_bytes:
     return out.toOwnedSlice(allocator);
 }
 
+// WAZI-61: one process-lifetime session + connection for slack.com so the
+// TLS handshake is paid once instead of per API call. WinHTTP handles are
+// thread-safe for concurrent requests; per-call request handles are still
+// opened and closed here. ponytail: handles are never closed; upgrade path
+// is an owned client shut down after the workers stop.
+var api_session: ?win.HINTERNET = null;
+var api_connection: ?win.HINTERNET = null;
+// Zeroed SRWLOCK is SRWLOCK_INIT (std.Thread.Mutex moved in this Zig version).
+var api_lock: win.SRWLOCK = .{};
+
+fn sharedApiHandles() ?win.HINTERNET {
+    win.AcquireSRWLockExclusive(&api_lock);
+    defer win.ReleaseSRWLockExclusive(&api_lock);
+    if (api_connection) |connection| return connection;
+    const session = win.WinHttpOpen(wideLiteral("Wazig Messages/1.0"), win.WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, null, null, 0) orelse return null;
+    _ = win.WinHttpSetTimeouts(session, 10_000, 10_000, 30_000, 60_000);
+    const connection = win.WinHttpConnect(session, wideLiteral("slack.com"), win.INTERNET_DEFAULT_HTTPS_PORT, 0) orelse {
+        _ = win.WinHttpCloseHandle(session);
+        return null;
+    };
+    api_session = session;
+    api_connection = connection;
+    return connection;
+}
+
 /// One HTTPS call to slack.com/api. `body` null means GET. Returns the status
 /// and body; Slack's own "ok" flag is checked by the caller through the job
 /// runner. 429 responses surface with their status so the caller can honor
@@ -201,11 +226,7 @@ pub fn callApi(allocator: std.mem.Allocator, token: []const u8, method: []const 
     const wide_method = try toWide(allocator, if (std.mem.eql(u8, method, "GET")) "GET" else "POST");
     defer allocator.free(wide_method);
 
-    const session = win.WinHttpOpen(wideLiteral("Wazig Messages/1.0"), win.WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, null, null, 0) orelse return error.NetworkFailed;
-    defer _ = win.WinHttpCloseHandle(session);
-    _ = win.WinHttpSetTimeouts(session, 10_000, 10_000, 30_000, 60_000);
-    const connection = win.WinHttpConnect(session, wideLiteral("slack.com"), win.INTERNET_DEFAULT_HTTPS_PORT, 0) orelse return error.NetworkFailed;
-    defer _ = win.WinHttpCloseHandle(connection);
+    const connection = sharedApiHandles() orelse return error.NetworkFailed;
     const request = win.WinHttpOpenRequest(connection, wide_method.ptr, wide_path.ptr, null, null, null, win.WINHTTP_FLAG_SECURE) orelse return error.NetworkFailed;
     defer _ = win.WinHttpCloseHandle(request);
 
@@ -412,6 +433,8 @@ pub const Event = struct {
     thread_ts_len: u8 = 0,
     user: [slack.max_user_id + 1]u8 = undefined,
     user_len: u8 = 0,
+    client_msg_id: [63]u8 = undefined,
+    client_msg_id_len: u8 = 0,
     text: [slack.max_text + 1]u8 = undefined,
     text_len: u16 = 0,
     file_id: [32]u8 = undefined,
@@ -435,6 +458,9 @@ pub const Event = struct {
     }
     pub fn userSlice(self: *const Event) []const u8 {
         return self.user[0..self.user_len];
+    }
+    pub fn clientMsgIdSlice(self: *const Event) []const u8 {
+        return self.client_msg_id[0..self.client_msg_id_len];
     }
     pub fn textSlice(self: *const Event) []const u8 {
         return self.text[0..self.text_len];
@@ -484,6 +510,7 @@ pub fn buildEvent(envelope: slack.Envelope) ?*Event {
     copyInto(&event.ts, &event.ts_len, envelope.ts);
     copyInto(&event.thread_ts, &event.thread_ts_len, envelope.thread_ts);
     copyInto(&event.user, &event.user_len, envelope.user);
+    copyInto(&event.client_msg_id, &event.client_msg_id_len, envelope.client_msg_id);
     copyInto(&event.text, &event.text_len, envelope.text);
     copyInto(&event.file_id, &event.file_id_len, envelope.file_id);
     copyInto(&event.file_url, &event.file_url_len, envelope.file_url);
@@ -640,7 +667,7 @@ pub fn runJob(allocator: std.mem.Allocator, ctx: JobContext, kind: JobKind, args
         },
         .send_text => {
             if (args.len < 3) return error.BadArguments;
-            const body = try slack.buildPostMessageBody(allocator, .{ .channel_id = args[0], .text = args[1], .thread_ts = args[2] });
+            const body = try slack.buildPostMessageBody(allocator, .{ .channel_id = args[0], .text = args[1], .thread_ts = args[2], .client_msg_id = if (args.len > 3) args[3] else "" });
             defer allocator.free(body);
             var response = try callWithRetry(allocator, ctx.user_token, "/api/chat.postMessage", body);
             errdefer response.deinit(allocator);
