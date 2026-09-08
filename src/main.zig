@@ -1959,7 +1959,7 @@ fn validTgApiHash(text: []const u8) bool {
 
 /// The rejection must name both failure modes the validator checks (length
 /// and characters), not just one (WAZI-73 review follow-up).
-const tg_api_hash_error = "The api_hash is exactly 32 characters, letters and digits. Copy the whole value from my.telegram.org/apps.";
+const tg_api_hash_error = "The api_hash is exactly 32 hexadecimal characters (0-9, a-f). Copy the whole value from my.telegram.org/apps.";
 
 /// Shows an error inside the sign-in dialog, keeping the current step's
 /// instruction visible after it. No-ops when the dialog is not open.
@@ -11237,6 +11237,7 @@ test "telegram api_hash rejection text covers both validation rules" {
     // The dialog error must describe length and characters, since the
     // validator rejects overlong and non-hex values too (not just short ones).
     try std.testing.expect(std.mem.indexOf(u8, tg_api_hash_error, "exactly 32") != null);
-    try std.testing.expect(std.mem.indexOf(u8, tg_api_hash_error, "letters and digits") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tg_api_hash_error, "hexadecimal") != null);
     try std.testing.expect(std.mem.indexOf(u8, tg_api_hash_error, "too short") == null);
+    try std.testing.expect(std.mem.indexOf(u8, tg_api_hash_error, "letters and digits") == null);
 }
