@@ -328,6 +328,31 @@ pub fn isStaleOrphan(self_pid: u32, pid: u32, has_visible_window: bool, age_seco
     return pid != self_pid and !has_visible_window and age_seconds >= orphan_min_age_seconds;
 }
 
+/// What to do with a leftover `.old` backup before the commit rename.
+/// `exe_present` says the current exe is in place, `old_present` says a
+/// `.old` backup exists, and `old_delete_succeeded` says a delete attempt
+/// removed it. A delete that leaves the file behind means a stale orphan
+/// copy still locks it: the orphans must be reclaimed and the delete
+/// retried, or renaming the exe onto `.old` fails (WAZI-66).
+pub const OldBackupAction = enum { none, restore, clear_orphans_and_retry };
+
+pub fn oldBackupAction(exe_present: bool, old_present: bool, old_delete_succeeded: bool) OldBackupAction {
+    if (old_present and !exe_present) return .restore;
+    if (old_present and !old_delete_succeeded) return .clear_orphans_and_retry;
+    return .none;
+}
+
+test oldBackupAction {
+    const action = oldBackupAction;
+    try std.testing.expectEqual(OldBackupAction.none, action(true, false, false));
+    // Interrupted swap: the exe vanished, the backup holds the last copy.
+    try std.testing.expectEqual(OldBackupAction.restore, action(false, true, false));
+    // Locked backup: the delete failed and the file is still there, so the
+    // commit rename onto .old would fail without orphan cleanup.
+    try std.testing.expectEqual(OldBackupAction.clear_orphans_and_retry, action(true, true, false));
+    try std.testing.expectEqual(OldBackupAction.none, action(true, true, true));
+}
+
 test classifyMutexWait {
     try std.testing.expectEqual(MutexWait.acquired, classifyMutexWait(0)); // WAIT_OBJECT_0
     try std.testing.expectEqual(MutexWait.acquired, classifyMutexWait(0x80)); // WAIT_ABANDONED
