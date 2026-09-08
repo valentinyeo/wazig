@@ -34,7 +34,7 @@ pub fn firstAnimationFrame(data: []const u8) ?[]const u8 {
                 // ponytail: the bare VP8 payload decodes without the alpha
                 // plane, so lossy-with-alpha stickers lose transparency; the
                 // upgrade path is WebPAnimDecoder (vendor src/demux).
-                if (8 + inner_size > frame_end - inner) return null;
+                if (inner_size > frame_end - inner - 8) return null;
                 inner += 8 + inner_size + (inner_size & 1);
             }
             if (inner + 8 > frame_end) return null;
