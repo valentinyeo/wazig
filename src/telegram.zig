@@ -46,6 +46,10 @@ pub const Client = struct {
     files_dir: []u8,
     stopping: std.atomic.Value(bool) = .init(false),
     parameters_sent: bool = false,
+    /// Phone number submitted before TDLib asked for it (client start is still
+    /// setting up parameters); flushed on the receive thread when wait_phone
+    /// arrives. Guarded by state_mutex.
+    pending_phone: ?[]u8 = null,
 
     pub fn create(allocator: std.mem.Allocator, io: std.Io, api_id: i32, api_hash: []const u8, base_dir: []const u8) ?*Client {
         const self = allocator.create(Client) catch return null;
@@ -80,6 +84,7 @@ pub const Client = struct {
         self.stopping.store(true, .release);
         self.sendClose();
         if (self.thread) |thread| thread.join();
+        if (self.pending_phone) |phone| self.allocator.free(phone);
         self.queue.deinit(self.allocator);
         var chat_iterator = self.chats.iterator();
         while (chat_iterator.next()) |entry| entry.value_ptr.deinit(self.allocator);
@@ -116,6 +121,30 @@ pub const Client = struct {
     }
 
     pub fn authPhone(self: *Client, phone: []const u8) void {
+        // TDLib needs setTdlibParameters before it accepts a phone number. In
+        // the pre-phone states the dialog is already open while the receive
+        // thread is still waiting for wait_parameters/wait_phone, so hold the
+        // number and send it when wait_phone arrives; in any later state
+        // (wait_code and beyond) send immediately so a stale number is never
+        // parked for a future login.
+        self.state_mutex.lockUncancelable(self.io);
+        const wait_for_it = self.auth == .unknown or self.auth == .wait_parameters;
+        if (wait_for_it) {
+            const copy = self.allocator.dupe(u8, phone) catch {
+                self.state_mutex.unlock(self.io);
+                return;
+            };
+            if (self.pending_phone) |old| self.allocator.free(old);
+            self.pending_phone = copy;
+        } else {
+            // Sent under state_mutex so a concurrent flush of an older stashed
+            // number cannot land after this newer submission.
+            self.sendPhoneNumber(phone);
+        }
+        self.state_mutex.unlock(self.io);
+    }
+
+    fn sendPhoneNumber(self: *Client, phone: []const u8) void {
         self.sendFields(.{ .type = "setAuthenticationPhoneNumber", .phone_number = phone, .allow_flash_call = false, .is_current_phone_number = true });
     }
 
@@ -313,8 +342,26 @@ pub const Client = struct {
                 .auth => |auth| {
                     self.state_mutex.lockUncancelable(self.io);
                     if (auth.state != .unknown) self.auth = auth.state;
+                    // The phone number may have been submitted while TDLib was
+                    // still setting up parameters; send it now that it is asked
+                    // for. The take and send share the critical section that
+                    // publishes wait_phone with authPhone, so phone requests
+                    // stay ordered and a newer submission can never be overtaken
+                    // by an older stashed one.
+                    var pending: ?[]u8 = null;
+                    if (auth.state != .unknown and auth.state != .wait_parameters) {
+                        // Either TDLib now asks for the number (wait_phone) or
+                        // it moved past the phone step without asking (for
+                        // example an already authorized session): in both cases
+                        // a stashed phone leaves the pre-phone window, to be
+                        // sent or dropped, never parked for a later cycle.
+                        pending = self.pending_phone;
+                        self.pending_phone = null;
+                    }
+                    if (auth.state == .wait_phone) if (pending) |phone| self.sendPhoneNumber(phone);
                     self.state_mutex.unlock(self.io);
                     if (auth.state == .wait_parameters and !self.parameters_sent) self.sendTdlibParameters();
+                    if (pending) |phone| self.allocator.free(phone);
                 },
                 .chat => |*info| {
                     self.applyChat(info);
