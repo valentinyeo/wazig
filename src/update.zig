@@ -328,29 +328,40 @@ pub fn isStaleOrphan(self_pid: u32, pid: u32, has_visible_window: bool, age_seco
     return pid != self_pid and !has_visible_window and age_seconds >= orphan_min_age_seconds;
 }
 
-/// What to do with a leftover `.old` backup before the commit rename.
-/// `exe_present` says the current exe is in place, `old_present` says a
-/// `.old` backup exists, and `old_delete_succeeded` says a delete attempt
-/// removed it. A delete that leaves the file behind means a stale orphan
-/// copy still locks it: the orphans must be reclaimed and the delete
-/// retried, or renaming the exe onto `.old` fails (WAZI-66).
-pub const OldBackupAction = enum { none, restore, clear_orphans_and_retry };
+/// WAZI-71: which leftover copy brings a runnable exe back after an
+/// interrupted swap left the install without one. The digest-verified
+/// replacement wins over the backup: it is the newest runnable copy and the
+/// backup may still be locked by a stale orphan.
+pub const RestoreSource = enum { replacement, backup };
 
-pub fn oldBackupAction(exe_present: bool, old_present: bool, old_delete_succeeded: bool) OldBackupAction {
-    if (old_present and !exe_present) return .restore;
-    if (old_present and !old_delete_succeeded) return .clear_orphans_and_retry;
-    return .none;
+/// Returns the leftover copy to restore from when the live exe is missing,
+/// or null when neither leftover exists.
+pub fn restoreSource(new_present: bool, old_present: bool) ?RestoreSource {
+    if (new_present) return .replacement;
+    if (old_present) return .backup;
+    return null;
 }
 
-test oldBackupAction {
-    const action = oldBackupAction;
-    try std.testing.expectEqual(OldBackupAction.none, action(true, false, false));
-    // Interrupted swap: the exe vanished, the backup holds the last copy.
-    try std.testing.expectEqual(OldBackupAction.restore, action(false, true, false));
-    // Locked backup: the delete failed and the file is still there, so the
-    // commit rename onto .old would fail without orphan cleanup.
-    try std.testing.expectEqual(OldBackupAction.clear_orphans_and_retry, action(true, true, false));
-    try std.testing.expectEqual(OldBackupAction.none, action(true, true, true));
+test restoreSource {
+    try std.testing.expectEqual(RestoreSource.replacement, restoreSource(true, true).?);
+    try std.testing.expectEqual(RestoreSource.backup, restoreSource(false, true).?);
+    try std.testing.expect(restoreSource(false, false) == null);
+}
+
+/// WAZI-71: a copied-out replacement exe counts as verified only when its
+/// size matches the staged exe exactly (those staged bytes were already
+/// digest-checked) and is not empty. Anything else aborts the swap before
+/// the live exe is touched, so a bad copy can never replace a working app.
+pub fn replacementVerified(staged_size: u64, temp_size: ?u64) bool {
+    const size = temp_size orelse return false;
+    return size == staged_size and size > 0;
+}
+
+test replacementVerified {
+    try std.testing.expect(replacementVerified(100, 100));
+    try std.testing.expect(!replacementVerified(100, null));
+    try std.testing.expect(!replacementVerified(100, 99));
+    try std.testing.expect(!replacementVerified(0, 0));
 }
 
 test classifyMutexWait {

@@ -9948,9 +9948,10 @@ fn performUpdate(io: std.Io) !UpdateOutcome {
     const root = try cwd.createDirPathOpen(io, update_root, .{});
     defer root.close(io);
 
-    // Recover from an interrupted earlier swap: if the exe was renamed to .old
-    // and its replacement never landed, restore it so the folder always holds
-    // a runnable exe. A leftover .new is debris either way.
+    // Recover from an interrupted earlier swap (WAZI-71). A windowless
+    // orphan from an earlier update locks the .old/.new copies and every
+    // rename below, so end the orphans before touching anything.
+    clearStaleOrphans();
     const exe_name = std.fs.path.basename(exe_path);
     {
         const exe_old = try std.fmt.allocPrint(allocator, "{s}\\{s}.old", .{ exe_dir, exe_name });
@@ -9963,38 +9964,42 @@ fn performUpdate(io: std.Io) !UpdateOutcome {
         defer allocator.free(exe_new_wide);
         const exe_here_wide = try utf8ToWide(allocator, exe_path);
         defer allocator.free(exe_here_wide);
-        if (win.GetFileAttributesW(exe_here_wide.ptr) == win.INVALID_FILE_ATTRIBUTES and
-            win.GetFileAttributesW(exe_old_wide.ptr) != win.INVALID_FILE_ATTRIBUTES)
-        {
-            _ = win.MoveFileExW(exe_old_wide.ptr, exe_here_wide.ptr, win.MOVEFILE_REPLACE_EXISTING);
-        }
-        _ = win.DeleteFileW(exe_new_wide.ptr);
-        // A .old backup left by a completed swap is safe to drop now. When the
-        // delete leaves the file behind, a stale orphan copy still locks it
-        // (WAZI-66): end the orphans here too — not only on mutex contention —
-        // and retry, so the commit rename onto .old cannot hit a locked file.
+        // If the exe is missing, bring a runnable copy back before anything
+        // else: the digest-verified replacement first, then the backup —
+        // a source locked by a leftover process must not stop the other.
         const exe_here = filePresentLookup(exe_here_wide.ptr) orelse return error.UpdateSwapStateUnknown;
-        const old_there = filePresentLookup(exe_old_wide.ptr) orelse return error.UpdateSwapStateUnknown;
-        // Only delete the backup when the current exe is in place; an absent
-        // exe means the swap was interrupted and the backup is the last
-        // runnable copy, which must be restored instead.
-        const old_delete_succeeded = exe_here and win.DeleteFileW(exe_old_wide.ptr) != 0;
-        switch (update.oldBackupAction(exe_here, old_there, old_delete_succeeded)) {
-            .restore => {
-                // The exe is gone; if the backup cannot come back, the folder
-                // would be left without a runnable copy — abort instead.
-                if (win.MoveFileExW(exe_old_wide.ptr, exe_here_wide.ptr, win.MOVEFILE_REPLACE_EXISTING) == 0) return error.UpdateSwapRestoreFailed;
-            },
-            .clear_orphans_and_retry => {
-                clearStaleOrphans();
-                _ = win.DeleteFileW(exe_old_wide.ptr);
-                // Still present after the retry: the lock persists and the
-                // commit rename onto .old would fail — abort with a distinct
-                // error instead of starting the download.
-                if (filePresentLookup(exe_old_wide.ptr) != false) return error.UpdateOldBackupLocked;
-            },
-            .none => {},
+        if (!exe_here) {
+            const new_there = filePresentLookup(exe_new_wide.ptr) orelse return error.UpdateSwapStateUnknown;
+            const old_there = filePresentLookup(exe_old_wide.ptr) orelse return error.UpdateSwapStateUnknown;
+            const source = update.restoreSource(new_there, old_there) orelse return error.UpdateSwapRestoreFailed;
+            const first: [:0]const u16 = switch (source) {
+                .replacement => exe_new_wide,
+                .backup => exe_old_wide,
+            };
+            const fallback: ?[:0]const u16 = switch (source) {
+                .replacement => if (old_there) exe_old_wide else null,
+                .backup => if (new_there) exe_new_wide else null,
+            };
+            if (!restoreExeFile(first, exe_here_wide) and
+                (fallback == null or !restoreExeFile(fallback.?, exe_here_wide)))
+            {
+                return error.UpdateSwapRestoreFailed;
+            }
         }
+        // A .old backup left by a completed swap is safe to drop now. When
+        // the delete leaves the file behind, a stale orphan copy still locks
+        // it (WAZI-66): end the orphans and retry, so the commit rename onto
+        // .old cannot hit a locked file.
+        const old_there = filePresentLookup(exe_old_wide.ptr) orelse return error.UpdateSwapStateUnknown;
+        if (old_there and win.DeleteFileW(exe_old_wide.ptr) == 0) {
+            clearStaleOrphans();
+            _ = win.DeleteFileW(exe_old_wide.ptr);
+            // Still present after the retry: the lock persists and the
+            // commit rename onto .old would fail — abort with a distinct
+            // error instead of starting the download.
+            if (filePresentLookup(exe_old_wide.ptr) != false) return error.UpdateOldBackupLocked;
+        }
+        _ = win.DeleteFileW(exe_new_wide.ptr); // stale replacement debris
     }
 
     const api_headers = try utf8ToWide(allocator, "User-Agent: Messages updater\r\nAccept: application/vnd.github+json\r\n");
@@ -10060,7 +10065,7 @@ fn performUpdate(io: std.Io) !UpdateOutcome {
     else
         try allocator.dupe(u8, exe_name);
     defer allocator.free(new_exe_rel);
-    _ = try stage.statFile(io, new_exe_rel, .{});
+    const staged_exe_size = (try stage.statFile(io, new_exe_rel, .{})).size;
 
     // Copy every staged file to a temporary `.new` name beside its destination
     // first. The running exe and all existing files stay untouched until every
@@ -10078,43 +10083,90 @@ fn performUpdate(io: std.Io) !UpdateOutcome {
     defer allocator.free(stage_path);
     if (!copyStagedFiles(io, allocator, stage, stage_path, inner_root, exe_dir, &pending)) return error.UpdateCopyFailed;
 
-    // Commit: rename the running exe aside (always allowed on Windows), then
-    // move the staged files into place. Both steps are atomic renames, so the
-    // window in which no runnable exe exists is two fast operations, and any
-    // failure rolls the old exe straight back.
+    // Commit (WAZI-71): every non-exe file renames into place first. The
+    // live exe is renamed aside only after its verified replacement is on
+    // disk, so every failure path leaves a runnable exe in the folder.
+    const exe_wide = try utf8ToWide(allocator, exe_path);
+    defer allocator.free(exe_wide);
+    var exe_index: ?usize = null;
+    for (pending.items, 0..) |p, i| {
+        if (eqlWideIgnoreCase(p.dest, exe_wide)) exe_index = i;
+    }
+    const exe_i = exe_index orelse return error.UpdateNoExePath;
+    const exe_temp = pending.items[exe_i].temp;
+
+    // The replacement must be verifiably on disk before the live exe is
+    // touched: exact size match against the digest-checked staged bytes.
+    if (!update.replacementVerified(staged_exe_size, wideFileSize(exe_temp))) return error.UpdateCopyFailed;
+
     const exe_old = try std.fmt.allocPrint(allocator, "{s}\\{s}.old", .{ exe_dir, exe_name });
     defer allocator.free(exe_old);
     const exe_old_wide = try utf8ToWide(allocator, exe_old);
     defer allocator.free(exe_old_wide);
-    const exe_wide = try utf8ToWide(allocator, exe_path);
-    defer allocator.free(exe_wide);
-    if (win.MoveFileExW(exe_wide.ptr, exe_old_wide.ptr, win.MOVEFILE_REPLACE_EXISTING) == 0) return error.UpdateSwapFailed;
-    if (commitSwapRenames(pending.items)) {
-        _ = win.DeleteFileW(exe_old_wide.ptr); // best effort; a leftover is removed on next start
-        return .installed;
+    // Rename the live exe aside. A failure here leaves it in place and
+    // nothing else has been touched; the usual cause is a leftover process
+    // holding .old, so end the orphans and retry once.
+    if (win.MoveFileExW(exe_wide.ptr, exe_old_wide.ptr, win.MOVEFILE_REPLACE_EXISTING) == 0) {
+        clearStaleOrphans();
+        if (win.MoveFileExW(exe_wide.ptr, exe_old_wide.ptr, win.MOVEFILE_REPLACE_EXISTING) == 0) return error.UpdateSwapFailed;
     }
-    // Rollback: restore the old executable (the staged files are untouched
-    // thanks to the two-phase copy).
-    _ = win.MoveFileExW(exe_old_wide.ptr, exe_wide.ptr, win.MOVEFILE_REPLACE_EXISTING);
-    return error.UpdateCopyFailed;
+    if (!restoreExeFile(exe_temp, exe_wide)) {
+        // The replacement did not land; put the old exe back. The verified
+        // .new replacement also remains on disk for the next recovery pass.
+        if (!restoreExeFile(exe_old_wide, exe_wide)) return error.UpdateSwapRestoreFailed;
+        return error.UpdateCopyFailed;
+    }
+    // The new exe is in place; now the support files. On a failure the old
+    // exe comes back — closest to the pre-update state. ponytail: no per-file
+    // rollback journal, deliberately — the only files beside the exe are the
+    // two IBM Plex fonts and the OFL license, so a partially renamed support
+    // set leaves the app runnable and is redone on the next update attempt.
+    // Leftover temps and a stale .old are also cleared there.
+    for (pending.items, 0..) |p, i| {
+        if (i == exe_i) continue;
+        if (win.MoveFileExW(p.temp.ptr, p.dest.ptr, win.MOVEFILE_REPLACE_EXISTING) == 0) {
+            for (pending.items, 0..) |q, j| {
+                if (j != i and j != exe_i) _ = win.DeleteFileW(q.temp.ptr);
+            }
+            _ = restoreExeFile(exe_old_wide, exe_wide);
+            return error.UpdateCopyFailed;
+        }
+    }
+    _ = win.DeleteFileW(exe_old_wide.ptr); // best effort; a leftover is removed on the next update attempt
+    return .installed;
 }
 
 /// One staged file waiting to be renamed from its temporary `.new` name to its
 /// final destination.
 const SwapPending = struct { temp: [:0]u16, dest: [:0]u16 };
 
-/// Moves every staged `.new` file onto its destination. Returns false on the
-/// first failure and deletes the not-yet-renamed temps so no debris is left.
-fn commitSwapRenames(pending: []SwapPending) bool {
-    for (pending) |p| {
-        if (win.MoveFileExW(p.temp.ptr, p.dest.ptr, win.MOVEFILE_REPLACE_EXISTING) == 0) {
-            for (pending) |q| {
-                if (q.temp.ptr != p.temp.ptr) _ = win.DeleteFileW(q.temp.ptr);
-            }
-            return false;
-        }
+/// WAZI-71: put a runnable exe back at `dest` from `source`. Rename first;
+/// when the source is locked against the rename, byte-copy it to a
+/// temporary name and rename that in, so `dest` is never left partial: a
+/// copy needs only read access, which a running executable always grants.
+fn restoreExeFile(source: [:0]const u16, dest: [:0]const u16) bool {
+    if (win.MoveFileExW(source.ptr, dest.ptr, win.MOVEFILE_REPLACE_EXISTING) != 0) return true;
+    const suffix = ".restore-tmp";
+    var tmp_buf: [519 + suffix.len]u16 = undefined;
+    if (dest.len + suffix.len >= tmp_buf.len) return false;
+    @memcpy(tmp_buf[0..dest.len], dest);
+    for (suffix, 0..) |c, i| tmp_buf[dest.len + i] = c;
+    tmp_buf[dest.len + suffix.len] = 0;
+    const tmp = tmp_buf[0 .. dest.len + suffix.len :0];
+    if (win.CopyFileW(source.ptr, tmp.ptr, win.FALSE) == 0) return false;
+    if (win.MoveFileExW(tmp.ptr, dest.ptr, win.MOVEFILE_REPLACE_EXISTING) == 0) {
+        _ = win.DeleteFileW(tmp.ptr);
+        return false;
     }
     return true;
+}
+
+/// WAZI-71: size of a file by wide path, or null when it cannot be read.
+fn wideFileSize(path_wide: [*:0]const u16) ?u64 {
+    var info: win.WIN32_FILE_ATTRIBUTE_DATA = undefined;
+    if (win.GetFileAttributesExW(path_wide, win.GetFileExInfoStandard, &info) == 0) return null;
+    const high: u64 = info.nFileSizeHigh;
+    return (high << 32) | info.nFileSizeLow;
 }
 
 /// Copies every staged file (below `inner_root` inside `stage_path`) to a
@@ -10194,7 +10246,16 @@ fn relaunchIntoUpdate(a: *App) void {
     var startup: win.STARTUPINFOW = std.mem.zeroes(win.STARTUPINFOW);
     startup.cb = @sizeOf(win.STARTUPINFOW);
     var process: win.PROCESS_INFORMATION = std.mem.zeroes(win.PROCESS_INFORMATION);
-    if (win.CreateProcessW(exe_buf[0..exe_len :0].ptr, null, null, null, win.FALSE, 0, null, null, &startup, &process) != 0) {
+    // WAZI-71: retry once before giving up; a transient failure must not
+    // push the restart back onto the user.
+    var launched = win.CreateProcessW(exe_buf[0..exe_len :0].ptr, null, null, null, win.FALSE, 0, null, null, &startup, &process) != 0;
+    if (!launched) {
+        process = std.mem.zeroes(win.PROCESS_INFORMATION);
+        launched = win.CreateProcessW(exe_buf[0..exe_len :0].ptr, null, null, null, win.FALSE, 0, null, null, &startup, &process) != 0;
+    }
+    if (launched) {
+        _ = win.CloseHandle(process.hProcess);
+        _ = win.CloseHandle(process.hThread);
         _ = win.PostQuitMessage(0);
     } else {
         setStatus(a, "Update installed - restart the app to finish");
