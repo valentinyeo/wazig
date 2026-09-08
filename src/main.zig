@@ -1051,22 +1051,22 @@ fn wacliEnqueue(a: *App, job: WacliJob, urgent: bool) void {
 fn wacliPumpSync(a: *App) void {
     while (true) {
         a.wacli_mutex.lockUncancelable(a.io);
-        // Every job kind must have a lane: the main worker, or this inline
-        // pump when a lane's thread failed to spawn.
-        if (a.wacli_queue_len == 0 or (a.wacli_thread != null and a.wacli_slack_thread != null)) {
+        // Every job kind must have a lane: its worker thread, or this inline
+        // pump for exactly the lanes whose thread failed to spawn.
+        const pump_wacli = a.wacli_thread == null;
+        const pump_slack = a.wacli_slack_thread == null;
+        if (a.wacli_queue_len == 0 or (!pump_wacli and !pump_slack)) {
             a.wacli_mutex.unlock(a.io);
             return;
         }
-        const job = if (a.wacli_thread != null)
-            wacliTakeJob(a, true) // main worker lives: pump only Slack jobs
-        else
-            wacliTakeJob(a, false) orelse wacliTakeJob(a, true);
-        if (job == null) {
+        const job = if (pump_wacli) wacliTakeJob(a, false) else null;
+        const chosen = job orelse (if (pump_slack) wacliTakeJob(a, true) else null);
+        if (chosen == null) {
             a.wacli_mutex.unlock(a.io);
             return;
         }
         a.wacli_mutex.unlock(a.io);
-        wacliRunJob(a, job.?);
+        wacliRunJob(a, chosen.?);
     }
 }
 
@@ -2214,16 +2214,29 @@ fn applySlackHistory(a: *App, raw: []const u8) void {
     // WAZI-61: optimistic bubbles are not in Slack's history yet. Keep them
     // only when this refresh is for the chat already on screen; a chat switch
     // discards them (the switched-back view refetches authoritative history).
-    var saved: [8]Message = undefined;
+    var saved: []Message = &.{};
     var saved_count: usize = 0;
     if (std.mem.eql(u8, a.displayed_jid.slice(), chat.jid.slice())) {
         for (a.messages[0..a.message_count]) |*message| {
-            if (message.from_me and message.send_state != .none and saved_count < saved.len) {
-                saved[saved_count] = message.*;
-                saved_count += 1;
+            if (message.from_me and message.send_state != .none) saved_count += 1;
+        }
+        if (saved_count > 0) {
+            if (a.allocator.alloc(Message, saved_count)) |buffer| {
+                saved = buffer;
+                var filled: usize = 0;
+                for (a.messages[0..a.message_count]) |*message| {
+                    if (message.from_me and message.send_state != .none) {
+                        saved[filled] = message.*;
+                        filled += 1;
+                    }
+                }
+                saved_count = filled;
+            } else |_| {
+                saved_count = 0;
             }
         }
     }
+    defer if (saved.len > 0) a.allocator.free(saved);
     clearMessages(a);
     a.selected_message = null;
     var reply_parents: [8]Utf8Text(64) = [_]Utf8Text(64){.{}} ** 8;
@@ -2385,9 +2398,10 @@ fn resolveSlackSend(a: *App, result: *WacliResult) void {
     // pending send (ponytail: that orphan bubble is silently dropped, the
     // status bar still reports the outcome).
     if (!std.mem.eql(u8, a.displayed_jid.slice(), result.jid.slice())) return;
-    // Correlate by client_msg_id; fall back to the oldest pending bubble for
-    // sends queued before ids existed.
-    const index = pendingByClientMsgId(a, result.extra.slice()) orelse oldestPendingSend(a) orelse return;
+    // Correlate by client_msg_id; only when a result carries no id (sends
+    // queued before correlation existed) fall back to the oldest pending.
+    const index = pendingByClientMsgId(a, result.extra.slice()) orelse
+        (if (result.extra.len == 0) oldestPendingSend(a) else null) orelse return;
     if (!result.ok) {
         const message = &a.messages[index];
         message.send_state = .failed;
@@ -4891,6 +4905,7 @@ fn sendMessage(a: *App) void {
             const client_msg_id = std.fmt.bufPrint(&cmid_buffer, "wz{d}-{d}", .{ win.GetTickCount64(), a.slack_client_seq }) catch "";
             var job = WacliJob{ .kind = .slack_send, .started_ms = win.GetTickCount64() };
             job.jid.set(chat.jid.slice());
+            job.extra.set(client_msg_id);
             wacliJobArgs(&job, &.{ chat.jid.slice(), text, a.reply_to.slice(), client_msg_id });
             wacliEnqueue(a, job, true);
             // Show the message immediately as pending; the send completion
