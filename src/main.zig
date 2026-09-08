@@ -9910,14 +9910,25 @@ fn performUpdate(io: std.Io) !UpdateOutcome {
         const exe_here_wide = try utf8ToWide(allocator, exe_path);
         defer allocator.free(exe_here_wide);
         // If the exe is missing, bring a runnable copy back before anything
-        // else: the digest-verified replacement first, then the backup.
+        // else: the digest-verified replacement first, then the backup —
+        // a source locked by a leftover process must not stop the other.
         const exe_here = filePresentLookup(exe_here_wide.ptr) orelse return error.UpdateSwapStateUnknown;
         if (!exe_here) {
             const new_there = filePresentLookup(exe_new_wide.ptr) orelse return error.UpdateSwapStateUnknown;
             const old_there = filePresentLookup(exe_old_wide.ptr) orelse return error.UpdateSwapStateUnknown;
-            switch (update.restoreSource(new_there, old_there) orelse return error.UpdateSwapRestoreFailed) {
-                .replacement => if (!restoreExeFile(exe_new_wide, exe_here_wide)) return error.UpdateSwapRestoreFailed,
-                .backup => if (!restoreExeFile(exe_old_wide, exe_here_wide)) return error.UpdateSwapRestoreFailed,
+            const source = update.restoreSource(new_there, old_there) orelse return error.UpdateSwapRestoreFailed;
+            const first: [:0]const u16 = switch (source) {
+                .replacement => exe_new_wide,
+                .backup => exe_old_wide,
+            };
+            const fallback: ?[:0]const u16 = switch (source) {
+                .replacement => if (old_there) exe_old_wide else null,
+                .backup => if (new_there) exe_new_wide else null,
+            };
+            if (!restoreExeFile(first, exe_here_wide) and
+                (fallback == null or !restoreExeFile(fallback.?, exe_here_wide)))
+            {
+                return error.UpdateSwapRestoreFailed;
             }
         }
         // A .old backup left by a completed swap is safe to drop now. When
@@ -10033,24 +10044,13 @@ fn performUpdate(io: std.Io) !UpdateOutcome {
     // touched: exact size match against the digest-checked staged bytes.
     if (!update.replacementVerified(staged_exe_size, wideFileSize(exe_temp))) return error.UpdateCopyFailed;
 
-    for (pending.items, 0..) |p, i| {
-        if (i == exe_index.?) continue;
-        if (win.MoveFileExW(p.temp.ptr, p.dest.ptr, win.MOVEFILE_REPLACE_EXISTING) == 0) {
-            for (pending.items, 0..) |q, j| {
-                if (j != i and j != exe_index.?) _ = win.DeleteFileW(q.temp.ptr);
-            }
-            _ = win.DeleteFileW(exe_temp.ptr);
-            return error.UpdateCopyFailed;
-        }
-    }
-
     const exe_old = try std.fmt.allocPrint(allocator, "{s}\\{s}.old", .{ exe_dir, exe_name });
     defer allocator.free(exe_old);
     const exe_old_wide = try utf8ToWide(allocator, exe_old);
     defer allocator.free(exe_old_wide);
-    // Rename the live exe aside. A failure here leaves it in place; the
-    // usual cause is a leftover process holding .old, so end the orphans
-    // and retry once.
+    // Rename the live exe aside. A failure here leaves it in place and
+    // nothing else has been touched; the usual cause is a leftover process
+    // holding .old, so end the orphans and retry once.
     if (win.MoveFileExW(exe_wide.ptr, exe_old_wide.ptr, win.MOVEFILE_REPLACE_EXISTING) == 0) {
         clearStaleOrphans();
         if (win.MoveFileExW(exe_wide.ptr, exe_old_wide.ptr, win.MOVEFILE_REPLACE_EXISTING) == 0) return error.UpdateSwapFailed;
@@ -10060,6 +10060,20 @@ fn performUpdate(io: std.Io) !UpdateOutcome {
         // .new replacement also remains on disk for the next recovery pass.
         if (!restoreExeFile(exe_old_wide, exe_wide)) return error.UpdateSwapRestoreFailed;
         return error.UpdateCopyFailed;
+    }
+    // The new exe is in place; now the support files. On a failure the old
+    // exe comes back — closest to the pre-update state. ponytail: a full
+    // per-file rollback journal is out of scope; leftover temps and a stale
+    // .old are cleared on the next update attempt.
+    for (pending.items, 0..) |p, i| {
+        if (i == exe_i) continue;
+        if (win.MoveFileExW(p.temp.ptr, p.dest.ptr, win.MOVEFILE_REPLACE_EXISTING) == 0) {
+            for (pending.items, 0..) |q, j| {
+                if (j != i and j != exe_i) _ = win.DeleteFileW(q.temp.ptr);
+            }
+            _ = restoreExeFile(exe_old_wide, exe_wide);
+            return error.UpdateCopyFailed;
+        }
     }
     _ = win.DeleteFileW(exe_old_wide.ptr); // best effort; a leftover is removed on the next update attempt
     return .installed;
