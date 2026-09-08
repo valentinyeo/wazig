@@ -2219,19 +2219,17 @@ fn applySlackHistory(a: *App, raw: []const u8) void {
             if (message.from_me and message.send_state != .none) saved_count += 1;
         }
         if (saved_count > 0) {
-            if (a.allocator.alloc(Message, saved_count)) |buffer| {
-                saved = buffer;
-                var filled: usize = 0;
-                for (a.messages[0..a.message_count]) |*message| {
-                    if (message.from_me and message.send_state != .none) {
-                        saved[filled] = message.*;
-                        filled += 1;
-                    }
+            // On allocation failure abort the refresh: clearing the view would
+            // permanently lose the bubbles still awaiting resolution.
+            saved = a.allocator.alloc(Message, saved_count) catch return;
+            var filled: usize = 0;
+            for (a.messages[0..a.message_count]) |*message| {
+                if (message.from_me and message.send_state != .none) {
+                    saved[filled] = message.*;
+                    filled += 1;
                 }
-                saved_count = filled;
-            } else |_| {
-                saved_count = 0;
             }
+            saved_count = filled;
         }
     }
     defer if (saved.len > 0) a.allocator.free(saved);
