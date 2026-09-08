@@ -1909,7 +1909,14 @@ fn parseTgApiId(text: []const u8) ?i32 {
 }
 
 fn validTgApiHash(text: []const u8) bool {
-    return text.len >= 32;
+    // my.telegram.org shows exactly 32 hex characters; anything else is a
+    // copy mistake and must not be persisted.
+    if (text.len != 32) return false;
+    for (text) |c| {
+        const hex = (c >= '0' and c <= '9') or (c >= 'a' and c <= 'f') or (c >= 'A' and c <= 'F');
+        if (!hex) return false;
+    }
+    return true;
 }
 
 /// Shows an error inside the sign-in dialog, keeping the current step's
@@ -10676,8 +10683,11 @@ test "telegram api_id parsing accepts positive numbers only" {
     try std.testing.expectEqual(@as(?i32, null), parseTgApiId("-4"));
 }
 
-test "telegram api_hash must be the full 32-character value" {
+test "telegram api_hash must be exactly 32 hex characters" {
     try std.testing.expect(validTgApiHash("0123456789abcdef0123456789abcdef"));
+    try std.testing.expect(validTgApiHash("0123456789ABCDEF0123456789ABCDEF"));
     try std.testing.expect(!validTgApiHash("0123456789abcdef"));
     try std.testing.expect(!validTgApiHash(""));
+    try std.testing.expect(!validTgApiHash("0123456789abcdef0123456789abcdeg"));
+    try std.testing.expect(!validTgApiHash("0123456789abcdef0123456789abcdef0"));
 }
