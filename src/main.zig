@@ -1481,6 +1481,17 @@ fn refreshChats(a: *App) void {
     a.chats_pending_flags = flags;
 }
 
+/// WAZI-76: wacli can return rows that are not addressable chats — the jid is
+/// a bare hex id with no @server part, no name resolves, and the kind stays
+/// "unknown". A real WhatsApp jid always carries an @server suffix, so an
+/// unknown-kind row that falls back to its raw jid as the name is storage
+/// noise, not a hidden conversation. Drop it instead of rendering hex.
+fn isUnresolvableChatEntry(name: []const u8, jid: []const u8, kind: []const u8) bool {
+    if (!std.mem.eql(u8, kind, "unknown")) return false;
+    if (std.mem.indexOfScalar(u8, jid, '@') != null) return false;
+    return name.len == 0 or std.mem.eql(u8, name, jid);
+}
+
 /// Returns true only when the payload was fully parsed into the chat list,
 /// so the caller can decide whether it is safe to persist as the launch
 /// snapshot (WAZI-67): a malformed response must never overwrite the last
@@ -1556,6 +1567,7 @@ fn applyChats(a: *App, raw: []const u8) bool {
         const jid = getString(object, "jid");
         const raw_name = getString(object, "name");
         const display_name = groupName(a, jid) orelse raw_name;
+        if (isUnresolvableChatEntry(display_name, jid, getString(object, "kind"))) continue;
         if (query_utf8) |query| {
             if (!containsIgnoreCase(display_name, query) and !containsIgnoreCase(jid, query)) continue;
         }
@@ -11240,4 +11252,17 @@ test "telegram api_hash rejection text covers both validation rules" {
     try std.testing.expect(std.mem.indexOf(u8, tg_api_hash_error, "hexadecimal") != null);
     try std.testing.expect(std.mem.indexOf(u8, tg_api_hash_error, "too short") == null);
     try std.testing.expect(std.mem.indexOf(u8, tg_api_hash_error, "letters and digits") == null);
+}
+
+test "unresolvable chat entries are dropped, real chats are kept" {
+    // WAZI-76 junk row: bare hex jid, no name, kind unknown.
+    try std.testing.expect(isUnresolvableChatEntry("00C6AD6F2E64", "00C6AD6F2E64", "unknown"));
+    try std.testing.expect(isUnresolvableChatEntry("", "00C6AD6F2E64", "unknown"));
+    // A real contact or group jid always carries an @server part.
+    try std.testing.expect(!isUnresolvableChatEntry("00C6AD6F2E64", "4917012345678@s.whatsapp.net", "dm"));
+    try std.testing.expect(!isUnresolvableChatEntry("Team", "120363...@g.us", "unknown"));
+    // Unknown kind is not enough on its own: a jid with a server part stays.
+    try std.testing.expect(!isUnresolvableChatEntry("", "4917012345678@s.whatsapp.net", "unknown"));
+    // A named chat resolves even when wacli reports no type.
+    try std.testing.expect(!isUnresolvableChatEntry("Mum", "00C6AD6F2E64", "unknown"));
 }
