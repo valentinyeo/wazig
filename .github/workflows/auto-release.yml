@@ -85,7 +85,7 @@ jobs:
             fi
             read -r running done_ok < <(echo "${runs_json}" | jq -r --arg tag "${tag}" '
               map(select((.event == "push" or .event == "workflow_dispatch") and .headBranch == $tag))
-              | [(map(select(.status == "queued" or .status == "in_progress")) | length), (map(select(.conclusion == "success")) | length)]
+              | [(map(select(.status != "completed")) | length), (map(select(.conclusion == "success")) | length)]
               | "\(.[0]) \(.[1])"')
             if [ "${running:-0}" -ge 1 ] 2>/dev/null || [ "${done_ok:-0}" -ge 1 ] 2>/dev/null; then
               echo "HEAD already carries a release tag and its release ran or is running"
