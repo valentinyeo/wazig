@@ -75,9 +75,18 @@ jobs:
           # job here instead of skipping: dispatch at the existing tag.
           tag="$(git tag -l 'v*' --points-at HEAD | grep -E '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' | tail -1 || true)"
           if [ -n "${tag}" ]; then
-            read -r running done_ok < <(gh run list -R "${GITHUB_REPOSITORY}" -w release \
-              --json event,headBranch,headSha,status,conclusion \
-              -q '[.[] | select((.event == "push" or .event == "workflow_dispatch") and .headBranch == "'"${tag}"'" and .headSha == "'"$(git rev-parse HEAD)"'")] | [([.[] | select(.status == "queued" or .status == "in_progress")] | length), ([.[] | select(.conclusion == "success")] | length)] | "\(.[0]) \(.[1])"' 2>/dev/null || echo "0 0")
+            # Server-side commit filter and a generous limit, so old tags and
+            # page truncation cannot hide a completed release run.
+            runs_json="$(gh run list -R "${GITHUB_REPOSITORY}" -w release --commit "$(git rev-parse HEAD)" -L 50 \
+              --json event,headBranch,headSha,status,conclusion 2>/dev/null)" || runs_json=""
+            if [ -z "${runs_json}" ]; then
+              echo "could not query release runs for this commit; failing closed" >&2
+              exit 1
+            fi
+            read -r running done_ok < <(echo "${runs_json}" | jq -r '
+              map(select((.event == "push" or .event == "workflow_dispatch") and .headBranch == "${tag}"))
+              | [(map(select(.status == "queued" or .status == "in_progress")) | length), (map(select(.conclusion == "success")) | length)]
+              | "\(.[0]) \(.[1])"')
             if [ "${running:-0}" -ge 1 ] 2>/dev/null || [ "${done_ok:-0}" -ge 1 ] 2>/dev/null; then
               echo "HEAD already carries a release tag and its release ran or is running"
               echo "skip=true" >> "$GITHUB_ENV"
@@ -190,9 +199,9 @@ jobs:
           # release.yml is re-run safe (create-or-clobber upload) either way.
           for _ in 1 2 3 4 5 6; do
             sleep 10
-            started="$(gh run list -R "${GITHUB_REPOSITORY}" -w release \
+            started="$(gh run list -R "${GITHUB_REPOSITORY}" -w release --commit "${sha}" -L 50 \
               --json event,headBranch,headSha \
-              -q "[.[] | select((.event == \"push\" or .event == \"workflow_dispatch\") and .headBranch == \"${next_tag}\" and .headSha == \"${sha}\")] | length")"
+              -q "[.[] | select((.event == \"push\" or .event == \"workflow_dispatch\") and .headBranch == \"${next_tag}\")] | length")"
             if [ "${started}" != "0" ]; then
               echo "release run started by the tag push"
               echo "### Released ${next_tag}" >> "$GITHUB_STEP_SUMMARY"

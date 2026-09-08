@@ -71,6 +71,14 @@ jobs:
                 sleep 15
                 # Only a numeric count of at least one successful run counts;
                 # a failed query must not be read as "ci started".
+                # If main moved on, the newer commit carries the ci run that
+                # feeds the release pipeline; our commit is no longer head.
+                main_now=$(gh api "repos/$REPO/commits/main" --jq .sha 2>/dev/null) || main_now=""
+                if [ -n "${main_now}" ] && [ "${main_now}" != "${merged_oid}" ]; then
+                  echo "#$pr: main advanced to ${main_now}; its ci run feeds the release"
+                  ci_started=1
+                  break
+                fi
                 # Any run for the commit (even queued) proves the dispatch
                 # landed; re-dispatching while ci is merely slow would only
                 # duplicate runs.
