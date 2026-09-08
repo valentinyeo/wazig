@@ -83,8 +83,8 @@ jobs:
               echo "could not query release runs for this commit; failing closed" >&2
               exit 1
             fi
-            read -r running done_ok < <(echo "${runs_json}" | jq -r '
-              map(select((.event == "push" or .event == "workflow_dispatch") and .headBranch == "${tag}"))
+            read -r running done_ok < <(echo "${runs_json}" | jq -r --arg tag "${tag}" '
+              map(select((.event == "push" or .event == "workflow_dispatch") and .headBranch == $tag))
               | [(map(select(.status == "queued" or .status == "in_progress")) | length), (map(select(.conclusion == "success")) | length)]
               | "\(.[0]) \(.[1])"')
             if [ "${running:-0}" -ge 1 ] 2>/dev/null || [ "${done_ok:-0}" -ge 1 ] 2>/dev/null; then
