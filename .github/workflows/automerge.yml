@@ -64,7 +64,11 @@ jobs:
               # current main head, so if main advances between merge and
               # dispatch the intermediate commit may miss its own release;
               # only main HEAD is ever tagged anyway.
-              merged_oid=$(gh pr view "$pr" -R "$REPO" --json mergeCommit -q .mergeCommit.oid)
+              merged_oid=$(gh pr view "$pr" -R "$REPO" --json mergeCommit -q .mergeCommit.oid) || merged_oid=""
+              if ! echo "${merged_oid}" | grep -Eq '^[0-9a-f]{40}$'; then
+                echo "#$pr: could not resolve the merge commit; not starting ci" >&2
+                exit 1
+              fi
               ci_started=""
               for _ in 1 2 3; do
                 gh workflow run ci.yml -R "$REPO" --ref main
