@@ -1674,14 +1674,20 @@ fn drainTelegram(a: *App) void {
                     .wait_code => telegramAuthPrompt(a, .code),
                     .wait_password => telegramAuthPrompt(a, .password),
                     .ready => {
+                        // Dismiss the window only if it is the login prompt;
+                        // a command palette the user opened must survive.
+                        const login_open = a.tg_login != .none;
                         a.tg_login = .none;
+                        if (login_open) closePalette(a);
                         client.requestChats();
                         setStatus(a, "Telegram connected");
                     },
                     .closed => {
+                        // Same rule as .ready: an unrelated palette stays up.
+                        const login_open = a.tg_login != .none;
                         a.tg_login = .none;
                         a.tg_chat_count = 0;
-                        if (a.palette != null) closePalette(a);
+                        if (login_open) closePalette(a);
                         refreshChats(a);
                         setStatus(a, "Telegram disconnected");
                     },
@@ -1866,13 +1872,38 @@ fn openTelegramLogin(a: *App, mode: TgLoginMode) void {
         .api_hash => "Telegram: type your api_hash and press Enter",
         .none => "Telegram",
     });
-    if (a.palette == null) {
-        // Login is its own prompt, not the command palette (WAZI-72): no
-        // command list behind the input box.
+    // The login prompt is its own input, not the command palette (WAZI-72):
+    // the api key steps keep only the my.telegram.org entry, other steps
+    // list no commands at all.
+    if (mode == .api_id or mode == .api_hash) {
         a.palette_item_count = 0;
+        appendPalette(a, "Open the Telegram app page (my.telegram.org/apps) in your browser", "", command_tg_open_apps);
+    } else {
+        a.palette_item_count = 0;
+    }
+    if (a.palette == null) {
         showPaletteWindow(a);
+    } else {
+        // Reusing an open window: refresh the cue and the item list for the
+        // new step, or the previous step's text lingers.
+        setPaletteCue(a);
+        if (a.palette_edit) |edit| _ = win.SetWindowTextW(edit, lit(""));
+        paletteFilter(a);
     }
     if (a.palette_edit) |edit| _ = win.SetFocus(edit);
+}
+
+fn setPaletteCue(a: *App) void {
+    const edit = a.palette_edit orelse return;
+    const cue: [*:0]const u16 = if (a.tg_login != .none) switch (a.tg_login) {
+        .phone => lit("Your phone number"),
+        .code => lit("Login code"),
+        .password => lit("2FA password"),
+        .api_id => lit("api_id"),
+        .api_hash => lit("api_hash"),
+        .none => lit(""),
+    } else if (a.palette_accounts_mode) lit("Accounts") else lit("Type a command");
+    _ = win.SendMessageW(edit, win.EM_SETCUEBANNER, 1, @bitCast(@intFromPtr(cue)));
 }
 
 fn handleTgLoginInput(a: *App) void {
@@ -6686,19 +6717,7 @@ fn showPaletteWindow(a: *App) void {
     a.palette_list = win.CreateWindowExW(0, lit("LISTBOX"), null, win.WS_CHILD | win.WS_VISIBLE | win.LBS_NOTIFY | win.LBS_OWNERDRAWFIXED | win.LBS_NOINTEGRALHEIGHT, 1, palette_edit_zone, palette_width - 2 - scrollbar_width, palette_max_rows * palette_row_height + 12, palette, controlId(id_palette_list), a.instance, null);
     setFont(a.palette_edit, a.font);
     setFont(a.palette_list, a.font);
-    if (a.palette_edit) |edit| {
-        // In Telegram login mode the box is a single-field login prompt, so
-        // the cue names what to type instead of "Type a command".
-        const cue: [*:0]const u16 = if (a.tg_login != .none) switch (a.tg_login) {
-            .phone => lit("Your phone number"),
-            .code => lit("Login code"),
-            .password => lit("2FA password"),
-            .api_id => lit("api_id"),
-            .api_hash => lit("api_hash"),
-            .none => lit(""),
-        } else if (a.palette_accounts_mode) lit("Accounts") else lit("Type a command");
-        _ = win.SendMessageW(edit, win.EM_SETCUEBANNER, 1, @bitCast(@intFromPtr(cue)));
-    }
+    setPaletteCue(a);
     if (a.palette_list) |list| _ = win.SendMessageW(list, win.LB_SETITEMHEIGHT, 0, palette_row_height);
     paletteFilter(a);
     _ = win.ShowWindow(palette, win.SW_SHOW);
