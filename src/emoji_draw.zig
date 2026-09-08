@@ -54,8 +54,36 @@ fn fail(stage: ErrorStage) bool {
     if (state.last_error != stage) {
         state.last_error = stage;
         state.announced = false;
+        logStage(stage);
     }
     return false;
+}
+
+/// Every new failure stage gets a timestamped line in
+/// %LOCALAPPDATA%\Wazig\emoji.log (WAZI-65): the diagnosis must not depend on
+/// anyone running the "Why are emoji black and white?" palette command.
+fn logStage(stage: ErrorStage) void {
+    var path: [280]u16 = undefined;
+    const local_label = std.unicode.utf8ToUtf16LeStringLiteral("LOCALAPPDATA");
+    const local_len: usize = @intCast(win.GetEnvironmentVariableW(local_label, &path, path.len - 40));
+    if (local_len == 0 or local_len >= path.len - 40) return;
+    const suffix = std.unicode.utf8ToUtf16LeStringLiteral("\\Wazig\\emoji.log");
+    @memcpy(path[local_len..][0..suffix.len], suffix);
+    const total = local_len + suffix.len;
+    path[total] = 0;
+    // Ignore the "already exists" error; only a missing directory matters.
+    _ = win.CreateDirectoryW(path[0 .. local_len + 7 :0].ptr, null);
+    var clock = std.mem.zeroes(win.SYSTEMTIME);
+    win.GetLocalTime(&clock);
+    var line_buf: [256]u8 = undefined;
+    const line = std.fmt.bufPrint(&line_buf, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2} colour emoji fell back at stage {s}: {s}\r\n", .{
+        clock.wYear, clock.wMonth, clock.wDay, clock.wHour, clock.wMinute, clock.wSecond, @tagName(stage), stageText(stage),
+    }) catch return;
+    const handle = win.CreateFileW(path[0..total :0].ptr, win.FILE_APPEND_DATA, win.FILE_SHARE_READ | win.FILE_SHARE_WRITE, null, win.OPEN_ALWAYS, win.FILE_ATTRIBUTE_NORMAL, null);
+    if (handle == win.INVALID_HANDLE_VALUE or handle == null) return;
+    defer _ = win.CloseHandle(handle);
+    var written: win.DWORD = 0;
+    _ = win.WriteFile(handle, line.ptr, @intCast(line.len), &written, null);
 }
 
 fn clearError() void {
@@ -116,7 +144,9 @@ fn ensureTarget(hdc: win.HDC) bool {
         var props = win.D2D1_RENDER_TARGET_PROPERTIES{
             .type = win.D2D1_RENDER_TARGET_TYPE_SOFTWARE,
             .pixelFormat = .{
-                .format = win.DXGI_FORMAT_B8G8R8A8_UNORM,
+                // DC render targets only accept DXGI_FORMAT_UNKNOWN (D2D
+                // rejects a concrete format); this was the WAZI-65 fallback.
+                .format = win.DXGI_FORMAT_UNKNOWN,
                 .alphaMode = win.D2D1_ALPHA_MODE_PREMULTIPLIED,
             },
             .dpiX = 96.0,
