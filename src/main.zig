@@ -9384,10 +9384,14 @@ fn clearStaleOrphans() void {
     if (exe_len == 0 or exe_len >= exe_buf.len) return;
 
     // First pass: pids that own a visible window anywhere on the desktop.
+    // The list is bounded; if it overflows we skip orphan cleanup entirely
+    // rather than risk misreading a live copy as windowless.
     var visible: [64]win.DWORD = undefined;
     var visible_count: usize = 0;
-    const ctx = VisibleWindowScan{ .pids = &visible, .count = &visible_count };
+    var visible_overflow = false;
+    const ctx = VisibleWindowScan{ .pids = &visible, .count = &visible_count, .overflow = &visible_overflow };
     _ = win.EnumWindows(visibleWindowProc, @bitCast(@intFromPtr(&ctx)));
+    if (visible_overflow) return;
 
     const TH32CS_SNAPPROCESS = 0x00000002;
     const snapshot = win.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) orelse return;
@@ -9420,6 +9424,7 @@ fn clearStaleOrphans() void {
 const VisibleWindowScan = struct {
     pids: []win.DWORD,
     count: *usize,
+    overflow: *bool,
 };
 
 fn visibleWindowProc(hwnd: win.HWND, lparam: win.LPARAM) callconv(.winapi) win.BOOL {
@@ -9427,10 +9432,12 @@ fn visibleWindowProc(hwnd: win.HWND, lparam: win.LPARAM) callconv(.winapi) win.B
         const scan: *VisibleWindowScan = @ptrFromInt(@as(usize, @bitCast(lparam)));
         var pid: win.DWORD = 0;
         _ = win.GetWindowThreadProcessId(hwnd, &pid);
-        if (scan.count.* < scan.pids.len) {
-            scan.pids[scan.count.*] = pid;
-            scan.count.* += 1;
+        if (scan.count.* >= scan.pids.len) {
+            scan.overflow.* = true;
+            return 0; // Stop enumerating; the caller will not kill anything.
         }
+        scan.pids[scan.count.*] = pid;
+        scan.count.* += 1;
     }
     return 1;
 }
