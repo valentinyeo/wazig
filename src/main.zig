@@ -6,6 +6,7 @@ const dictation = @import("dictation.zig");
 const slack = @import("slack.zig");
 const slack_win = @import("slack_win.zig");
 const played = @import("played.zig");
+const pending_reads = @import("pending_reads.zig");
 const chat_order = @import("chat_order.zig");
 const compose_layout = @import("compose_layout.zig");
 const media_age = @import("media_age.zig");
@@ -2915,11 +2916,6 @@ fn requeueFailedRead(a: *App) bool {
 // because the store's unread state only clears once the write lands.
 fn persistPendingReads(a: *App) void {
     if (a.read_path.len == 0) return;
-    const wide = std.unicode.utf8ToUtf16LeAllocZ(a.allocator, a.read_path) catch return;
-    defer a.allocator.free(wide);
-    const handle = win.CreateFileW(wide.ptr, win.GENERIC_WRITE, win.FILE_SHARE_READ, null, win.CREATE_ALWAYS, win.FILE_ATTRIBUTE_NORMAL, null);
-    if (handle == win.INVALID_HANDLE_VALUE or handle == null) return;
-    defer _ = win.CloseHandle(handle);
     var buffer: [max_pending_reads * 192]u8 = undefined;
     var total: usize = 0;
     for (a.pending_reads[0..a.pending_read_count]) |entry| {
@@ -2930,30 +2926,35 @@ fn persistPendingReads(a: *App) void {
         buffer[total] = '\n';
         total += 1;
     }
-    var written: win.DWORD = 0;
-    _ = win.WriteFile(handle, &buffer, @intCast(total), &written, null);
+    // Write to a sibling temp file and swap it in: CREATE_ALWAYS on the
+    // queue file itself would truncate the last good queue before the new
+    // one is written, and a failed or partial write would destroy it.
+    const temp_path = std.fmt.allocPrint(a.allocator, "{s}.new", .{a.read_path}) catch return;
+    defer a.allocator.free(temp_path);
+    const wide = std.unicode.utf8ToUtf16LeAllocZ(a.allocator, temp_path) catch return;
+    defer a.allocator.free(wide);
+    const handle = win.CreateFileW(wide.ptr, win.GENERIC_WRITE, 0, null, win.CREATE_ALWAYS, win.FILE_ATTRIBUTE_NORMAL, null);
+    if (handle == win.INVALID_HANDLE_VALUE or handle == null) return;
+    var written_total: usize = 0;
+    var ok = true;
+    while (ok and written_total < total) {
+        var written: win.DWORD = 0;
+        if (win.WriteFile(handle, buffer[written_total..].ptr, @intCast(total - written_total), &written, null) == 0 or written == 0) ok = false;
+        written_total += written;
+    }
+    _ = win.CloseHandle(handle);
+    if (!ok or written_total != total) return;
+    const target = std.unicode.utf8ToUtf16LeAllocZ(a.allocator, a.read_path) catch return;
+    defer a.allocator.free(target);
+    // A full write landed; replacing the queue now cannot leave a truncated
+    // store behind. If the swap itself fails the in-memory queue is still
+    // accurate and WM_DESTROY re-persists (retries the swap) on exit.
+    _ = win.MoveFileExW(wide.ptr, target.ptr, win.MOVEFILE_REPLACE_EXISTING);
 }
 
 /// Fills `out` from the one-jid-per-line queue file, dropping duplicates and
 /// entries that do not fit. Runs at startup, before the frame loop starts
 /// draining via startNextMarkRead.
-pub fn parsePendingReads(contents: []const u8, out: *[max_pending_reads]Utf8Text(191)) usize {
-    var count: usize = 0;
-    var lines = std.mem.tokenizeAny(u8, contents, "\r\n");
-    while (lines.next()) |line| {
-        if (line.len == 0 or line.len > 191) continue;
-        var seen = false;
-        for (out[0..count]) |entry| {
-            if (std.mem.eql(u8, entry.slice(), line)) seen = true;
-        }
-        if (seen) continue;
-        out[count].set(line);
-        count += 1;
-        if (count == max_pending_reads) break;
-    }
-    return count;
-}
-
 fn loadPendingReads(a: *App) void {
     if (a.read_path.len == 0) return;
     const wide = std.unicode.utf8ToUtf16LeAllocZ(a.allocator, a.read_path) catch return;
@@ -2969,7 +2970,14 @@ fn loadPendingReads(a: *App) void {
         if (got == 0) break;
         total += got;
     }
-    a.pending_read_count = parsePendingReads(buffer[0..total], &a.pending_reads);
+    var parsed: [pending_reads.max_pending_reads][pending_reads.max_jid_len + 1]u8 = undefined;
+    const count = pending_reads.parse(buffer[0..total], &parsed);
+    a.pending_read_count = 0;
+    for (parsed[0..count]) |entry| {
+        const jid = pending_reads.term(entry[0..]);
+        a.pending_reads[a.pending_read_count].set(jid);
+        a.pending_read_count += 1;
+    }
 }
 
 // The mark-read write used to run on the UI thread with the sync child
@@ -8780,7 +8788,9 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
             // Flush reads that never reached the store: the write may have
             // been queued, in flight, or killed mid-run, and mark-read is
             // idempotent so retrying next launch is always safe (WAZI-74).
-            persistPendingReads(a);
+            // After spawn failures the queue is dead but its file is the
+            // only copy of those reads — never overwrite it from memory.
+            if (!a.read_queue_dead) persistPendingReads(a);
             // ponytail: the Socket Mode thread stops at its next frame or at
             // process exit, whichever comes first; upgrade path is a stored
             // socket handle closed here to unblock the receive immediately.
@@ -10266,22 +10276,4 @@ test "sender name shows only at the start of a same-sender run" {
     a.messages[1].from_me = false;
     a.messages[1].sender_jid.set("111@g.us");
     try std.testing.expect(!showSenderName(&a, 2));
-}
-
-test "parsePendingReads dedupes, caps, and skips junk lines" {
-    var out: [max_pending_reads]Utf8Text(191) = [_]Utf8Text(191){.{}} ** max_pending_reads;
-    const count = parsePendingReads("123@s.whatsapp.net\n\nbad-but-not-a-jid\n123@s.whatsapp.net\n456@g.us\n", &out);
-    try std.testing.expectEqual(@as(usize, 2), count);
-    try std.testing.expectEqualStrings("123@s.whatsapp.net", out[0].slice());
-    try std.testing.expectEqualStrings("456@g.us", out[1].slice());
-    // Entries past the queue capacity are dropped, not overflowed.
-    var overflow: [max_pending_reads]Utf8Text(191) = [_]Utf8Text(191){.{}} ** max_pending_reads;
-    var contents: std.ArrayList(u8) = .empty;
-    defer contents.deinit(std.testing.allocator);
-    var index: usize = 0;
-    while (index < max_pending_reads + 3) : (index += 1) {
-        try contents.print(std.testing.allocator, "{d}@s.whatsapp.net\n", .{index});
-    }
-    const capped = parsePendingReads(contents.items, &overflow);
-    try std.testing.expectEqual(@as(usize, max_pending_reads), capped);
 }
