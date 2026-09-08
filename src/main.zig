@@ -9827,6 +9827,19 @@ fn filetimeAgeSeconds(created: win.FILETIME) u64 {
     return (now_64 - created_64) / 10_000_000;
 }
 
+/// Tri-state file lookup: true/false when the lookup answers, null when it
+/// fails for a reason other than a missing file (access, sharing, I/O). A
+/// null answer means the disk state is unknown and the caller must not
+/// delete or restore anything based on it.
+fn filePresentLookup(path_wide: [*:0]const u16) ?bool {
+    // The last-error value is only meaningful when the lookup failed; a
+    // successful lookup does not clear it.
+    if (win.GetFileAttributesW(path_wide) != win.INVALID_FILE_ATTRIBUTES) return true;
+    const err = win.GetLastError();
+    if (err == 2 or err == 3) return false; // ERROR_FILE_NOT_FOUND / ERROR_PATH_NOT_FOUND
+    return null;
+}
+
 /// Windows paths are case-insensitive and the reporting of casing varies,
 /// so compare without case.
 fn eqlWideIgnoreCase(a: []const u16, b: []const u16) bool {
@@ -9905,17 +9918,25 @@ fn performUpdate(io: std.Io) !UpdateOutcome {
         // delete leaves the file behind, a stale orphan copy still locks it
         // (WAZI-66): end the orphans here too — not only on mutex contention —
         // and retry, so the commit rename onto .old cannot hit a locked file.
-        const exe_present = win.GetFileAttributesW(exe_here_wide.ptr) != win.INVALID_FILE_ATTRIBUTES;
-        const old_present = win.GetFileAttributesW(exe_old_wide.ptr) != win.INVALID_FILE_ATTRIBUTES;
+        const exe_here = filePresentLookup(exe_here_wide.ptr) orelse return error.UpdateSwapStateUnknown;
+        const old_there = filePresentLookup(exe_old_wide.ptr) orelse return error.UpdateSwapStateUnknown;
         // Only delete the backup when the current exe is in place; an absent
         // exe means the swap was interrupted and the backup is the last
         // runnable copy, which must be restored instead.
-        const old_delete_succeeded = exe_present and win.DeleteFileW(exe_old_wide.ptr) != 0;
-        switch (update.oldBackupAction(exe_present, old_present, old_delete_succeeded)) {
-            .restore => _ = win.MoveFileExW(exe_old_wide.ptr, exe_here_wide.ptr, win.MOVEFILE_REPLACE_EXISTING),
+        const old_delete_succeeded = exe_here and win.DeleteFileW(exe_old_wide.ptr) != 0;
+        switch (update.oldBackupAction(exe_here, old_there, old_delete_succeeded)) {
+            .restore => {
+                // The exe is gone; if the backup cannot come back, the folder
+                // would be left without a runnable copy — abort instead.
+                if (win.MoveFileExW(exe_old_wide.ptr, exe_here_wide.ptr, win.MOVEFILE_REPLACE_EXISTING) == 0) return error.UpdateSwapRestoreFailed;
+            },
             .clear_orphans_and_retry => {
                 clearStaleOrphans();
                 _ = win.DeleteFileW(exe_old_wide.ptr);
+                // Still present after the retry: the lock persists and the
+                // commit rename onto .old would fail — abort with a distinct
+                // error instead of starting the download.
+                if (filePresentLookup(exe_old_wide.ptr) != false) return error.UpdateOldBackupLocked;
             },
             .none => {},
         }
