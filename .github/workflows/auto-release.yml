@@ -1,0 +1,114 @@
+# Cut a release whenever app code lands on main.
+#
+# release.yml already builds and publishes from a vX.Y.Z tag, and takes the
+# version straight from the tag name. So releasing automatically just means
+# creating that tag automatically, once CI has gone green on the commit.
+name: auto-release
+
+on:
+  workflow_run:
+    workflows: ["ci"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "Which part of the version to bump"
+        type: choice
+        options: [patch, minor]
+        default: patch
+
+concurrency:
+  group: auto-release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  tag:
+    name: tag
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Only ever tag a commit CI has passed. A manual run is trusted.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Refuse to tag a commit that is no longer the head of main
+        if: github.event_name == 'workflow_run'
+        env:
+          TESTED_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          head="$(git rev-parse HEAD)"
+          if [ "${head}" != "${TESTED_SHA}" ]; then
+            echo "main has moved on (tested ${TESTED_SHA}, head ${head})."
+            echo "The newer commit gets its own CI run and its own release."
+            echo "skip=true" >> "$GITHUB_ENV"
+          fi
+
+      - name: Honour [skip release]
+        if: env.skip != 'true'
+        run: |
+          subject="$(git log -1 --pretty=%B)"
+          case "${subject}" in
+            *"[skip release]"*|*"[release skip]"*)
+              echo "commit asks for no release"
+              echo "skip=true" >> "$GITHUB_ENV" ;;
+          esac
+
+      - name: Release only when the app itself changed
+        if: env.skip != 'true'
+        run: |
+          last="$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -1)"
+          if [ -z "${last}" ]; then
+            echo "no previous tag, treating as releasable"
+            echo "last_tag=v0.0.0" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          echo "last_tag=${last}" >> "$GITHUB_ENV"
+
+          # Anything that ends up inside the shipped binary or installer.
+          if git diff --name-only "${last}..HEAD" \
+             | grep -qE '^(src/|assets/|vendor/|build\.zig)'; then
+            echo "app changed since ${last}"
+          else
+            echo "only non-app files changed since ${last}, no release"
+            echo "skip=true" >> "$GITHUB_ENV"
+          fi
+
+      - name: Work out the next version
+        if: env.skip != 'true'
+        env:
+          BUMP: ${{ inputs.bump || 'patch' }}
+        run: |
+          v="${last_tag#v}"
+          major="${v%%.*}"; rest="${v#*.}"
+          minor="${rest%%.*}"; patch="${rest#*.}"
+          case "${BUMP}" in
+            minor) minor=$((minor + 1)); patch=0 ;;
+            *)     patch=$((patch + 1)) ;;
+          esac
+          next="v${major}.${minor}.${patch}"
+          if git rev-parse -q --verify "refs/tags/${next}" >/dev/null; then
+            echo "${next} already exists, refusing to move it"
+            echo "skip=true" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          echo "next_tag=${next}" >> "$GITHUB_ENV"
+          echo "Releasing ${last_tag} -> ${next}"
+
+      - name: Tag it
+        if: env.skip != 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "${next_tag}" -m "${next_tag}"
+          git push origin "${next_tag}"
+          echo "### Released ${next_tag}" >> "$GITHUB_STEP_SUMMARY"
+          echo "Tag pushed; the release workflow builds and publishes it." >> "$GITHUB_STEP_SUMMARY"
