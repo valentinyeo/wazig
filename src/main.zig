@@ -2427,7 +2427,7 @@ fn slackSetupProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam:
             _ = win.CreateWindowExW(0, lit("EDIT"), null, win.WS_CHILD | win.WS_VISIBLE | win.WS_BORDER | win.ES_AUTOHSCROLL | win.ES_PASSWORD, 16, 38, 360, 26, hwnd, controlId(id_slack_user_edit), a.instance, null);
             _ = win.CreateWindowExW(0, lit("STATIC"), lit("App token (xapp-) for Socket Mode"), win.WS_CHILD | win.WS_VISIBLE, 16, 74, 360, 20, hwnd, null, a.instance, null);
             _ = win.CreateWindowExW(0, lit("EDIT"), null, win.WS_CHILD | win.WS_VISIBLE | win.WS_BORDER | win.ES_AUTOHSCROLL | win.ES_PASSWORD, 16, 96, 360, 26, hwnd, controlId(id_slack_app_edit), a.instance, null);
-            const save = win.CreateWindowExW(0, lit("BUTTON"), lit("Save"), win.WS_CHILD | win.WS_VISIBLE | win.WS_TABSTOP | win.BS_OWNERDRAW, 0, 0, 90, 30, hwnd, controlId(id_slack_save), a.instance, null);
+            const save = win.CreateWindowExW(0, lit("BUTTON"), lit("Save"), win.WS_CHILD | win.WS_VISIBLE | win.WS_TABSTOP | win.BS_OWNERDRAW | win.BS_DEFPUSHBUTTON, 0, 0, 90, 30, hwnd, controlId(id_slack_save), a.instance, null);
             const cancel = win.CreateWindowExW(0, lit("BUTTON"), lit("Cancel"), win.WS_CHILD | win.WS_VISIBLE | win.WS_TABSTOP | win.BS_OWNERDRAW, 0, 0, 90, 30, hwnd, controlId(id_slack_cancel), a.instance, null);
             setFont(save, a.font_bold);
             setFont(cancel, a.font_bold);
@@ -2536,6 +2536,12 @@ fn openSlackSetup(a: *App) void {
             break;
         }
         if (got < 0) break;
+        // Dialog navigation (Tab between fields, Enter presses the default
+        // Save button) works only when the pump routes through IsDialogMessage.
+        if (win.IsDialogMessageW(wnd, &msg) != 0) {
+            if (a.slack_setup_window == null) break;
+            continue;
+        }
         _ = win.TranslateMessage(&msg);
         _ = win.DispatchMessageW(&msg);
         if (a.slack_setup_window == null) break;
