@@ -4652,6 +4652,7 @@ fn applyMessageData(a: *App, raw: []const u8, final: bool) void {
         const id = getString(object, "MsgID");
         var text = getString(object, "DisplayText");
         if (text.len == 0) text = getString(object, "Text");
+        text = message_filter.stripPlaceholder(text);
         const revoked = getBool(object, "Revoked");
         const media_type = getString(object, "MediaType");
         const filename = getString(object, "Filename");
