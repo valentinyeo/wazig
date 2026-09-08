@@ -46,12 +46,13 @@ jobs:
                        or ([ $roll[] | select(.name == $r and .conclusion != "SUCCESS") ] | length) > 0
                      then $r else empty end ] )
               | join(",")')
-            reason=$(echo "$info" | jq -r '
+            reason=$(echo "$info" | jq -r --argjson gate '[".github/workflows/automerge.yml", ".github/workflows/ci.yml", ".github/workflows/release.yml", ".github/workflows/auto-release.yml"]' '
               if .isDraft then "draft"
               elif ([.labels[].name] | index("hold")) then "hold label"
-              elif ([.files[].path] | index(".github/workflows/automerge.yml", ".github/workflows/ci.yml", ".github/workflows/release.yml", ".github/workflows/auto-release.yml")) then "edits a release-gating workflow, needs manual review"
+              elif ([.files[].path] | map(select(. == $gate[])) | length) > 0 then "edits a release-gating workflow, needs manual review"
               elif .mergeable != "MERGEABLE" then "not mergeable (\(.mergeable))"
               else "" end')
+            if [ "${reason}" = "null" ] || [ -z "${reason}" ] && [ "$(echo "$info" | jq -r '.isDraft, .mergeable' | head -c 0)x" = "x" ]; then :; fi
             if [ -n "$blocked" ]; then reason="required checks not green: ${blocked}"; fi
             if [ -n "$reason" ]; then echo "#$pr: skip ($reason)"; continue; fi
             # --match-head-commit closes the race: if the PR head changes
