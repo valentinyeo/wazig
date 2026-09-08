@@ -126,7 +126,6 @@ const command_slack_disconnect = 2047;
 const command_slack_attach = 2048;
 const command_accounts_tg_remove = 2049;
 const command_accounts_tg_remove_confirm = 2050;
-const command_tg_open_apps = 2051;
 const command_update_check = 2052;
 const command_update_install = 2053;
 const command_emoji_diag = 2054;
@@ -435,9 +434,9 @@ const App = struct {
     send: ?win.HWND = null,
     emoji_btn: ?win.HWND = null,
     dictate: ?win.HWND = null,
-    // 0-2: composer buttons, 3-4: Slack setup dialog buttons.
-    btn_hover: [5]bool = .{ false, false, false, false, false },
-    btn_prev_proc: [5]usize = .{ 0, 0, 0, 0, 0 },
+    // 0-2: composer buttons, 3-4: Slack setup dialog, 5-7: Telegram login dialog.
+    btn_hover: [8]bool = .{ false, false, false, false, false, false, false, false },
+    btn_prev_proc: [8]usize = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
     tooltips: ?win.HWND = null,
     status: ?win.HWND = null,
     palette: ?win.HWND = null,
@@ -498,6 +497,7 @@ const App = struct {
     tg_chats: [max_tg_chats]TgChat = [_]TgChat{.{}} ** max_tg_chats,
     tg_chat_count: usize = 0,
     tg_login: TgLoginMode = .none,
+    tg_login_window: ?win.HWND = null,
     tg_auth: tj.AuthState = .unknown,
     tg_dirty: bool = false,
     tg_api_id: i32 = 0,
@@ -751,13 +751,21 @@ fn drawComposerButton(a: *App, item: *win.DRAWITEMSTRUCT) void {
 }
 
 fn drawSetupButton(a: *App, item: *win.DRAWITEMSTRUCT) void {
-    const index: usize = if (item.CtlID == id_slack_save) 3 else 4;
+    const index: usize = switch (item.CtlID) {
+        id_slack_save => 3,
+        id_slack_cancel => 4,
+        id_tg_next => 5,
+        id_tg_cancel => 6,
+        id_tg_open_page => 7,
+        else => return,
+    };
     const pressed = (item.itemState & win.ODS_SELECTED) != 0;
     const focused = (item.itemState & win.ODS_FOCUS) != 0;
     _ = win.FillRect(item.hDC, &item.rcItem, a.brush_panel.?);
     const face: win.COLORREF = if (pressed) color_outgoing else if (a.btn_hover[index]) color_selected else color_raised;
-    // Save is the default action; keep its accent outline even without focus.
-    const frame: ?win.COLORREF = if (index == 3 or focused) color_accent else null;
+    // Save/Next are the default action; keep their accent outline even
+    // without focus.
+    const frame: ?win.COLORREF = if (index == 3 or index == 5 or focused) color_accent else null;
     var text_buffer: [32]u16 = undefined;
     paintRoundedButton(item.hDC, item.rcItem, face, color_text, a.font_bold.?, frame, buttonLabel(item, &text_buffer));
 }
@@ -1684,24 +1692,28 @@ fn drainTelegram(a: *App) void {
                     a.tg_dirty = true;
                 }
                 switch (auth.state) {
-                    .wait_phone => telegramAuthPrompt(a, .phone),
-                    .wait_code => telegramAuthPrompt(a, .code),
-                    .wait_password => telegramAuthPrompt(a, .password),
+                    // Auto-advance only while a login flow is running
+                    // (a.tg_login != .none): stale events from an earlier
+                    // cancelled attempt must not pop the sign-in dialog.
+                    .wait_phone => if (a.tg_login != .none) {
+                        openTelegramLogin(a, .phone);
+                    },
+                    .wait_code => if (a.tg_login != .none) {
+                        openTelegramLogin(a, .code);
+                    },
+                    .wait_password => if (a.tg_login != .none) {
+                        openTelegramLogin(a, .password);
+                    },
                     .ready => {
-                        // Dismiss the window only if it is the login prompt;
-                        // a command palette the user opened must survive.
-                        const login_open = a.tg_login != .none;
                         a.tg_login = .none;
-                        if (login_open) closePalette(a);
+                        if (a.tg_login_window) |window| _ = win.DestroyWindow(window);
                         client.requestChats();
                         setStatus(a, "Telegram connected");
                     },
                     .closed => {
-                        // Same rule as .ready: an unrelated palette stays up.
-                        const login_open = a.tg_login != .none;
                         a.tg_login = .none;
+                        if (a.tg_login_window) |window| _ = win.DestroyWindow(window);
                         a.tg_chat_count = 0;
-                        if (login_open) closePalette(a);
                         refreshChats(a);
                         setStatus(a, "Telegram disconnected");
                     },
@@ -1844,168 +1856,342 @@ fn tgDisplayText(msg: *const tg.Msg) []const u8 {
 }
 
 /// Routes the user back to the login step the error belongs to. Matches the
-/// plain-language texts from friendlyTgError in telegram_json.zig.
+/// plain-language texts from friendlyTgError in telegram_json.zig. Errors
+/// only steer the dialog while a login flow is running; otherwise they stay
+/// in the status bar instead of popping the sign-in window unasked.
 fn handleTgAuthError(a: *App, error_text: []const u8) void {
-    // No login is in progress (e.g. a bad-key failure at launch): the error
-    // is shown in the status bar only, it must not open the login prompt.
     if (a.tg_login == .none) return;
     if (std.mem.indexOf(u8, error_text, "app keys") != null) {
         wipeBadTelegramKeys(a);
         return;
     }
-    if (a.tg_login == .api_id or a.tg_login == .api_hash) return;
+    if (a.tg_login == .api_id or a.tg_login == .api_hash) {
+        tgLoginShowError(a, error_text);
+        return;
+    }
     const mode: TgLoginMode = if (std.mem.indexOf(u8, error_text, "phone number") != null)
         .phone
     else if (std.mem.indexOf(u8, error_text, "code") != null)
         .code
     else if (std.mem.indexOf(u8, error_text, "2FA password") != null)
         .password
-    else
+    else {
+        tgLoginShowError(a, error_text);
         return;
+    };
     openTelegramLogin(a, mode);
+    tgLoginShowError(a, error_text);
 }
 
-/// TDLib reports a login step. Prompt only when the user started the login;
-/// an account that is not signed in must never grab the screen at launch
-/// (WAZI-72). It sits quietly until asked about.
-fn telegramAuthPrompt(a: *App, mode: TgLoginMode) void {
-    if (a.tg_login != .none) {
-        openTelegramLogin(a, mode);
-    } else {
-        setStatus(a, "Telegram is not signed in. Press Ctrl+K, open Accounts, and choose Add Telegram account.");
+fn tgPromptText(mode: TgLoginMode) [*:0]const u16 {
+    return switch (mode) {
+        .phone => lit("Telegram: type your phone number (with country code) and press Next"),
+        .code => lit("Telegram: type the login code Telegram sent you and press Next"),
+        .password => lit("Telegram: type your 2FA password and press Next"),
+        .api_id => lit("Telegram: get api_id and api_hash at my.telegram.org/apps (button below), then type the api_id and press Next"),
+        .api_hash => lit("Telegram: type your api_hash and press Next"),
+        .none => lit("Telegram"),
+    };
+}
+
+fn tgModeSecret(mode: TgLoginMode) bool {
+    // Password and api_hash are credentials; mask them like the Slack tokens.
+    return mode == .password or mode == .api_hash;
+}
+
+fn parseTgApiId(text: []const u8) ?i32 {
+    const parsed = std.fmt.parseInt(i32, text, 10) catch return null;
+    if (parsed <= 0) return null;
+    return parsed;
+}
+
+fn validTgApiHash(text: []const u8) bool {
+    return text.len >= 32;
+}
+
+/// Shows an error inside the sign-in dialog, keeping the current step's
+/// instruction visible after it. No-ops when the dialog is not open.
+fn tgLoginShowError(a: *App, error_text: []const u8) void {
+    const window = a.tg_login_window orelse return;
+    const prompt_ctl = win.GetDlgItem(window, id_tg_prompt) orelse return;
+    const error_wide = utf8ToWide(a.allocator, error_text) catch return;
+    defer a.allocator.free(error_wide);
+    if (a.tg_login == .none) {
+        _ = win.SetWindowTextW(prompt_ctl, error_wide.ptr);
+        return;
     }
+    const prompt: []const u16 = std.mem.span(tgPromptText(a.tg_login));
+    const buffer = a.allocator.alloc(u16, error_wide.len + 3 + prompt.len + 1) catch return;
+    defer a.allocator.free(buffer);
+    @memcpy(buffer[0..error_wide.len], error_wide);
+    buffer[error_wide.len] = ' ';
+    buffer[error_wide.len + 1] = '-';
+    buffer[error_wide.len + 2] = ' ';
+    @memcpy(buffer[error_wide.len + 3 ..][0..prompt.len], prompt);
+    buffer[buffer.len - 1] = 0;
+    _ = win.SetWindowTextW(prompt_ctl, @ptrCast(buffer.ptr));
+}
+
+/// Switches the dialog's edit box to a new login step: clear the input,
+/// mask it when the step is a secret, and show the my.telegram.org helper
+/// button only while collecting api keys.
+fn tgLoginApplyMode(a: *App, window: win.HWND, mode: TgLoginMode) void {
+    const edit = win.GetDlgItem(window, id_tg_edit) orelse return;
+    _ = win.SendMessageW(edit, win.EM_SETPASSWORDCHAR, if (tgModeSecret(mode)) @as(usize, '*') else 0, 0);
+    _ = win.SetWindowTextW(edit, lit(""));
+    _ = win.EnableWindow(edit, 1);
+    if (win.GetDlgItem(window, id_tg_next)) |next| {
+        _ = win.EnableWindow(next, 1);
+        setFont(next, a.font_bold);
+    }
+    if (win.GetDlgItem(window, id_tg_open_page)) |open_page| {
+        _ = win.ShowWindow(open_page, if (mode == .api_id) win.SW_SHOW else win.SW_HIDE);
+    }
+    _ = win.InvalidateRect(edit, null, win.TRUE);
+    _ = win.SetFocus(edit);
+}
+
+/// After a phone/code/password submit: keep the dialog up (so the next auth
+/// state can update it in place) but block resubmission until TDLib answers.
+fn tgLoginSetChecking(a: *App) void {
+    const window = a.tg_login_window orelse return;
+    const edit = win.GetDlgItem(window, id_tg_edit) orelse return;
+    _ = win.EnableWindow(edit, 0);
+    if (win.GetDlgItem(window, id_tg_next)) |next| _ = win.EnableWindow(next, 0);
+    const prompt = win.GetDlgItem(window, id_tg_prompt) orelse return;
+    _ = win.SetWindowTextW(prompt, lit("Checking with Telegram..."));
 }
 
 fn openTelegramLogin(a: *App, mode: TgLoginMode) void {
     a.tg_login = mode;
     setStatus(a, switch (mode) {
-        .phone => "Telegram: type your phone number in the box and press Enter",
-        .code => "Telegram: type the login code and press Enter",
-        .password => "Telegram: type your 2FA password and press Enter",
-        .api_id => "Telegram: open my.telegram.org/apps below, then type your api_id here and press Enter",
-        .api_hash => "Telegram: type your api_hash and press Enter",
+        .phone => "Telegram: type your phone number in the box and press Next",
+        .code => "Telegram: type the login code and press Next",
+        .password => "Telegram: type your 2FA password and press Next",
+        .api_id => "Telegram: open my.telegram.org/apps below, then type your api_id and press Next",
+        .api_hash => "Telegram: type your api_hash and press Next",
         .none => "Telegram",
     });
-    // The login prompt is its own input, not the command palette (WAZI-72):
-    // the api key steps keep only the my.telegram.org entry, other steps
-    // list no commands at all.
-    if (mode == .api_id or mode == .api_hash) {
-        a.palette_item_count = 0;
-        appendPalette(a, "Open the Telegram app page (my.telegram.org/apps) in your browser", "", command_tg_open_apps);
-    } else {
-        a.palette_item_count = 0;
+    if (a.tg_login_window) |window| {
+        if (win.GetDlgItem(window, id_tg_prompt)) |prompt| _ = win.SetWindowTextW(prompt, tgPromptText(mode));
+        tgLoginApplyMode(a, window, mode);
+        return;
     }
-    if (a.palette == null) {
-        showPaletteWindow(a);
-    } else {
-        // Reusing an open window: refresh the cue and the item list for the
-        // new step, or the previous step's text lingers.
-        setPaletteCue(a);
-        if (a.palette_edit) |edit| _ = win.SetWindowTextW(edit, lit(""));
-        paletteFilter(a);
-    }
-    if (a.palette_edit) |edit| _ = win.SetFocus(edit);
+    const owner = a.hwnd orelse return;
+    _ = win.EnableWindow(owner, 0);
+    const window = win.CreateWindowExW(
+        win.WS_EX_DLGMODALFRAME,
+        lit("TelegramLogin"),
+        lit("Sign in to Telegram"),
+        win.WS_OVERLAPPED | win.WS_CAPTION | win.WS_SYSMENU,
+        200,
+        200,
+        410,
+        240,
+        owner,
+        null,
+        a.instance,
+        null,
+    ) orelse {
+        _ = win.EnableWindow(owner, 1);
+        a.tg_login = .none;
+        setStatus(a, "Telegram: the sign-in window could not open. Try Add Telegram account again.");
+        return;
+    };
+    a.tg_login_window = window;
+    tgLoginApplyMode(a, window, mode);
+    _ = win.ShowWindow(window, win.SW_SHOW);
 }
 
 fn setPaletteCue(a: *App) void {
     const edit = a.palette_edit orelse return;
-    const cue: [*:0]const u16 = if (a.tg_login != .none) switch (a.tg_login) {
-        .phone => lit("Your phone number"),
-        .code => lit("Login code"),
-        .password => lit("2FA password"),
-        .api_id => lit("api_id"),
-        .api_hash => lit("api_hash"),
-        .none => lit(""),
-    } else if (a.palette_accounts_mode) lit("Accounts") else lit("Type a command");
+    const cue: [*:0]const u16 = if (a.palette_accounts_mode) lit("Accounts") else lit("Type a command");
     _ = win.SendMessageW(edit, win.EM_SETCUEBANNER, 1, @bitCast(@intFromPtr(cue)));
 }
 
-fn handleTgLoginInput(a: *App) void {
-    const client = a.telegram orelse {
-        if (a.tg_login == .api_id or a.tg_login == .api_hash) handleTgKeyInput(a);
-        return;
-    };
+/// Closes the sign-in dialog and ends the login flow. TDLib may still be
+/// waiting for input; its later auth events are ignored because
+/// a.tg_login is .none again.
+fn closeTgLogin(a: *App) void {
+    a.tg_login = .none;
+    if (a.tg_login_window) |window| _ = win.DestroyWindow(window);
+}
+
+fn layoutTgLogin(hwnd: win.HWND) void {
+    var client: win.RECT = undefined;
+    _ = win.GetClientRect(hwnd, &client);
+    const btn_w: i32 = 90;
+    const btn_h: i32 = 30;
+    const gap: i32 = 8;
+    const margin: i32 = 16;
+    const bottom = client.bottom - margin - btn_h;
+    if (win.GetDlgItem(hwnd, id_tg_prompt)) |p| _ = win.MoveWindow(p, margin, 14, client.right - 2 * margin, 48, win.TRUE);
+    if (win.GetDlgItem(hwnd, id_tg_edit)) |e| _ = win.MoveWindow(e, margin, 70, client.right - 2 * margin, 28, win.TRUE);
+    if (win.GetDlgItem(hwnd, id_tg_open_page)) |o| _ = win.MoveWindow(o, margin, 106, 210, btn_h, win.TRUE);
+    if (win.GetDlgItem(hwnd, id_tg_cancel)) |c| _ = win.MoveWindow(c, client.right - margin - btn_w, bottom, btn_w, btn_h, win.TRUE);
+    if (win.GetDlgItem(hwnd, id_tg_next)) |n| _ = win.MoveWindow(n, client.right - margin - 2 * btn_w - gap, bottom, btn_w, btn_h, win.TRUE);
+}
+
+fn telegramLoginProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.LPARAM) callconv(.winapi) isize {
+    const a = app_ptr orelse return win.DefWindowProcW(hwnd, message, wparam, lparam);
+    switch (message) {
+        win.WM_CREATE => {
+            _ = win.CreateWindowExW(0, lit("STATIC"), lit(""), win.WS_CHILD | win.WS_VISIBLE, 16, 14, 366, 48, hwnd, controlId(id_tg_prompt), a.instance, null);
+            _ = win.CreateWindowExW(0, lit("EDIT"), null, win.WS_CHILD | win.WS_VISIBLE | win.WS_BORDER | win.WS_TABSTOP | win.ES_AUTOHSCROLL, 16, 70, 366, 28, hwnd, controlId(id_tg_edit), a.instance, null);
+            const next = win.CreateWindowExW(0, lit("BUTTON"), lit("Next"), win.WS_CHILD | win.WS_VISIBLE | win.WS_TABSTOP | win.BS_OWNERDRAW | win.BS_DEFPUSHBUTTON, 0, 0, 90, 30, hwnd, controlId(id_tg_next), a.instance, null);
+            const cancel = win.CreateWindowExW(0, lit("BUTTON"), lit("Cancel"), win.WS_CHILD | win.WS_VISIBLE | win.WS_TABSTOP | win.BS_OWNERDRAW, 0, 0, 90, 30, hwnd, controlId(id_tg_cancel), a.instance, null);
+            const open_page = win.CreateWindowExW(0, lit("BUTTON"), lit("Open my.telegram.org/apps"), win.WS_CHILD | win.WS_TABSTOP | win.BS_OWNERDRAW, 0, 0, 210, 30, hwnd, controlId(id_tg_open_page), a.instance, null);
+            setFont(win.GetDlgItem(hwnd, id_tg_prompt), a.font);
+            setFont(win.GetDlgItem(hwnd, id_tg_edit), a.font);
+            setFont(next, a.font_bold);
+            setFont(cancel, a.font_bold);
+            setFont(open_page, a.font_bold);
+            subclassComposerButton(a, next, 5);
+            subclassComposerButton(a, cancel, 6);
+            subclassComposerButton(a, open_page, 7);
+            layoutTgLogin(hwnd);
+            return 0;
+        },
+        win.WM_SIZE => {
+            layoutTgLogin(hwnd);
+            return 0;
+        },
+        win.WM_ERASEBKGND => {
+            var client: win.RECT = undefined;
+            _ = win.GetClientRect(hwnd, &client);
+            _ = win.FillRect(winHandle(win.HDC, @as(usize, @bitCast(wparam))), &client, a.brush_panel.?);
+            return 1;
+        },
+        win.WM_DRAWITEM => {
+            const item: *win.DRAWITEMSTRUCT = winHandle(*win.DRAWITEMSTRUCT, @as(usize, @bitCast(lparam)));
+            drawSetupButton(a, item);
+            return 1;
+        },
+        win.WM_CTLCOLORSTATIC, win.WM_CTLCOLOREDIT => {
+            const hdc: win.HDC = winHandle(win.HDC, wparam);
+            _ = win.SetTextColor(hdc, color_text);
+            _ = win.SetBkColor(hdc, color_panel);
+            if (a.brush_panel) |brush| return @bitCast(@intFromPtr(brush));
+            return @bitCast(@intFromPtr(win.GetStockObject(win.BLACK_BRUSH)));
+        },
+        win.WM_COMMAND => {
+            const id = loword(wparam);
+            if (id == id_tg_next or id == 1) { // 1 = IDOK (Enter)
+                tgLoginSubmit(a);
+                return 0;
+            }
+            if (id == id_tg_cancel or id == 2) { // 2 = IDCANCEL (Escape)
+                closeTgLogin(a);
+                return 0;
+            }
+            if (id == id_tg_open_page) {
+                openMyTelegramPage(a);
+                return 0;
+            }
+            return 0;
+        },
+        win.WM_CLOSE => {
+            closeTgLogin(a);
+            return 0;
+        },
+        win.WM_NCDESTROY => {
+            a.tg_login_window = null;
+            if (a.hwnd) |main_hwnd| {
+                _ = win.EnableWindow(main_hwnd, 1);
+                _ = win.SetFocus(main_hwnd);
+            }
+            return 0;
+        },
+        else => {},
+    }
+    return win.DefWindowProcW(hwnd, message, wparam, lparam);
+}
+
+fn tgLoginSubmit(a: *App) void {
+    const window = a.tg_login_window orelse return;
+    const edit = win.GetDlgItem(window, id_tg_edit) orelse return;
     var wide_buffer: [128]u16 = [_]u16{0} ** 128;
-    const length: usize = if (a.palette_edit) |edit|
-        @intCast(win.GetWindowTextW(edit, &wide_buffer, wide_buffer.len))
-    else
-        0;
+    const length: usize = @intCast(win.GetWindowTextW(edit, &wide_buffer, wide_buffer.len));
     if (length == 0) return;
     const text = std.unicode.utf16LeToUtf8Alloc(a.allocator, wide_buffer[0..length]) catch return;
     defer a.allocator.free(text);
     const trimmed = std.mem.trim(u8, text, " ");
     switch (a.tg_login) {
-        .phone => client.authPhone(trimmed),
-        .code => client.authCode(trimmed),
-        .password => client.authPassword(trimmed),
-        .api_id, .api_hash => {
-            handleTgKeyInput(a);
-            return;
+        .phone, .code, .password => {
+            const client = a.telegram orelse {
+                tgLoginShowError(a, "Telegram is not running. Close this window and choose Add Telegram account again.");
+                return;
+            };
+            switch (a.tg_login) {
+                .phone => client.authPhone(trimmed),
+                .code => client.authCode(trimmed),
+                .password => client.authPassword(trimmed),
+                else => unreachable,
+            }
+            // Stay in this mode so the next auth event can move the dialog
+            // to the following step; block a second submit meanwhile.
+            tgLoginSetChecking(a);
+            setStatus(a, "Telegram: checking with Telegram...");
         },
-        .none => return,
+        .api_id, .api_hash => handleTgKeyInput(a, trimmed),
+        .none => {},
     }
-    a.tg_login = .none;
-    closePalette(a);
-    setStatus(a, "Telegram: checking with Telegram...");
 }
 
 /// The api_id/api_hash steps run before the Telegram client exists: input is
 /// validated and stored (registry), and only the api_hash step starts the
-/// client and hands over to the phone step.
-fn handleTgKeyInput(a: *App) void {
-    var wide_buffer: [128]u16 = [_]u16{0} ** 128;
-    const length: usize = if (a.palette_edit) |edit|
-        @intCast(win.GetWindowTextW(edit, &wide_buffer, wide_buffer.len))
-    else
-        0;
-    if (length == 0) return;
-    const text = std.unicode.utf16LeToUtf8Alloc(a.allocator, wide_buffer[0..length]) catch return;
-    defer a.allocator.free(text);
-    const trimmed = std.mem.trim(u8, text, " ");
+/// client and hands over to the phone step. Failures are shown in the dialog.
+fn handleTgKeyInput(a: *App, trimmed: []const u8) void {
     switch (a.tg_login) {
         .api_id => {
-            const parsed = std.fmt.parseInt(i32, trimmed, 10) catch {
-                setStatus(a, "The api_id is a number. Type it again.");
+            const parsed = parseTgApiId(trimmed) orelse {
+                tgLoginShowError(a, "The api_id is a number. Type it again.");
                 return;
             };
-            if (parsed <= 0) {
-                setStatus(a, "The api_id is a number. Type it again.");
-                return;
-            }
             a.tg_api_id = parsed;
-            a.tg_login = .api_hash;
-            if (a.palette_edit) |edit| _ = win.SetWindowTextW(edit, lit(""));
-            setStatus(a, "Telegram: api_id saved. Now type your api_hash and press Enter");
+            openTelegramLogin(a, .api_hash);
         },
         .api_hash => {
-            if (trimmed.len < 32) {
-                setStatus(a, "That api_hash looks too short. Copy the whole 32-character value.");
+            if (!validTgApiHash(trimmed)) {
+                tgLoginShowError(a, "That api_hash looks too short. Copy the whole 32-character value.");
                 return;
             }
             a.tg_api_hash.set(trimmed);
             if (!saveTelegramKeys(a)) {
-                setStatus(a, "Could not save the Telegram keys on this PC. Try again.");
+                tgLoginShowError(a, "Could not save the Telegram keys on this PC. Try again.");
                 return;
             }
             createTelegramClient(a);
             if (a.telegram == null) {
-                // Creation failed: stay on the api_hash step so Enter retries
+                // Creation failed: stay on the api_hash step so Next retries
                 // instead of a phone prompt that can never be answered.
-                setStatus(a, "Telegram could not start on this PC. Press Enter to try again.");
+                tgLoginShowError(a, "Telegram could not start on this PC. Press Next to try again.");
                 return;
             }
-            a.tg_login = .none;
-            closePalette(a);
             openTelegramLogin(a, .phone);
-            setStatus(a, "Telegram: keys saved. Type your phone number and press Enter");
+            setStatus(a, "Telegram: keys saved. Type your phone number and press Next");
         },
         else => {},
     }
 }
 
+fn openMyTelegramPage(a: *App) void {
+    const url_wide = utf8ToWide(a.allocator, "https://my.telegram.org/apps") catch return;
+    defer a.allocator.free(url_wide);
+    const result = win.ShellExecuteW(a.hwnd orelse null, lit("open"), url_wide.ptr, null, null, win.SW_SHOWNORMAL);
+    if (@intFromPtr(result) <= 32) setStatus(a, "Windows could not open the browser");
+}
+
 fn createTelegramClient(a: *App) void {
-    if (a.telegram != null or a.tg_data_dir.len == 0) return;
-    if (a.tg_api_id == 0 or a.tg_api_hash.len == 0) return;
+    if (a.telegram != null) return;
+    if (a.tg_api_id == 0 or a.tg_api_hash.len == 0) {
+        setStatus(a, "Telegram needs an api_id and api_hash before it can start");
+        return;
+    }
+    if (a.tg_data_dir.len == 0) {
+        setStatus(a, "Telegram could not start: its data folder is missing");
+        return;
+    }
     a.telegram = tg.Client.create(a.allocator, a.io, a.tg_api_id, a.tg_api_hash.slice(), a.tg_data_dir.slice());
     if (a.telegram == null) setStatus(a, "Telegram could not start on this PC");
 }
@@ -2025,7 +2211,12 @@ fn startTelegramAdd(a: *App) void {
             return;
         }
         createTelegramClient(a);
-        if (a.telegram == null) return;
+        if (a.telegram == null) {
+            // Creation failed: the status names the cause, and the api_hash
+            // prompt gives Next a way to retry with a corrected key.
+            if (a.tg_login == .none) openTelegramLogin(a, .api_hash);
+            return;
+        }
     }
     openTelegramLogin(a, switch (a.tg_auth) {
         .wait_code => .code,
@@ -2088,6 +2279,7 @@ fn removeTelegramAccount(a: *App) void {
     }
     deleteTelegramKeys(a);
     a.tg_login = .none;
+    if (a.tg_login_window) |window| _ = win.DestroyWindow(window);
     a.tg_auth = .unknown;
     a.tg_chat_count = 0;
     a.tg_chats = [_]TgChat{.{}} ** max_tg_chats;
@@ -2678,6 +2870,13 @@ const id_slack_user_edit = 100;
 const id_slack_app_edit = 101;
 const id_slack_save = 102;
 const id_slack_cancel = 103;
+
+// Telegram sign-in dialog controls.
+const id_tg_prompt = 110;
+const id_tg_edit = 111;
+const id_tg_next = 112;
+const id_tg_cancel = 113;
+const id_tg_open_page = 114;
 
 const OPENFILENAMEW = extern struct {
     lStructSize: win.DWORD,
@@ -6372,9 +6571,6 @@ fn appendPaletteChat(a: *App, index: usize) void {
 
 fn buildPaletteItems(a: *App) void {
     a.palette_item_count = 0;
-    if (a.tg_login == .api_id or a.tg_login == .api_hash) {
-        appendPalette(a, "Open the Telegram app page (my.telegram.org/apps) in your browser", "", command_tg_open_apps);
-    }
     appendPalette(a, "Search chats", "Ctrl+F", command_search);
     appendPalette(a, "Compose message", "C", command_compose);
     appendPalette(a, "Dictate", "Ctrl+D", command_dictate);
@@ -6531,24 +6727,7 @@ fn closePalette(a: *App) void {
     if (a.chats_hwnd) |list| _ = win.SetFocus(list);
 }
 
-fn paletteEditEmpty(a: *App) bool {
-    var wide_buffer: [8]u16 = [_]u16{0} ** 8;
-    const length: usize = if (a.palette_edit) |edit|
-        @intCast(win.GetWindowTextW(edit, &wide_buffer, wide_buffer.len))
-    else
-        0;
-    return length == 0;
-}
-
 fn paletteActivate(a: *App) void {
-    if (a.tg_login != .none) {
-        // In the api key steps, Enter on an empty box activates the selected
-        // item instead (the "open my.telegram.org/apps" entry).
-        if ((a.tg_login != .api_id and a.tg_login != .api_hash) or !paletteEditEmpty(a)) {
-            handleTgLoginInput(a);
-            return;
-        }
-    }
     if (a.palette_selected >= a.palette_match_count) return;
     const item = &a.palette_items[a.palette_matches[a.palette_selected]];
     if (item.chat_jid.len > 0) {
@@ -7050,16 +7229,6 @@ fn runCommand(a: *App, command: u16) void {
         },
         command_slack_setup => {
             openSlackSetup(a);
-        },
-        command_tg_open_apps => {
-            const url_wide = utf8ToWide(a.allocator, "https://my.telegram.org/apps") catch return;
-            defer a.allocator.free(url_wide);
-            const result = win.ShellExecuteW(a.hwnd.?, lit("open"), url_wide.ptr, null, null, win.SW_SHOWNORMAL);
-            if (@intFromPtr(result) <= 32) {
-                setStatus(a, "Windows could not open the browser");
-            }
-            // The api key prompt closed with the palette; bring it back.
-            openTelegramLogin(a, if (a.tg_login == .api_hash) .api_hash else .api_id);
         },
         command_accounts_tg_remove => {
             a.accounts_confirm_remove_tg = true;
@@ -9001,6 +9170,10 @@ fn handleKeyboard(a: *App, message: *const win.MSG) bool {
     // proc it enters menu mode, which hides the caret, and because Alt+J/K
     // are consumed here the mode never exits and the caret stays hidden.
     if (alt and key == win.VK_MENU) return true;
+    // While the Telegram sign-in dialog is open, all keys go to it: the main
+    // loop routes them through IsDialogMessageW, and the global shortcuts
+    // (Ctrl+K palette, hotkeys) must not fire underneath the login flow.
+    if (a.tg_login_window != null) return false;
     if (control and key == 'F') {
         if (a.search) |search| {
             _ = win.SetFocus(search);
@@ -9636,6 +9809,13 @@ pub fn main(init: std.process.Init) !void {
     slack_class.lpszClassName = lit("SlackSetup");
     if (win.RegisterClassExW(&slack_class) == 0) return error.RegisterSlackClassFailed;
 
+    var tg_login_class = std.mem.zeroes(win.WNDCLASSEXW);
+    tg_login_class.cbSize = @sizeOf(win.WNDCLASSEXW);
+    tg_login_class.lpfnWndProc = telegramLoginProc;
+    tg_login_class.hInstance = instance;
+    tg_login_class.lpszClassName = lit("TelegramLogin");
+    if (win.RegisterClassExW(&tg_login_class) == 0) return error.RegisterTelegramLoginClassFailed;
+
     var emoji_class = win.WNDCLASSEXW{
         .cbSize = @sizeOf(win.WNDCLASSEXW),
         .style = 0,
@@ -9689,6 +9869,11 @@ pub fn main(init: std.process.Init) !void {
                 _ = win.InvalidateRect(app.canvas.?, null, win.TRUE);
                 continue;
             }
+        }
+        // Telegram sign-in dialog first: Tab/Enter/Escape are dialog
+        // navigation and IsDialogMessageW dispatches them itself.
+        if (app.tg_login_window) |login_wnd| {
+            if (win.IsDialogMessageW(login_wnd, &message) != 0) continue;
         }
         if (handleKeyboard(&app, &message)) continue;
         _ = win.TranslateMessage(&message);
@@ -10469,4 +10654,18 @@ test "sender name shows only at the start of a same-sender run" {
     a.messages[1].from_me = false;
     a.messages[1].sender_jid.set("111@g.us");
     try std.testing.expect(!showSenderName(&a, 2));
+}
+
+test "telegram api_id parsing accepts positive numbers only" {
+    try std.testing.expectEqual(@as(?i32, 12345), parseTgApiId("12345"));
+    try std.testing.expectEqual(@as(?i32, null), parseTgApiId(""));
+    try std.testing.expectEqual(@as(?i32, null), parseTgApiId("abc"));
+    try std.testing.expectEqual(@as(?i32, null), parseTgApiId("0"));
+    try std.testing.expectEqual(@as(?i32, null), parseTgApiId("-4"));
+}
+
+test "telegram api_hash must be the full 32-character value" {
+    try std.testing.expect(validTgApiHash("0123456789abcdef0123456789abcdef"));
+    try std.testing.expect(!validTgApiHash("0123456789abcdef"));
+    try std.testing.expect(!validTgApiHash(""));
 }
