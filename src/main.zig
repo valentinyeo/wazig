@@ -127,6 +127,7 @@ const command_accounts_tg_remove_confirm = 2050;
 const command_tg_open_apps = 2051;
 const command_update_check = 2052;
 const command_update_install = 2053;
+const command_emoji_diag = 2054;
 const reaction_like = 3001;
 const reaction_love = 3002;
 const reaction_laugh = 3003;
@@ -6006,6 +6007,7 @@ fn buildPaletteItems(a: *App) void {
     appendPalette(a, "Next chat", "Ctrl+Tab", command_next_chat);
     appendPalette(a, "Previous chat", "Ctrl+Shift+Tab", command_prev_chat);
     appendPalette(a, "Insert emoji", "", command_emoji);
+    if (emoji_draw.failureNotice() != null) appendPalette(a, "Why are emoji black and white?", "", command_emoji_diag);
     appendPalette(a, "Send message", "Enter", command_send);
     appendPalette(a, "React to message: 👍 Like", "", reaction_like);
     appendPalette(a, "React to message: ❤️ Love", "", reaction_love);
@@ -6555,6 +6557,7 @@ fn runCommand(a: *App, command: u16) void {
             if (a.compose) |compose| _ = win.SetFocus(compose);
         },
         command_emoji => openEmojiPicker(a),
+        command_emoji_diag => setStatus(a, emoji_draw.failureNotice() orelse "Colour emoji is working"),
         command_unread => {
             a.unread_only = !a.unread_only;
             refreshChats(a);
@@ -6935,6 +6938,10 @@ fn drawEmojiRun(hdc: win.HDC, emoji_font: win.HFONT, text_ascent: i32, line_heig
     const em = line_height;
     if (emoji_draw.metrics(slice, em)) |run_metrics| {
         if (!draw or emoji_draw.draw(hdc, slice, cursor, y, text_ascent, em)) return run_metrics.width;
+    }
+    // WAZI-65: colour fallback is never silent; each new reason shows once.
+    if (emoji_draw.takeNotice()) |notice| {
+        if (app_ptr) |app| setStatus(app, notice);
     }
     _ = win.SelectObject(hdc, @ptrCast(emoji_font));
     if (draw) _ = win.TextOutW(hdc, cursor, y, slice.ptr, @intCast(slice.len));
