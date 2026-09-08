@@ -93,9 +93,17 @@ jobs:
                 # feeds the release pipeline; our commit is no longer head.
                 main_now=$(gh api "repos/$REPO/commits/main" --jq .sha 2>/dev/null) || main_now=""
                 if [ -n "${main_now}" ] && [ "${main_now}" != "${merged_oid}" ]; then
-                  echo "#$pr: main advanced to ${main_now}; its ci run feeds the release"
-                  ci_started=1
-                  break
+                  # Advancing main is not itself proof of a ci run: a human
+                  # push or another merge could have landed without one. Only
+                  # accept it when the new head really carries ci; otherwise
+                  # keep retrying, since the dispatch now targets main HEAD.
+                  now_count=$(gh run list -R "$REPO" -w ci -b main --commit "$main_now" --json databaseId -q 'length' 2>/dev/null) || now_count=""
+                  if [ "${now_count:-0}" -ge 1 ] 2>/dev/null; then
+                    echo "#$pr: main advanced to ${main_now}; its ci run feeds the release"
+                    ci_started=1
+                    break
+                  fi
+                  echo "#$pr: main advanced to ${main_now} but has no ci run; retrying dispatch"
                 fi
                 # Any run for the commit (even queued) proves the dispatch
                 # landed; re-dispatching while ci is merely slow would only
