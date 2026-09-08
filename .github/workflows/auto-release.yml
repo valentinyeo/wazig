@@ -93,6 +93,7 @@ jobs:
             else
               echo "HEAD is tagged ${tag} but has no successful release run; dispatching release.yml"
               gh workflow run release.yml -R "${GITHUB_REPOSITORY}" --ref "${tag}"
+              echo "skip=true" >> "$GITHUB_ENV"
               exit 0
             fi
           fi
