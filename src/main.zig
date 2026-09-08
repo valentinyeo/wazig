@@ -2444,9 +2444,13 @@ fn resolveSlackSend(a: *App, result: *WacliResult) void {
     };
     defer a.allocator.free(ts);
     // The echo may have replaced the pending bubble already; then the message
-    // with this ts exists and there is nothing left to stamp.
+    // with this ts exists and the leftover optimistic copy must go, or every
+    // refresh would re-preserve it as a duplicate.
     for (a.messages[0..a.message_count]) |*message| {
-        if (std.mem.eql(u8, message.id.slice(), ts)) return;
+        if (std.mem.eql(u8, message.id.slice(), ts)) {
+            removeMessageAt(a, index);
+            return;
+        }
     }
     const message = &a.messages[index];
     message.id.set(ts);
