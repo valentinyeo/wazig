@@ -1670,9 +1670,9 @@ fn drainTelegram(a: *App) void {
                     a.tg_dirty = true;
                 }
                 switch (auth.state) {
-                    .wait_phone => openTelegramLogin(a, .phone),
-                    .wait_code => openTelegramLogin(a, .code),
-                    .wait_password => openTelegramLogin(a, .password),
+                    .wait_phone => telegramAuthPrompt(a, .phone),
+                    .wait_code => telegramAuthPrompt(a, .code),
+                    .wait_password => telegramAuthPrompt(a, .password),
                     .ready => {
                         a.tg_login = .none;
                         client.requestChats();
@@ -1681,6 +1681,7 @@ fn drainTelegram(a: *App) void {
                     .closed => {
                         a.tg_login = .none;
                         a.tg_chat_count = 0;
+                        if (a.palette != null) closePalette(a);
                         refreshChats(a);
                         setStatus(a, "Telegram disconnected");
                     },
@@ -1825,6 +1826,9 @@ fn tgDisplayText(msg: *const tg.Msg) []const u8 {
 /// Routes the user back to the login step the error belongs to. Matches the
 /// plain-language texts from friendlyTgError in telegram_json.zig.
 fn handleTgAuthError(a: *App, error_text: []const u8) void {
+    // No login is in progress (e.g. a bad-key failure at launch): the error
+    // is shown in the status bar only, it must not open the login prompt.
+    if (a.tg_login == .none) return;
     if (std.mem.indexOf(u8, error_text, "app keys") != null) {
         wipeBadTelegramKeys(a);
         return;
@@ -1841,6 +1845,17 @@ fn handleTgAuthError(a: *App, error_text: []const u8) void {
     openTelegramLogin(a, mode);
 }
 
+/// TDLib reports a login step. Prompt only when the user started the login;
+/// an account that is not signed in must never grab the screen at launch
+/// (WAZI-72). It sits quietly until asked about.
+fn telegramAuthPrompt(a: *App, mode: TgLoginMode) void {
+    if (a.tg_login != .none) {
+        openTelegramLogin(a, mode);
+    } else {
+        setStatus(a, "Telegram is not signed in. Press Ctrl+K, open Accounts, and choose Add Telegram account.");
+    }
+}
+
 fn openTelegramLogin(a: *App, mode: TgLoginMode) void {
     a.tg_login = mode;
     setStatus(a, switch (mode) {
@@ -1852,7 +1867,9 @@ fn openTelegramLogin(a: *App, mode: TgLoginMode) void {
         .none => "Telegram",
     });
     if (a.palette == null) {
-        buildPaletteItems(a);
+        // Login is its own prompt, not the command palette (WAZI-72): no
+        // command list behind the input box.
+        a.palette_item_count = 0;
         showPaletteWindow(a);
     }
     if (a.palette_edit) |edit| _ = win.SetFocus(edit);
@@ -6670,7 +6687,16 @@ fn showPaletteWindow(a: *App) void {
     setFont(a.palette_edit, a.font);
     setFont(a.palette_list, a.font);
     if (a.palette_edit) |edit| {
-        const cue = if (a.palette_accounts_mode) lit("Accounts") else lit("Type a command");
+        // In Telegram login mode the box is a single-field login prompt, so
+        // the cue names what to type instead of "Type a command".
+        const cue: [*:0]const u16 = if (a.tg_login != .none) switch (a.tg_login) {
+            .phone => lit("Your phone number"),
+            .code => lit("Login code"),
+            .password => lit("2FA password"),
+            .api_id => lit("api_id"),
+            .api_hash => lit("api_hash"),
+            .none => lit(""),
+        } else if (a.palette_accounts_mode) lit("Accounts") else lit("Type a command");
         _ = win.SendMessageW(edit, win.EM_SETCUEBANNER, 1, @bitCast(@intFromPtr(cue)));
     }
     if (a.palette_list) |list| _ = win.SendMessageW(list, win.LB_SETITEMHEIGHT, 0, palette_row_height);
@@ -6752,8 +6778,14 @@ fn paletteProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: wi
             if (a.palette_match_count == 0) {
                 _ = win.SetTextColor(hdc, color_muted);
                 _ = win.SelectObject(hdc, @ptrCast(a.font.?));
+                // In Telegram login mode the empty list is expected, not a
+                // failed command search.
+                const empty_text: [*:0]const u16 = if (a.tg_login != .none)
+                    lit("Type in the box above and press Enter")
+                else
+                    lit("No matching commands");
                 var empty_rect = win.RECT{ .left = 20, .top = palette_edit_zone + 4, .right = client.right - 20, .bottom = palette_edit_zone + 36 };
-                _ = win.DrawTextW(hdc, lit("No matching commands"), -1, &empty_rect, win.DT_LEFT | win.DT_SINGLELINE | win.DT_VCENTER);
+                _ = win.DrawTextW(hdc, empty_text, -1, &empty_rect, win.DT_LEFT | win.DT_SINGLELINE | win.DT_VCENTER);
             }
             if (a.palette_list) |list| drawScrollbar(hdc, stripRightOf(list, hwnd), listboxScrollInfo(list), a.brush_muted.?);
             return 0;
@@ -6802,6 +6834,10 @@ fn paletteProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: wi
             a.palette = null;
             a.palette_edit = null;
             a.palette_list = null;
+            // Closing the prompt cancels the login (WAZI-72): the next
+            // palette must be a normal command list, and TDLib events must
+            // not re-prompt on their own.
+            a.tg_login = .none;
             if (a.sb_drag == .palette) a.sb_drag = .none;
             return 0;
         },
