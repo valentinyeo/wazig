@@ -52,7 +52,14 @@ const max_wacli_args = 16;
 const wacli_arg_cap = 512;
 const max_msg_cache = 8;
 const msg_cache_max_bytes = 4 * 1024 * 1024;
-const update_check_interval_ms: u32 = 4 * 60 * 60 * 1000;
+// WAZI-60: check hourly (was every 4 hours) so a release is noticed within
+// the hour, plus right after the machine wakes and when the window is focused.
+const update_check_interval_ms: u32 = 60 * 60 * 1000;
+// Automatic re-checks (wake, focus) are throttled to at most one per 5 minutes.
+const update_min_retry_ms: u64 = 5 * 60 * 1000;
+// A check stuck longer than this means its completion message was lost; allow
+// a new check instead of blocking the rest of the session.
+const update_check_timeout_ms: u64 = 10 * 60 * 1000;
 const update_restart_delay_ms: u32 = 10 * 1000;
 const scrollbar_width: i32 = 8; // 6px thumb + 1px inset on each side
 const scrollbar_min_thumb: i32 = 24;
@@ -118,6 +125,8 @@ const command_slack_attach = 2048;
 const command_accounts_tg_remove = 2049;
 const command_accounts_tg_remove_confirm = 2050;
 const command_tg_open_apps = 2051;
+const command_update_check = 2052;
+const command_update_install = 2053;
 const reaction_like = 3001;
 const reaction_love = 3002;
 const reaction_laugh = 3003;
@@ -469,6 +478,10 @@ const App = struct {
     sb_compose_lines: i32 = -1,
     sb_palette_top: i32 = -1,
     sb_palette_total: i32 = -1,
+    update_pending: ?*UpdateAvailable = null,
+    update_check_running: bool = false,
+    update_last_check_ms: u64 = 0,
+    update_failures: u32 = 0,
     chats: [max_chats]Chat = [_]Chat{.{}} ** max_chats,
     chat_count: usize = 0,
     telegram: ?*tg.Client = null,
@@ -5700,6 +5713,8 @@ fn buildPaletteItems(a: *App) void {
     appendPalette(a, "Attach image to send", "", command_slack_attach);
     appendPalette(a, "Set up Slack...", "", command_slack_setup);
     appendPalette(a, "Disconnect Slack", "", command_slack_disconnect);
+    appendPalette(a, "Check for updates now", "", command_update_check);
+    if (a.update_pending != null) appendPalette(a, "Restart now to install update", "", command_update_install);
     appendPalette(a, "Quit Messages", "Q", command_quit);
     for (0..a.chat_count) |index| appendPaletteChat(a, index);
 }
@@ -6284,6 +6299,15 @@ fn runCommand(a: *App, command: u16) void {
         command_sync => {
             stopSync(a);
             startSync(a);
+        },
+        command_update_check => {
+            setStatus(a, "Checking for updates...");
+            if (a.hwnd) |hwnd| startUpdateCheck(hwnd, true);
+        },
+        command_update_install => {
+            if (a.update_pending == null) return;
+            setStatus(a, "Downloading update...");
+            if (a.hwnd) |hwnd| startUpdateInstall(hwnd);
         },
         command_telegram_login => {
             startTelegramAdd(a);
@@ -7593,9 +7617,38 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
     const a = app_ptr orelse return win.DefWindowProcW(hwnd, message, wparam, lparam);
     switch (message) {
         wm_update_ready => {
-            if (wparam != 0) {
-                setStatus(a, "Update installed - restarting in 10 seconds");
-                _ = win.SetTimer(hwnd, timer_update_restart, update_restart_delay_ms, null);
+            // wparam: 1 installed, 2 newer version found (lparam = *UpdateAvailable),
+            // 3 no update, 4 check failed automatically, 5 check failed manually
+            // (lparam = static @errorName text).
+            a.update_check_running = false;
+            switch (wparam) {
+                1 => {
+                    setStatus(a, "Update installed - restarting in 10 seconds");
+                    _ = win.SetTimer(hwnd, timer_update_restart, update_restart_delay_ms, null);
+                },
+                2 => {
+                    const upd: *UpdateAvailable = @ptrFromInt(@as(usize, @bitCast(lparam)));
+                    if (a.update_pending) |old| {
+                        old.deinit(std.heap.page_allocator);
+                        std.heap.page_allocator.destroy(old);
+                    }
+                    a.update_pending = upd;
+                    a.update_failures = 0;
+                    showUpdatePrompt(a);
+                },
+                3 => {
+                    a.update_failures = 0;
+                    var none_buf: [96]u8 = undefined;
+                    setStatus(a, std.fmt.bufPrint(&none_buf, "You are on v{s} - this is the newest version", .{app_version}) catch "No updates found");
+                },
+                4, 5 => {
+                    const name: [*:0]const u8 = @ptrFromInt(@as(usize, @bitCast(lparam)));
+                    a.update_failures += 1;
+                    var fail_buf: [128]u8 = undefined;
+                    const text = std.fmt.bufPrint(&fail_buf, "Update check failed: {s}", .{std.mem.span(name)}) catch "Update check failed";
+                    if (wparam == 5 or a.update_failures >= 2) setStatus(a, text);
+                },
+                else => {},
             }
             return 0;
         },
@@ -7696,6 +7749,18 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
             startSlackSocket(a);
             return 0;
         },
+        win.WM_POWERBROADCAST => {
+            // WAZI-60: catch up right after the machine wakes; the hourly
+            // timer alone can go a whole sleep cycle without firing.
+            if (wparam == win.PBT_APMRESUMEAUTOMATIC) startUpdateCheck(hwnd, false);
+            return 1; // TRUE: message handled
+        },
+        win.WM_ACTIVATE => {
+            // WAZI-60: a laptop that sleeps at night checks on the first
+            // focus after waking even if no power broadcast arrived.
+            if (loword(wparam) != win.WA_INACTIVE) startUpdateCheck(hwnd, false);
+            return win.DefWindowProcW(hwnd, message, wparam, lparam);
+        },
         win.WM_CREATE => {
             a.hwnd = hwnd;
             a.brush_bg = win.CreateSolidBrush(color_bg);
@@ -7735,7 +7800,7 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
             refreshMessages(a);
             _ = storeChanged(a);
             startSync(a);
-            startUpdateCheck(hwnd);
+            startUpdateCheck(hwnd, false);
             loadSlackTokens(a);
             if (slackConfigured(a)) {
                 refreshSlackWorkspace(a);
@@ -7957,7 +8022,7 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
                 a.chat_selection_pending = false;
                 refreshMessages(a);
             } else if (wparam == timer_update_check) {
-                startUpdateCheck(hwnd);
+                startUpdateCheck(hwnd, false);
             } else if (wparam == timer_update_restart) {
                 _ = win.KillTimer(hwnd, timer_update_restart);
                 relaunchIntoUpdate(a);
@@ -8691,35 +8756,172 @@ pub fn main(init: std.process.Init) !void {
     }
 }
 
-// Self-update (WAZI-27): checks GitHub Releases for a newer version, downloads
-// and verifies the release archive, then swaps the running executable in place
-// and relaunches. All work happens on a detached worker thread; the UI only
-// receives a wm_update_ready message once a new version is installed.
+// Self-update (WAZI-27, WAZI-60): checks GitHub Releases for a newer version.
+// A check only looks and reports; downloading and installing happens solely
+// after the user approves it in the update prompt or via the Ctrl+K
+// "Restart now to install update" command. All work happens on a detached
+// worker thread; the UI only hears back via wm_update_ready.
 const UpdateContext = struct {
     io: std.Io,
     hwnd: win.HWND,
+    manual: bool,
+    install: bool,
 };
 
 const UpdateOutcome = enum { none, installed };
 
-fn startUpdateCheck(hwnd: win.HWND) void {
+/// A newer release found by a check: enough to ask the user, nothing more.
+/// The install path re-checks, so a stale download URL is never used.
+const UpdateAvailable = struct {
+    tag: []u8,
+    notes: []u8,
+
+    fn deinit(self: *UpdateAvailable, allocator: std.mem.Allocator) void {
+        allocator.free(self.tag);
+        allocator.free(self.notes);
+    }
+};
+
+fn startUpdateCheck(hwnd: win.HWND, manual: bool) void {
     const a = app_ptr orelse return;
+    const now = win.GetTickCount64();
+    if (a.update_check_running and now - a.update_last_check_ms < update_check_timeout_ms) return;
+    if (!manual and a.update_last_check_ms != 0 and now - a.update_last_check_ms < update_min_retry_ms) return;
     const ctx = std.heap.page_allocator.create(UpdateContext) catch return;
-    ctx.* = .{ .io = a.io, .hwnd = hwnd };
+    ctx.* = .{ .io = a.io, .hwnd = hwnd, .manual = manual, .install = false };
     const thread = std.Thread.spawn(.{}, updateThreadMain, .{ctx}) catch {
         std.heap.page_allocator.destroy(ctx);
         return;
     };
     thread.detach();
+    a.update_check_running = true;
+    a.update_last_check_ms = now;
+}
+
+fn startUpdateInstall(hwnd: win.HWND) void {
+    const a = app_ptr orelse return;
+    if (a.update_check_running and win.GetTickCount64() - a.update_last_check_ms < update_check_timeout_ms) return;
+    const ctx = std.heap.page_allocator.create(UpdateContext) catch return;
+    ctx.* = .{ .io = a.io, .hwnd = hwnd, .manual = true, .install = true };
+    const thread = std.Thread.spawn(.{}, updateThreadMain, .{ctx}) catch {
+        std.heap.page_allocator.destroy(ctx);
+        return;
+    };
+    thread.detach();
+    a.update_check_running = true;
+}
+
+fn postUpdateFailure(hwnd: win.HWND, manual: bool, err: anyerror) void {
+    logUpdateFailure(@errorName(err));
+    const name: [*:0]const u8 = @errorName(err).ptr;
+    _ = win.PostMessageW(hwnd, wm_update_ready, if (manual) 5 else 4, @intCast(@intFromPtr(name)));
 }
 
 fn updateThreadMain(ctx: *UpdateContext) void {
     defer std.heap.page_allocator.destroy(ctx);
-    // ponytail: updates are authenticated only by HTTPS plus GitHub's own asset
-    // digest; a code-signing certificate would be needed to authenticate the
-    // publisher itself. Upgrade path: verify an Authenticode signature here.
-    const outcome = performUpdate(ctx.io) catch .none;
-    if (outcome == .installed) _ = win.PostMessageW(ctx.hwnd, wm_update_ready, 1, 0);
+    const allocator = std.heap.page_allocator;
+    if (ctx.install) {
+        // ponytail: updates are authenticated only by HTTPS plus GitHub's own asset
+        // digest; a code-signing certificate would be needed to authenticate the
+        // publisher itself. Upgrade path: verify an Authenticode signature here.
+        const outcome = performUpdate(ctx.io) catch |err| {
+            postUpdateFailure(ctx.hwnd, ctx.manual, err);
+            return;
+        };
+        _ = win.PostMessageW(ctx.hwnd, wm_update_ready, if (outcome == .installed) 1 else 3, 0);
+        return;
+    }
+    const maybe_update = checkForUpdate(allocator) catch |err| {
+        postUpdateFailure(ctx.hwnd, ctx.manual, err);
+        return;
+    };
+    if (maybe_update) |found| {
+        const stored = std.heap.page_allocator.create(UpdateAvailable) catch {
+            var heap_copy = found;
+            heap_copy.deinit(allocator);
+            _ = win.PostMessageW(ctx.hwnd, wm_update_ready, 3, 0);
+            return;
+        };
+        stored.* = found;
+        // Ownership of `stored` moves to the UI thread only if the post
+        // succeeds; reclaim it here otherwise.
+        if (win.PostMessageW(ctx.hwnd, wm_update_ready, 2, @intCast(@intFromPtr(stored))) == 0) {
+            stored.deinit(allocator);
+            std.heap.page_allocator.destroy(stored);
+        }
+    } else {
+        _ = win.PostMessageW(ctx.hwnd, wm_update_ready, 3, 0);
+    }
+}
+
+/// Asks GitHub Releases whether a newer version exists. Downloads nothing.
+fn checkForUpdate(allocator: std.mem.Allocator) !?UpdateAvailable {
+    const current = update.parseVersion(app_version) orelse return error.UpdateBadVersion;
+    const api_headers = try utf8ToWide(allocator, "User-Agent: Messages updater\r\nAccept: application/vnd.github+json\r\n");
+    defer allocator.free(api_headers);
+    const json = try httpGet(allocator, lit("api.github.com"), lit("/repos/valentinyeo/wazig/releases/latest"), api_headers.ptr, 4 * 1024 * 1024);
+    defer allocator.free(json);
+    var parsed: std.json.Parsed(std.json.Value) = undefined;
+    const maybe_asset = try update.pickAsset(allocator, json, &parsed);
+    defer parsed.deinit();
+    const asset = maybe_asset orelse return null;
+    if (!update.isNewer(asset.tag, current)) return null;
+    const body = update.releaseBody(parsed.value);
+    const notes = try allocator.dupe(u8, body[0..@min(body.len, 4096)]);
+    errdefer allocator.free(notes);
+    const tag = try allocator.dupe(u8, asset.tag);
+    return .{ .tag = tag, .notes = notes };
+}
+
+/// WAZI-60: ask before installing. ponytail: the notes render in a native
+/// MessageBox, truncated; a richer in-app dialog can replace it later.
+fn showUpdatePrompt(a: *App) void {
+    const upd = a.update_pending orelse return;
+    const notes = upd.notes[0..@min(upd.notes.len, 1200)];
+    const text = std.fmt.allocPrint(a.allocator, "Version {s} is available. Install it now?\n\n{s}{s}", .{
+        upd.tag,
+        notes,
+        if (upd.notes.len > notes.len) "\n\n..." else "",
+    }) catch return;
+    defer a.allocator.free(text);
+    const text_wide = utf8ToWide(a.allocator, text) catch return;
+    defer a.allocator.free(text_wide);
+    const title_wide = utf8ToWide(a.allocator, "Messages update") catch return;
+    defer a.allocator.free(title_wide);
+    const choice = win.MessageBoxW(a.hwnd.?, text_wide.ptr, title_wide.ptr, win.MB_YESNO | win.MB_ICONINFORMATION);
+    if (choice == win.IDYES) {
+        if (a.hwnd) |hwnd| startUpdateInstall(hwnd);
+    } else {
+        var later_buf: [160]u8 = undefined;
+        setStatus(a, std.fmt.bufPrint(&later_buf, "Update to {s} is ready - choose \"Restart now to install update\" in the command palette when you want it", .{upd.tag}) catch "An update is ready in the command palette");
+    }
+}
+
+/// Every failed check or install gets a timestamped line in
+/// %LOCALAPPDATA%\Wazig\update.log (WAZI-60): failures must never vanish
+/// into "nothing to do".
+fn logUpdateFailure(err_name: []const u8) void {
+    const allocator = std.heap.page_allocator;
+    var local_buf: [256]u16 = undefined;
+    const local_len: usize = @intCast(win.GetEnvironmentVariableW(lit("LOCALAPPDATA"), &local_buf, local_buf.len));
+    if (local_len == 0 or local_len >= local_buf.len) return;
+    const local_dir = wideToUtf8(allocator, local_buf[0..local_len]) catch return;
+    defer allocator.free(local_dir);
+    const log_path = std.fmt.allocPrint(allocator, "{s}\\Wazig\\update.log", .{local_dir}) catch return;
+    defer allocator.free(log_path);
+    const wide = utf8ToWide(allocator, log_path) catch return;
+    defer allocator.free(wide);
+    var clock = std.mem.zeroes(win.SYSTEMTIME);
+    win.GetLocalTime(&clock);
+    var line_buf: [160]u8 = undefined;
+    const line = std.fmt.bufPrint(&line_buf, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2} update check failed: {s}\r\n", .{
+        clock.wYear, clock.wMonth, clock.wDay, clock.wHour, clock.wMinute, clock.wSecond, err_name,
+    }) catch return;
+    const handle = win.CreateFileW(wide.ptr, win.FILE_APPEND_DATA, win.FILE_SHARE_READ | win.FILE_SHARE_WRITE, null, win.OPEN_ALWAYS, win.FILE_ATTRIBUTE_NORMAL, null);
+    if (handle == win.INVALID_HANDLE_VALUE or handle == null) return;
+    defer _ = win.CloseHandle(handle);
+    var written: win.DWORD = 0;
+    _ = win.WriteFile(handle, line.ptr, @intCast(line.len), &written, null);
 }
 
 fn utf8ToWide(allocator: std.mem.Allocator, text: []const u8) ![:0]u16 {

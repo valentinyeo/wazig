@@ -64,6 +64,25 @@ pub fn digestMatches(data: []const u8, digest_field: []const u8) bool {
     return std.crypto.timing_safe.eql([32]u8, expected, actual);
 }
 
+/// Returns the release body (markdown notes) of a /releases/latest response,
+/// or "" when absent (WAZI-60 shows these notes in the update prompt).
+pub fn releaseBody(root: std.json.Value) []const u8 {
+    if (root != .object) return "";
+    const body = root.object.get("body") orelse return "";
+    return if (body == .string) body.string else "";
+}
+
+test releaseBody {
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"tag_name": "v1.0.0", "body": "Fixes and speed"}
+    , .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("Fixes and speed", releaseBody(parsed.value));
+    const empty = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{}", .{});
+    defer empty.deinit();
+    try std.testing.expectEqualStrings("", releaseBody(empty.value));
+}
+
 fn flagTrue(value: ?std.json.Value) bool {
     const v = value orelse return false;
     return v == .bool and v.bool;
