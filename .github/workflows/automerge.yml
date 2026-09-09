@@ -68,6 +68,8 @@ jobs:
                   --json headSha | jq "[.[] | select(.headSha == \"$head\")] | length")"
             if [ "$n" -eq 0 ]; then
               echo "main head ${head} has no ci run; dispatching"
-              gh workflow run ci.yml --ref main -R "$REPO" || echo "self-heal dispatch failed"
+              gh workflow run ci.yml --ref main -R "$REPO" \
+                || { sleep 5; gh workflow run ci.yml --ref main -R "$REPO"; } \
+                || echo "self-heal dispatch failed; next pass will retry" >&2
             fi
           fi
