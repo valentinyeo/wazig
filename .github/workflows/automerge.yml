@@ -32,6 +32,7 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           set -uo pipefail
+          merged_any=0
           # A PR merges only when every release-gating check is present and
           # green on its current head: pending, skipped, or failed copies of
           # a required check block, and duplicate names cannot hide a red run.
@@ -70,6 +71,7 @@ jobs:
             # between the checks we read and the merge, GitHub refuses it.
             if gh pr merge "$pr" -R "$REPO" --squash --delete-branch --match-head-commit "$head_oid"; then
               echo "#$pr: merged"
+              merged_any=1
               # The GITHUB_TOKEN merge suppresses the push-triggered ci on
               # main; start it for the resulting commit so the auto-release
               # pipeline still fires. ponytail: workflow_dispatch runs at the
@@ -126,3 +128,25 @@ jobs:
               echo "#$pr: merge failed"
             fi
           done
+
+          # Self-heal: if a past dispatch failure ever left main's head with
+          # no ci run at all (nothing else can trigger one for a GITHUB_TOKEN
+          # push), dispatch it so the commit is eventually tested and
+          # released. Skipped when this pass just merged something, whose
+          # dispatch above was already verified to have created a run; and a
+          # run that exists but failed is left alone instead of looping.
+          if [ "$merged_any" -eq 0 ]; then
+            head_oid=$(gh api "repos/$REPO/commits/main" --jq .sha)
+            # Only a successful query that returns zero counts as "untested";
+            # a failed lookup must not be read as "no runs", or a transient
+            # API error would dispatch duplicate ci runs. Retry next pass.
+            run_count=$(gh run list -R "$REPO" -w ci -b main --commit "$head_oid" --json databaseId -q 'length') || run_count=""
+            if [ -z "$run_count" ]; then
+              echo "could not list ci runs for main head; skipping self-heal this pass" >&2
+            elif [ "$run_count" -eq 0 ]; then
+              echo "main head ${head_oid} has no ci run; dispatching"
+              gh workflow run ci.yml -R "$REPO" --ref main \
+                || { sleep 5; gh workflow run ci.yml -R "$REPO" --ref main; } \
+                || echo "self-heal dispatch failed; next pass will retry" >&2
+            fi
+          fi
