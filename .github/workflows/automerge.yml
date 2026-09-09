@@ -136,17 +136,26 @@ jobs:
           # dispatch above was already verified to have created a run; and a
           # run that exists but failed is left alone instead of looping.
           if [ "$merged_any" -eq 0 ]; then
-            head_oid=$(gh api "repos/$REPO/commits/main" --jq .sha)
-            # Only a successful query that returns zero counts as "untested";
-            # a failed lookup must not be read as "no runs", or a transient
-            # API error would dispatch duplicate ci runs. Retry next pass.
-            run_count=$(gh run list -R "$REPO" -w ci -b main --commit "$head_oid" --json databaseId -q 'length') || run_count=""
-            if [ -z "$run_count" ]; then
-              echo "could not list ci runs for main head; skipping self-heal this pass" >&2
-            elif [ "$run_count" -eq 0 ]; then
-              echo "main head ${head_oid} has no ci run; dispatching"
-              gh workflow run ci.yml -R "$REPO" --ref main \
-                || { sleep 5; gh workflow run ci.yml -R "$REPO" --ref main; } \
-                || echo "self-heal dispatch failed; next pass will retry" >&2
+            head_oid=$(gh api "repos/$REPO/commits/main" --jq .sha 2>/dev/null) || head_oid=""
+            # Only a resolved 40-char head is trusted; an empty one would
+            # make the run-list query below match every commit.
+            if ! echo "${head_oid}" | grep -Eq '^[0-9a-f]{40}$'; then
+              echo "could not resolve main head; skipping self-heal this pass" >&2
+            else
+              # Only a successful query that returns zero counts as "untested";
+              # a failed lookup must not be read as "no runs", or a transient
+              # API error would dispatch duplicate ci runs. Retry next pass.
+              run_count=$(gh run list -R "$REPO" -w ci -b main --commit "$head_oid" --json databaseId -q 'length') || run_count=""
+              if [ -z "$run_count" ]; then
+                echo "could not list ci runs for main head; skipping self-heal this pass" >&2
+              elif [ "$run_count" -eq 0 ]; then
+                echo "main head ${head_oid} has no ci run; dispatching"
+                # Like the merge path above, a self-heal that cannot start ci
+                # must not look like success: without ci the release pipeline
+                # stays stalled silently.
+                gh workflow run ci.yml -R "$REPO" --ref main \
+                  || { sleep 5; gh workflow run ci.yml -R "$REPO" --ref main; } \
+                  || { echo "self-heal dispatch failed; next pass will retry" >&2; exit 1; }
+              fi
             fi
           fi
