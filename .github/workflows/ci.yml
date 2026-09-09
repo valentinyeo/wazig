@@ -4,6 +4,9 @@ on:
   push:
     branches: [main]
   pull_request:
+  # automerge.yml dispatches ci on main after a GITHUB_TOKEN squash merge,
+  # because merges made with that token do not fire the push trigger.
+  workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.ref }}
