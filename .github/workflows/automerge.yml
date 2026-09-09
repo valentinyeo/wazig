@@ -30,6 +30,7 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           set -uo pipefail
+          merged_any=0
           for pr in $(gh pr list -R "$REPO" --state open --json number -q '.[].number'); do
             info=$(gh pr view "$pr" -R "$REPO" --json isDraft,labels,additions,deletions,files,mergeable,statusCheckRollup)
             reason=$(echo "$info" | jq -r '
@@ -42,14 +43,31 @@ jobs:
             if [ -n "$reason" ]; then echo "#$pr: skip ($reason)"; continue; fi
             if gh pr merge "$pr" -R "$REPO" --squash --delete-branch; then
               echo "#$pr: merged"
-              # The merge push uses GITHUB_TOKEN, which fires no push event, so
-              # ci (and chained auto-release) would never see the commit.
-              # Dispatch ci on main ourselves; workflow_dispatch works with
-              # GITHUB_TOKEN and its completion still triggers auto-release.
-              # A swallowed dispatch failure would leave main untested, so
-              # retry once and let a second failure fail the job loudly.
-              gh workflow run ci.yml --ref main -R "$REPO" \
-                || { sleep 5; gh workflow run ci.yml --ref main -R "$REPO"; } \
-                || { echo "failed to dispatch ci on main; main left untested" >&2; exit 1; }
+              merged_any=1
             else echo "#$pr: merge failed"; fi
           done
+
+          # The merge pushes above use GITHUB_TOKEN, which fires no push
+          # event, so ci (and chained auto-release) would never see the
+          # commits. Dispatch ci on main ourselves; workflow_dispatch works
+          # with GITHUB_TOKEN and its completion still triggers auto-release.
+          # One dispatch per pass tests the final head; the ci concurrency
+          # group would cancel the extras anyway.
+          if [ "$merged_any" -eq 1 ]; then
+            # A swallowed dispatch failure would leave main untested, so
+            # retry once and let a second failure fail the job loudly.
+            gh workflow run ci.yml --ref main -R "$REPO" \
+              || { sleep 5; gh workflow run ci.yml --ref main -R "$REPO"; } \
+              || { echo "failed to dispatch ci on main; main left untested" >&2; exit 1; }
+          else
+            # Self-heal: if a past dispatch failure left main's head with no
+            # ci run at all (nothing else can trigger one), dispatch it now.
+            # If the only run failed, leave it alone instead of looping.
+            head="$(gh api "repos/$REPO/commits/main" --jq .sha)"
+            n="$(gh run list -R "$REPO" --workflow ci --branch main --limit 30 \
+                  --json headSha | jq "[.[] | select(.headSha == \"$head\")] | length")"
+            if [ "$n" -eq 0 ]; then
+              echo "main head ${head} has no ci run; dispatching"
+              gh workflow run ci.yml --ref main -R "$REPO" || echo "self-heal dispatch failed"
+            fi
+          fi
