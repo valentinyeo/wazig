@@ -155,20 +155,31 @@ fn ensureFactory() bool {
 fn ensureTarget(hdc: win.HDC) bool {
     const factory = state.factory orelse return false;
     if (state.target == null) {
-        var props = win.D2D1_RENDER_TARGET_PROPERTIES{
-            .type = win.D2D1_RENDER_TARGET_TYPE_SOFTWARE,
-            .pixelFormat = .{
-                // DC render targets only accept DXGI_FORMAT_UNKNOWN (D2D
-                // rejects a concrete format); this was the WAZI-65 fallback.
-                .format = win.DXGI_FORMAT_UNKNOWN,
-                .alphaMode = win.D2D1_ALPHA_MODE_PREMULTIPLIED,
-            },
-            .dpiX = 96.0,
-            .dpiY = 96.0,
-            .usage = 0,
-            .minLevel = win.D2D1_FEATURE_LEVEL_DEFAULT,
+        // DC render targets composite onto a GDI DC, which carries no alpha:
+        // Microsoft's CreateDCRenderTarget sample pairs D2D1_ALPHA_MODE_IGNORE
+        // with the pixel format. Every PREMULTIPLIED combination shipped so
+        // far failed on the affected machine (v0.9.33: B8G8R8A8_UNORM,
+        // v0.9.41: DXGI_FORMAT_UNKNOWN - both logged render_target), so alpha
+        // mode was the common factor. Try both documented formats with IGNORE,
+        // each failure's HRESULT lands in emoji.log for the next diagnosis.
+        const candidates = [_]win.D2D1_PIXEL_FORMAT{
+            .{ .format = win.DXGI_FORMAT_UNKNOWN, .alphaMode = win.D2D1_ALPHA_MODE_IGNORE },
+            .{ .format = win.DXGI_FORMAT_B8G8R8A8_UNORM, .alphaMode = win.D2D1_ALPHA_MODE_IGNORE },
         };
-        const create_hr = factory.*.lpVtbl.*.CreateDCRenderTarget.?(factory, &props, &state.target);
+        var create_hr: win.HRESULT = 0;
+        for (candidates) |pixel_format| {
+            var props = win.D2D1_RENDER_TARGET_PROPERTIES{
+                .type = win.D2D1_RENDER_TARGET_TYPE_SOFTWARE,
+                .pixelFormat = pixel_format,
+                .dpiX = 96.0,
+                .dpiY = 96.0,
+                .usage = 0,
+                .minLevel = win.D2D1_FEATURE_LEVEL_DEFAULT,
+            };
+            state.target = null;
+            create_hr = factory.*.lpVtbl.*.CreateDCRenderTarget.?(factory, &props, &state.target);
+            if (create_hr == 0 and state.target != null) break;
+        }
         if (create_hr != 0 or state.target == null) {
             return fail(.render_target_create, create_hr);
         }
