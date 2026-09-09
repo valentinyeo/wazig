@@ -7,6 +7,7 @@
 //! so the app can say why, and transient failures retry instead of latching
 //! colour off for the session (WAZI-65).
 const std = @import("std");
+const build_info = @import("build_info");
 const win = @import("win32.zig").c;
 
 // mingw headers do not export these IIDs as linkable symbols, so define them
@@ -33,7 +34,9 @@ const FormatEntry = struct { em: i32, format: ?*win.IDWriteTextFormat = null };
 
 /// Stages where the colour path can bail, in call order. Each maps to a
 /// plain-language reason the status bar and Ctrl+K palette can show (WAZI-65).
-const ErrorStage = enum { d2d_factory, dwrite_factory, render_target, bind, format, layout, draw };
+/// render_target_create and render_target_brush are separate stages so the
+/// log names the exact Direct2D call that failed (WAZI-65 evidence).
+const ErrorStage = enum { d2d_factory, dwrite_factory, render_target_create, render_target_brush, bind, format, layout, draw };
 
 const State = struct {
     factory: ?*win.ID2D1Factory = null,
@@ -44,25 +47,28 @@ const State = struct {
     formats: [format_cache_size]FormatEntry = [_]FormatEntry{.{ .em = 0 }} ** format_cache_size,
     format_count: usize = 0,
     last_error: ?ErrorStage = null,
+    last_hr: win.HRESULT = 0,
     // One-shot announcement: the status bar shows each new reason once.
     announced: bool = false,
     notice_buf: [128]u8 = undefined,
 };
 var state: State = .{};
 
-fn fail(stage: ErrorStage) bool {
-    if (state.last_error != stage) {
+fn fail(stage: ErrorStage, hr: win.HRESULT) bool {
+    if (state.last_error == null or state.last_error.? != stage or state.last_hr != hr) {
         state.last_error = stage;
+        state.last_hr = hr;
         state.announced = false;
-        logStage(stage);
+        logStage(stage, hr);
     }
     return false;
 }
 
-/// Every new failure stage gets a timestamped line in
-/// %LOCALAPPDATA%\Wazig\emoji.log (WAZI-65): the diagnosis must not depend on
-/// anyone running the "Why are emoji black and white?" palette command.
-fn logStage(stage: ErrorStage) void {
+/// Every new failure stage gets a timestamped line with the failing call's
+/// HRESULT in %LOCALAPPDATA%\Wazig\emoji.log (WAZI-65): the diagnosis must not
+/// depend on anyone running the "Why are emoji black and white?" palette
+/// command, and the stage alone cannot tell two failing calls apart.
+fn logStage(stage: ErrorStage, hr: win.HRESULT) void {
     var path: [280]u16 = undefined;
     const local_label = std.unicode.utf8ToUtf16LeStringLiteral("LOCALAPPDATA");
     const local_len: usize = @intCast(win.GetEnvironmentVariableW(local_label, &path, path.len - 40));
@@ -81,8 +87,8 @@ fn logStage(stage: ErrorStage) void {
     var clock = std.mem.zeroes(win.SYSTEMTIME);
     win.GetLocalTime(&clock);
     var line_buf: [256]u8 = undefined;
-    const line = std.fmt.bufPrint(&line_buf, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2} colour emoji fell back at stage {s}: {s}\r\n", .{
-        clock.wYear, clock.wMonth, clock.wDay, clock.wHour, clock.wMinute, clock.wSecond, @tagName(stage), stageText(stage),
+    const line = std.fmt.bufPrint(&line_buf, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2} v{s} colour emoji fell back at stage {s} (hr 0x{X:0>8}): {s}\r\n", .{
+        clock.wYear, clock.wMonth, clock.wDay, clock.wHour, clock.wMinute, clock.wSecond, build_info.version, @tagName(stage), @as(u32, @bitCast(hr)), stageText(stage),
     }) catch return;
     const handle = win.CreateFileW(path[0..total :0].ptr, win.FILE_APPEND_DATA, win.FILE_SHARE_READ | win.FILE_SHARE_WRITE, null, win.OPEN_ALWAYS, win.FILE_ATTRIBUTE_NORMAL, null);
     if (handle == win.INVALID_HANDLE_VALUE or handle == null) return;
@@ -100,7 +106,8 @@ fn stageText(stage: ErrorStage) []const u8 {
     return switch (stage) {
         .d2d_factory => "the Windows graphics engine (Direct2D) failed to start",
         .dwrite_factory => "the Windows text engine (DirectWrite) failed to start",
-        .render_target => "the drawing surface could not be created",
+        .render_target_create => "the drawing surface could not be created",
+        .render_target_brush => "the drawing surface could not be created",
         .bind => "the drawing surface could not attach to the window",
         .format => "the emoji font (Segoe UI Emoji) could not be loaded",
         .layout => "the emoji layout could not be measured",
@@ -131,13 +138,15 @@ fn ensureFactory() bool {
     // Check both factories independently: a half-initialised state must
     // retry the missing piece instead of reporting ready (WAZI-65 review).
     if (state.factory == null) {
-        if (win.D2D1CreateFactory(win.D2D1_FACTORY_TYPE_SINGLE_THREADED, &iid_id2d1_factory, null, @ptrCast(&state.factory)) != 0 or state.factory == null) {
-            return fail(.d2d_factory);
+        const hr = win.D2D1CreateFactory(win.D2D1_FACTORY_TYPE_SINGLE_THREADED, &iid_id2d1_factory, null, @ptrCast(&state.factory));
+        if (hr != 0 or state.factory == null) {
+            return fail(.d2d_factory, hr);
         }
     }
     if (state.dwrite == null) {
-        if (win.DWriteCreateFactory(win.DWRITE_FACTORY_TYPE_SHARED, &iid_idwrite_factory, @ptrCast(&state.dwrite)) != 0 or state.dwrite == null) {
-            return fail(.dwrite_factory);
+        const hr = win.DWriteCreateFactory(win.DWRITE_FACTORY_TYPE_SHARED, &iid_idwrite_factory, @ptrCast(&state.dwrite));
+        if (hr != 0 or state.dwrite == null) {
+            return fail(.dwrite_factory, hr);
         }
     }
     return true;
@@ -146,21 +155,33 @@ fn ensureFactory() bool {
 fn ensureTarget(hdc: win.HDC) bool {
     const factory = state.factory orelse return false;
     if (state.target == null) {
-        var props = win.D2D1_RENDER_TARGET_PROPERTIES{
-            .type = win.D2D1_RENDER_TARGET_TYPE_SOFTWARE,
-            .pixelFormat = .{
-                // DC render targets only accept DXGI_FORMAT_UNKNOWN (D2D
-                // rejects a concrete format); this was the WAZI-65 fallback.
-                .format = win.DXGI_FORMAT_UNKNOWN,
-                .alphaMode = win.D2D1_ALPHA_MODE_PREMULTIPLIED,
-            },
-            .dpiX = 96.0,
-            .dpiY = 96.0,
-            .usage = 0,
-            .minLevel = win.D2D1_FEATURE_LEVEL_DEFAULT,
+        // DC render targets composite onto a GDI DC, which carries no alpha:
+        // Microsoft's CreateDCRenderTarget sample pairs D2D1_ALPHA_MODE_IGNORE
+        // with the pixel format. Every PREMULTIPLIED combination shipped so
+        // far failed on the affected machine (v0.9.33: B8G8R8A8_UNORM,
+        // v0.9.41: DXGI_FORMAT_UNKNOWN - both logged render_target), so alpha
+        // mode was the common factor. Try both documented formats with IGNORE,
+        // each failure's HRESULT lands in emoji.log for the next diagnosis.
+        const candidates = [_]win.D2D1_PIXEL_FORMAT{
+            .{ .format = win.DXGI_FORMAT_UNKNOWN, .alphaMode = win.D2D1_ALPHA_MODE_IGNORE },
+            .{ .format = win.DXGI_FORMAT_B8G8R8A8_UNORM, .alphaMode = win.D2D1_ALPHA_MODE_IGNORE },
         };
-        if (factory.*.lpVtbl.*.CreateDCRenderTarget.?(factory, &props, &state.target) != 0 or state.target == null) {
-            return fail(.render_target);
+        var create_hr: win.HRESULT = 0;
+        for (candidates) |pixel_format| {
+            var props = win.D2D1_RENDER_TARGET_PROPERTIES{
+                .type = win.D2D1_RENDER_TARGET_TYPE_SOFTWARE,
+                .pixelFormat = pixel_format,
+                .dpiX = 96.0,
+                .dpiY = 96.0,
+                .usage = 0,
+                .minLevel = win.D2D1_FEATURE_LEVEL_DEFAULT,
+            };
+            state.target = null;
+            create_hr = factory.*.lpVtbl.*.CreateDCRenderTarget.?(factory, &props, &state.target);
+            if (create_hr == 0 and state.target != null) break;
+        }
+        if (create_hr != 0 or state.target == null) {
+            return fail(.render_target_create, create_hr);
         }
         const target = state.target.?;
         const base: *win.ID2D1RenderTarget = @ptrCast(target);
@@ -169,10 +190,11 @@ fn ensureTarget(hdc: win.HDC) bool {
         _ = base.*.lpVtbl.*.SetTextAntialiasMode.?(base, win.D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
         const white = win.D2D1_COLOR_F{ .r = 0, .g = 0, .b = 0, .a = 1 };
         const brush_props = win.D2D1_BRUSH_PROPERTIES{ .opacity = 1, .transform = identityMatrix() };
-        if (base.*.lpVtbl.*.CreateSolidColorBrush.?(base, &white, &brush_props, &state.brush) != 0 or state.brush == null) {
+        const brush_hr = base.*.lpVtbl.*.CreateSolidColorBrush.?(base, &white, &brush_props, &state.brush);
+        if (brush_hr != 0 or state.brush == null) {
             // Drop the half-built target so the next call rebuilds both.
             releaseTarget();
-            return fail(.render_target);
+            return fail(.render_target_brush, brush_hr);
         }
     }
     const already_bound = state.bound_hdc != null and state.bound_hdc.? == hdc;
@@ -183,7 +205,8 @@ fn ensureTarget(hdc: win.HDC) bool {
             .right = @max(1, win.GetDeviceCaps(hdc, win.HORZRES)),
             .bottom = @max(1, win.GetDeviceCaps(hdc, win.VERTRES)),
         };
-        if (state.target.?.*.lpVtbl.*.BindDC.?(state.target.?, hdc, &rect) != 0) return fail(.bind);
+        const bind_hr = state.target.?.*.lpVtbl.*.BindDC.?(state.target.?, hdc, &rect);
+        if (bind_hr != 0) return fail(.bind, bind_hr);
         state.bound_hdc = hdc;
     }
     return true;
@@ -213,7 +236,7 @@ fn formatFor(em: i32) ?*win.IDWriteTextFormat {
         &format,
     );
     if (hr != 0 or format == null) {
-        _ = fail(.format);
+        _ = fail(.format, hr);
         return null;
     }
     if (state.format_count < format_cache_size) {
@@ -244,20 +267,23 @@ pub fn metrics(text: []const u16, em: i32) ?Metrics {
     const format = formatFor(em) orelse return null;
     var layout: ?*win.IDWriteTextLayout = null;
     const dwrite = state.dwrite.?;
-    if (dwrite.*.lpVtbl.*.CreateTextLayout.?(dwrite, text.ptr, @intCast(text.len), format, 4096.0, 256.0, &layout) != 0 or layout == null) {
-        _ = fail(.layout);
+    const layout_hr = dwrite.*.lpVtbl.*.CreateTextLayout.?(dwrite, text.ptr, @intCast(text.len), format, 4096.0, 256.0, &layout);
+    if (layout_hr != 0 or layout == null) {
+        _ = fail(.layout, layout_hr);
         return null;
     }
     defer _ = layout.?.*.lpVtbl.*.Release.?(layout.?);
     var text_metrics: win.DWRITE_TEXT_METRICS = undefined;
-    if (layout.?.*.lpVtbl.*.GetMetrics.?(layout.?, &text_metrics) != 0) {
-        _ = fail(.layout);
+    const metrics_hr = layout.?.*.lpVtbl.*.GetMetrics.?(layout.?, &text_metrics);
+    if (metrics_hr != 0) {
+        _ = fail(.layout, metrics_hr);
         return null;
     }
     var line: win.DWRITE_LINE_METRICS = undefined;
     var line_count: u32 = 0;
-    if (layout.?.*.lpVtbl.*.GetLineMetrics.?(layout.?, &line, 1, &line_count) != 0 or line_count == 0) {
-        _ = fail(.layout);
+    const line_hr = layout.?.*.lpVtbl.*.GetLineMetrics.?(layout.?, &line, 1, &line_count);
+    if (line_hr != 0 or line_count == 0) {
+        _ = fail(.layout, line_hr);
         return null;
     }
     // No clearError here: measurement proves the text engine only. Render
@@ -291,8 +317,9 @@ pub fn draw(hdc: win.HDC, text: []const u16, x: i32, top_y: i32, text_ascent: i3
     );
     var tag1: win.D2D1_TAG = 0;
     var tag2: win.D2D1_TAG = 0;
-    if (base.*.lpVtbl.*.EndDraw.?(base, &tag1, &tag2) != 0) {
-        _ = fail(.draw);
+    const end_hr = base.*.lpVtbl.*.EndDraw.?(base, &tag1, &tag2);
+    if (end_hr != 0) {
+        _ = fail(.draw, end_hr);
         // The target may need recreation after device loss; drop it so the
         // next call rebuilds, and fall back to GDI for this run.
         releaseTarget();
