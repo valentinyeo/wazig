@@ -9105,6 +9105,18 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
                 },
                 2 => {
                     const upd: *UpdateAvailable = @ptrFromInt(@as(usize, @bitCast(lparam)));
+                    // Re-finding an update the user already declined must
+                    // not pop the modal box over whatever he is typing;
+                    // the palette command stays available instead.
+                    const known = if (a.update_pending) |old| old.tag else null;
+                    if (!update.isNewOffer(known, upd.tag)) {
+                        var ready_buf: [128]u8 = undefined;
+                        const ready = std.fmt.bufPrint(&ready_buf, "Update to {s} is ready - \"Restart now to install update\" is in the command palette", .{upd.tag}) catch "An update is ready in the command palette";
+                        upd.deinit(std.heap.page_allocator);
+                        std.heap.page_allocator.destroy(upd);
+                        setStatus(a, ready);
+                        return 0;
+                    }
                     if (a.update_pending) |old| {
                         old.deinit(std.heap.page_allocator);
                         std.heap.page_allocator.destroy(old);
