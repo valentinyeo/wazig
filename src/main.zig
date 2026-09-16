@@ -521,6 +521,7 @@ const App = struct {
     sb_palette_total: i32 = -1,
     update_pending: ?*UpdateAvailable = null,
     update_check_running: bool = false,
+    update_install_running: bool = false,
     update_last_check_ms: u64 = 0,
     update_failures: u32 = 0,
     chats: [max_chats]Chat = [_]Chat{.{}} ** max_chats,
@@ -9098,6 +9099,10 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
             // 3 no update, 4 check failed automatically, 5 check failed manually
             // (lparam = static @errorName text), 6 blocked by another running copy.
             a.update_check_running = false;
+            // An install thread reports only through codes 1, 5, 6, and 3;
+            // clear its flag so a later failure never wedges the button.
+            // Code 3 can also come from a check, where clearing is harmless.
+            if (wparam == 1 or wparam == 3 or wparam >= 5) a.update_install_running = false;
             switch (wparam) {
                 1 => {
                     setStatus(a, "Update installed - restarting in 10 seconds");
@@ -10530,7 +10535,14 @@ fn startUpdateCheck(hwnd: win.HWND, manual: bool) void {
 
 fn startUpdateInstall(hwnd: win.HWND) void {
     const a = app_ptr orelse return;
-    if (a.update_check_running and win.GetTickCount64() - a.update_last_check_ms < update_check_timeout_ms) return;
+    // WAZI-81: a concurrent read-only check must never swallow an explicit
+    // install request — activation fires checks constantly, so this guard
+    // used to turn the update button into a silent no-op. performUpdate
+    // re-checks and serializes on the update mutex itself.
+    if (a.update_install_running) {
+        setStatus(a, "An update install is already running");
+        return;
+    }
     const ctx = std.heap.page_allocator.create(UpdateContext) catch return;
     ctx.* = .{ .io = a.io, .hwnd = hwnd, .manual = true, .install = true };
     const thread = std.Thread.spawn(.{}, updateThreadMain, .{ctx}) catch {
@@ -10539,6 +10551,7 @@ fn startUpdateInstall(hwnd: win.HWND) void {
     };
     thread.detach();
     a.update_check_running = true;
+    a.update_install_running = true;
 }
 
 fn postUpdateFailure(hwnd: win.HWND, manual: bool, err: anyerror) void {
