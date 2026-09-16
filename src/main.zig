@@ -10558,13 +10558,16 @@ fn startUpdateInstall(hwnd: win.HWND) void {
 
 /// A lost completion message would wedge the install slot (the button
 /// would refuse every later install until restart), so a full message
-/// queue is retried briefly instead of dropping the outcome.
+/// queue is retried briefly instead of dropping the outcome. If even the
+/// retries fail, the slot is freed from here: a wrongly freed slot can
+/// at worst start a second install, which the update mutex serializes.
 fn postInstallResult(hwnd: win.HWND, code: u32, lparam: usize) void {
     var tries: u32 = 0;
     while (tries < 50) : (tries += 1) {
         if (win.PostMessageW(hwnd, wm_update_ready, code, @bitCast(lparam)) != 0) return;
         win.Sleep(100);
     }
+    if (app_ptr) |a| a.update_install_running = false;
 }
 
 fn postUpdateFailure(hwnd: win.HWND, manual: bool, err: anyerror) void {
