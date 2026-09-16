@@ -10549,12 +10549,16 @@ fn startUpdateInstall(hwnd: win.HWND) void {
     }
     const ctx = std.heap.page_allocator.create(UpdateContext) catch return;
     ctx.* = .{ .io = a.io, .hwnd = hwnd, .manual = true, .install = true };
+    // Claim the slot before spawning: the worker may post its completion
+    // (and free the slot) as soon as it starts, so claiming afterwards
+    // could leave a stale claim behind.
+    a.update_install_running.store(true, .release);
     const thread = std.Thread.spawn(.{}, updateThreadMain, .{ctx}) catch {
+        a.update_install_running.store(false, .release);
         std.heap.page_allocator.destroy(ctx);
         return;
     };
     thread.detach();
-    a.update_install_running.store(true, .release);
 }
 
 /// A lost completion message would wedge the install slot (the button
