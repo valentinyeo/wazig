@@ -184,4 +184,12 @@ jobs:
         run: |
           # auto-release re-verifies everything itself (head of main, tag
           # dedupe, app-files-changed) before it tags anything.
-          gh workflow run auto-release.yml -R "${GITHUB_REPOSITORY}" --ref main
+          # Retry transient dispatch failures: this handoff is the only
+          # auto-release trigger for heads without a push-triggered ci run.
+          for _ in 1 2 3; do
+            if gh workflow run auto-release.yml -R "${GITHUB_REPOSITORY}" --ref main; then
+              exit 0
+            fi
+            sleep 5
+          done
+          exit 1
