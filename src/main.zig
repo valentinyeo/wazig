@@ -2541,8 +2541,8 @@ fn smokeDrawCard(allocator: std.mem.Allocator, io: std.Io, a: *App, dir: []const
 }
 
 // One diagnostic media-open attempt so the log records the exact MFPlay
-// result when a machine cannot decode the sample clip. Diagnostic only:
-// the shipped play path above stays the one whose behaviour is judged.
+// result when a machine refuses the sample clip. Diagnostic only: the
+// shipped play path above stays the one whose behaviour is judged.
 fn smokeMfProbe(a: *App) struct { hr: win.HRESULT, note: []const u8 } {
     var player: ?*win.IMFPMediaPlayer = null;
     const probe_url = lit("https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerBlazes.mp4");
@@ -2552,7 +2552,7 @@ fn smokeMfProbe(a: *App) struct { hr: win.HRESULT, note: []const u8 } {
         _ = player.?.lpVtbl.*.Release.?(player.?);
         return .{ .hr = hr, .note = "the media source opens on retry; the earlier refusal was transient" };
     }
-    return .{ .hr = hr, .note = "MFPlay refused the media source on this machine (a server-class runner often ships without the video decoder)" };
+    return .{ .hr = hr, .note = "MFPlay refused the media source on this machine; whether video can decode is a capability of the machine the app runs on" };
 }
 
 const SmokeLog = struct {
@@ -2720,7 +2720,7 @@ fn unfurlSmoke(init: std.process.Init) u8 {
     if (player_hwnd == null) {
         media_opened = false;
         const probe = smokeMfProbe(&app);
-        smoke_log.line("media open on this machine: MFPlay returned hr=0x{x:0>8} ({s}); the decoder decides this, so fullscreen mechanics are verified on the bare shipped player window", .{ @as(u32, @bitCast(probe.hr)), probe.note });
+        smoke_log.line("media open on this machine: MFPlay returned hr=0x{x:0>8}: {s}; fullscreen mechanics are verified on the bare shipped player window", .{ @as(u32, @bitCast(probe.hr)), probe.note });
         player_hwnd = openPlayerWindow(&app, 800, 450);
         if (player_hwnd) |hwnd| _ = win.ShowWindow(hwnd, win.SW_SHOW);
     }
