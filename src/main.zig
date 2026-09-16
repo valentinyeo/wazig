@@ -2510,6 +2510,9 @@ fn smokeDrawCard(allocator: std.mem.Allocator, io: std.Io, a: *App, dir: []const
     defer _ = win.ReleaseDC(null, screen_dc);
     const memory = win.CreateCompatibleDC(screen_dc) orelse return false;
     defer _ = win.DeleteDC(memory);
+    // The chat frame sets this once per paint before drawing messages;
+    // mirror it so the evidence shows the card as the app renders it.
+    _ = win.SetBkMode(memory, win.TRANSPARENT);
     var info = std.mem.zeroes(win.BITMAPINFO);
     info.bmiHeader.biSize = @sizeOf(win.BITMAPINFOHEADER);
     info.bmiHeader.biWidth = width;
@@ -2717,7 +2720,7 @@ fn unfurlSmoke(init: std.process.Init) u8 {
     if (player_hwnd == null) {
         media_opened = false;
         const probe = smokeMfProbe(&app);
-        smoke_log.line("media open on this machine: MFPlay returned hr=0x{x:0>8} ({s}); the decoder decides this, so fullscreen mechanics are verified on the bare shipped player window", .{ probe.hr, probe.note });
+        smoke_log.line("media open on this machine: MFPlay returned hr=0x{x:0>8} ({s}); the decoder decides this, so fullscreen mechanics are verified on the bare shipped player window", .{ @as(u32, @bitCast(probe.hr)), probe.note });
         player_hwnd = openPlayerWindow(&app, 800, 450);
         if (player_hwnd) |hwnd| _ = win.ShowWindow(hwnd, win.SW_SHOW);
     }
