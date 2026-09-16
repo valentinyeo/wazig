@@ -159,6 +159,40 @@ jobs:
           $p = Start-Process -FilePath "bin\Messages.exe" -ArgumentList "--tdlib-smoke" -Wait -PassThru
           exit $p.ExitCode
 
+  # WAZI-68 affected-machine verification: runs the shipped unfurl code
+  # (link classifier, live card fetch, card painter, MFPlay player window,
+  # fullscreen toggle) on a real Windows desktop, without a WhatsApp
+  # session, and uploads the screenshots and result log as evidence.
+  unfurl-verification:
+    name: unfurl-verification
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Build Messages.exe
+        run: zig build -Dtarget=x86_64-windows-gnu --release=small
+
+      - name: Run unfurl smoke on this Windows machine
+        shell: pwsh
+        env:
+          UNFURL_SMOKE_DIR: smoke-out
+        run: |
+          $p = Start-Process -FilePath "zig-out\bin\Messages.exe" -ArgumentList "--unfurl-smoke" -Wait -PassThru
+          if (Test-Path "smoke-out\results.txt") { Get-Content "smoke-out\results.txt" | Write-Host }
+          exit $p.ExitCode
+
+      - name: Upload unfurl evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unfurl-verification-evidence
+          path: smoke-out/
+
   # A ci run on main that was started by workflow_dispatch (the automerge
   # bot-merge path and the automerge self-heal) gets no downstream
   # workflow_run trigger: GitHub does not fire workflow_run for runs that
