@@ -10051,24 +10051,45 @@ fn appendHashLine(a: *App, path: []const u8, line: []const u8) void {
 }
 
 // ponytail: temporary WAZI-67 diagnostics, one line per launch event in
-// Messages/launch-log.txt, capped at 64 KiB. Remove once the blank
-// first-launch-after-update is root-caused and verified fixed.
+// Messages/launch-log.txt. Past 64 KiB the log rotates to
+// launch-log.old.txt instead of being truncated, so the history from the
+// launch that exposed a bug is never erased; if the rotation fails the
+// event still appends, which at worst lets the file keep growing. Remove
+// once the blank first-launch-after-update is root-caused and verified
+// fixed.
+const launch_log_max_bytes: i64 = 64 * 1024;
+
+fn launchLogShouldRotate(size: i64) bool {
+    return size > launch_log_max_bytes;
+}
+
 fn appendLaunchLog(a: *App, event: []const u8) void {
     const path = messagesDirPath(a, "launch-log.txt") orelse return;
     defer a.allocator.free(path);
     const wide = std.unicode.utf8ToUtf16LeAllocZ(a.allocator, path) catch return;
     defer a.allocator.free(wide);
-    // GENERIC_WRITE, not FILE_APPEND_DATA: the 64 KiB cap truncates through
-    // SetEndOfFile, which needs write-data access.
-    const handle = win.CreateFileW(wide.ptr, win.GENERIC_WRITE, win.FILE_SHARE_READ | win.FILE_SHARE_WRITE, null, win.OPEN_ALWAYS, win.FILE_ATTRIBUTE_NORMAL, null);
+    // Read the size first, then close: MoveFileExW cannot rename a file we
+    // still hold a handle on.
+    const read_handle = win.CreateFileW(wide.ptr, win.GENERIC_READ, win.FILE_SHARE_READ | win.FILE_SHARE_WRITE, null, win.OPEN_EXISTING, win.FILE_ATTRIBUTE_NORMAL, null);
+    var size: i64 = 0;
+    if (read_handle != win.INVALID_HANDLE_VALUE and read_handle != null) {
+        var large: win.LARGE_INTEGER = undefined;
+        if (win.GetFileSizeEx(read_handle, &large) != 0) size = large.QuadPart;
+        _ = win.CloseHandle(read_handle);
+    }
+    if (launchLogShouldRotate(size)) {
+        const old_path = messagesDirPath(a, "launch-log.old.txt") orelse return;
+        defer a.allocator.free(old_path);
+        const old_wide = std.unicode.utf8ToUtf16LeAllocZ(a.allocator, old_path) catch return;
+        defer a.allocator.free(old_wide);
+        _ = win.MoveFileExW(wide.ptr, old_wide.ptr, win.MOVEFILE_REPLACE_EXISTING);
+    }
+    // FILE_APPEND_DATA, never a seek-and-write: NTFS appends through this
+    // access atomically at the end of file, so two instances logging the
+    // same event cannot overwrite each other's lines.
+    const handle = win.CreateFileW(wide.ptr, win.FILE_APPEND_DATA, win.FILE_SHARE_READ | win.FILE_SHARE_WRITE, null, win.OPEN_ALWAYS, win.FILE_ATTRIBUTE_NORMAL, null);
     if (handle == win.INVALID_HANDLE_VALUE or handle == null) return;
     defer _ = win.CloseHandle(handle);
-    var size: win.LARGE_INTEGER = undefined;
-    if (win.GetFileSizeEx(handle, &size) == 0) return;
-    if (size.QuadPart > 64 * 1024) {
-        const zero: win.LARGE_INTEGER = .{ .QuadPart = 0 };
-        if (win.SetFilePointerEx(handle, zero, null, win.FILE_BEGIN) == 0 or win.SetEndOfFile(handle) == 0) return;
-    } else if (win.SetFilePointerEx(handle, size, null, win.FILE_BEGIN) == 0) return;
     var line_buffer: [192]u8 = undefined;
     const line = std.fmt.bufPrint(&line_buffer, "{d} {s}\n", .{ nowUnixSeconds(), event }) catch return;
     var written: win.DWORD = 0;
@@ -11277,4 +11298,14 @@ test "unresolvable chat entries are dropped, real chats are kept" {
     try std.testing.expect(!isUnresolvableChatEntry("", "4917012345678@s.whatsapp.net", "unknown"));
     // A named chat resolves even when wacli reports no type.
     try std.testing.expect(!isUnresolvableChatEntry("Mum", "00C6AD6F2E64", "unknown"));
+}
+
+test "launch log rotates one byte past its cap, never at or under it" {
+    // The old code truncated a full log, erasing exactly the launch history
+    // the log exists to keep. The boundary is where the bug lived: at the
+    // cap the log keeps growing, past it the whole file moves to
+    // launch-log.old.txt.
+    try std.testing.expect(!launchLogShouldRotate(0));
+    try std.testing.expect(!launchLogShouldRotate(launch_log_max_bytes));
+    try std.testing.expect(launchLogShouldRotate(launch_log_max_bytes + 1));
 }
