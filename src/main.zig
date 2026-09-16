@@ -521,7 +521,8 @@ const App = struct {
     sb_palette_total: i32 = -1,
     update_pending: ?*UpdateAvailable = null,
     update_check_running: bool = false,
-    update_install_running: bool = false,
+    // Touched by both the UI thread and the detached update worker.
+    update_install_running: std.atomic.Value(bool) = .init(false),
     update_last_check_ms: u64 = 0,
     update_failures: u32 = 0,
     chats: [max_chats]Chat = [_]Chat{.{}} ** max_chats,
@@ -9103,7 +9104,7 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
             // completion clears only its own slot, so overlapping operations
             // can never free each other's flag.
             if (wparam >= 2 and wparam <= 5) a.update_check_running = false;
-            if (wparam == 1 or wparam >= 6) a.update_install_running = false;
+            if (wparam == 1 or wparam >= 6) a.update_install_running.store(false, .release);
             switch (wparam) {
                 1 => {
                     setStatus(a, "Update installed - restarting in 10 seconds");
@@ -10542,7 +10543,7 @@ fn startUpdateInstall(hwnd: win.HWND) void {
     // install request — activation fires checks constantly, so this guard
     // used to turn the update button into a silent no-op. performUpdate
     // re-checks and serializes on the update mutex itself.
-    if (a.update_install_running) {
+    if (a.update_install_running.load(.acquire)) {
         setStatus(a, "An update install is already running");
         return;
     }
@@ -10553,7 +10554,7 @@ fn startUpdateInstall(hwnd: win.HWND) void {
         return;
     };
     thread.detach();
-    a.update_install_running = true;
+    a.update_install_running.store(true, .release);
 }
 
 /// A lost completion message would wedge the install slot (the button
@@ -10567,7 +10568,7 @@ fn postInstallResult(hwnd: win.HWND, code: u32, lparam: usize) void {
         if (win.PostMessageW(hwnd, wm_update_ready, code, @bitCast(lparam)) != 0) return;
         win.Sleep(100);
     }
-    if (app_ptr) |a| a.update_install_running = false;
+    if (app_ptr) |a| a.update_install_running.store(false, .release);
 }
 
 fn postUpdateFailure(hwnd: win.HWND, manual: bool, err: anyerror) void {
