@@ -9097,12 +9097,12 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
         wm_update_ready => {
             // wparam: 1 installed, 2 newer version found (lparam = *UpdateAvailable),
             // 3 no update, 4 check failed automatically, 5 check failed manually
-            // (lparam = static @errorName text), 6 blocked by another running copy.
+            // (lparam = static @errorName text), 6 blocked by another running copy,
+            // 7 install failed (lparam like 5), 8 install found no update.
             a.update_check_running = false;
-            // An install thread reports only through codes 1, 5, 6, and 3;
-            // clear its flag so a later failure never wedges the button.
-            // Code 3 can also come from a check, where clearing is harmless.
-            if (wparam == 1 or wparam == 3 or wparam >= 5) a.update_install_running = false;
+            // Only install threads post 1, 6, 7, and 8, so a concurrent
+            // check can never free the install slot mid-install.
+            if (wparam == 1 or wparam >= 6) a.update_install_running = false;
             switch (wparam) {
                 1 => {
                     setStatus(a, "Update installed - restarting in 10 seconds");
@@ -9130,7 +9130,7 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
                     a.update_failures = 0;
                     showUpdatePrompt(a);
                 },
-                3 => {
+                3, 8 => {
                     a.update_failures = 0;
                     var none_buf: [96]u8 = undefined;
                     setStatus(a, std.fmt.bufPrint(&none_buf, "You are on v{s} - this is the newest version", .{app_version}) catch "No updates found");
@@ -9139,12 +9139,14 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
                     a.update_failures = 0;
                     setStatus(a, "Update blocked: another copy of Messages is running - close other copies and try again");
                 },
-                4, 5 => {
+                4, 5, 7 => {
                     const name: [*:0]const u8 = @ptrFromInt(@as(usize, @bitCast(lparam)));
                     a.update_failures += 1;
                     var fail_buf: [128]u8 = undefined;
-                    const text = std.fmt.bufPrint(&fail_buf, "Update check failed: {s}", .{std.mem.span(name)}) catch "Update check failed";
-                    if (wparam == 5 or a.update_failures >= 2) setStatus(a, text);
+                    const verb: []const u8 = if (wparam == 7) "install" else "check";
+                    const text = std.fmt.bufPrint(&fail_buf, "Update {s} failed: {s}", .{ verb, std.mem.span(name) }) catch "Update failed";
+                    // 5 and 7 are user-initiated, so their failures always show.
+                    if (wparam != 4 or a.update_failures >= 2) setStatus(a, text);
                 },
                 else => {},
             }
@@ -10568,14 +10570,19 @@ fn updateThreadMain(ctx: *UpdateContext) void {
         // digest; a code-signing certificate would be needed to authenticate the
         // publisher itself. Upgrade path: verify an Authenticode signature here.
         const outcome = performUpdate(ctx.io) catch |err| {
-            postUpdateFailure(ctx.hwnd, ctx.manual, err);
+            logUpdateFailure(@errorName(err));
+            // 7 is install-only: a concurrent check posting 4/5 must never
+            // look like the install finished and free its slot.
+            const name: [*:0]const u8 = @errorName(err).ptr;
+            _ = win.PostMessageW(ctx.hwnd, wm_update_ready, 7, @intCast(@intFromPtr(name)));
             return;
         };
         if (outcome == .blocked) logUpdateFailure("update blocked by another running copy");
         _ = win.PostMessageW(ctx.hwnd, wm_update_ready, switch (outcome) {
             .installed => @as(u32, 1),
             .blocked => 6,
-            .none => 3,
+            // 8 is install-only, same reason as 7.
+            .none => 8,
         }, 0);
         return;
     }
