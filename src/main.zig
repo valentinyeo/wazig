@@ -9099,9 +9099,10 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
             // 3 no update, 4 check failed automatically, 5 check failed manually
             // (lparam = static @errorName text), 6 blocked by another running copy,
             // 7 install failed (lparam like 5), 8 install found no update.
-            a.update_check_running = false;
-            // Only install threads post 1, 6, 7, and 8, so a concurrent
-            // check can never free the install slot mid-install.
+            // Check threads post 2-5; install threads post 1 and 6-8. Each
+            // completion clears only its own slot, so overlapping operations
+            // can never free each other's flag.
+            if (wparam >= 2 and wparam <= 5) a.update_check_running = false;
             if (wparam == 1 or wparam >= 6) a.update_install_running = false;
             switch (wparam) {
                 1 => {
@@ -10552,8 +10553,18 @@ fn startUpdateInstall(hwnd: win.HWND) void {
         return;
     };
     thread.detach();
-    a.update_check_running = true;
     a.update_install_running = true;
+}
+
+/// A lost completion message would wedge the install slot (the button
+/// would refuse every later install until restart), so a full message
+/// queue is retried briefly instead of dropping the outcome.
+fn postInstallResult(hwnd: win.HWND, code: u32, lparam: usize) void {
+    var tries: u32 = 0;
+    while (tries < 50) : (tries += 1) {
+        if (win.PostMessageW(hwnd, wm_update_ready, code, @bitCast(lparam)) != 0) return;
+        win.Sleep(100);
+    }
 }
 
 fn postUpdateFailure(hwnd: win.HWND, manual: bool, err: anyerror) void {
@@ -10574,11 +10585,11 @@ fn updateThreadMain(ctx: *UpdateContext) void {
             // 7 is install-only: a concurrent check posting 4/5 must never
             // look like the install finished and free its slot.
             const name: [*:0]const u8 = @errorName(err).ptr;
-            _ = win.PostMessageW(ctx.hwnd, wm_update_ready, 7, @intCast(@intFromPtr(name)));
+            postInstallResult(ctx.hwnd, 7, @intCast(@intFromPtr(name)));
             return;
         };
         if (outcome == .blocked) logUpdateFailure("update blocked by another running copy");
-        _ = win.PostMessageW(ctx.hwnd, wm_update_ready, switch (outcome) {
+        postInstallResult(ctx.hwnd, switch (outcome) {
             .installed => @as(u32, 1),
             .blocked => 6,
             // 8 is install-only, same reason as 7.
