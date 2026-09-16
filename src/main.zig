@@ -15,6 +15,7 @@ const paste_image = @import("paste_image.zig");
 const scrollbar = @import("scrollbar.zig");
 const message_filter = @import("message_filter.zig");
 const chat_cache = @import("chat_cache.zig");
+const message_fetch = @import("message_fetch.zig");
 const unfurl = @import("unfurl.zig");
 
 const webp = @cImport({
@@ -666,6 +667,13 @@ const App = struct {
     slack_attach_jid: Utf8Text(191) = .{},
     slack_media_dir: []u8 = &.{},
     messages_gen: u64 = 0,
+    // WAZI-79: one outstanding messages read at a time. Extra refreshes for
+    // the same chat only set the redo flag instead of stacking reads whose
+    // results would invalidate each other (the tail never landed).
+    msg_fetch_inflight: bool = false,
+    msg_fetch_dirty: bool = false,
+    msg_fetch_jid: Utf8Text(191) = .{},
+    msg_fetch_seq: u64 = 0,
     chats_gen: u64 = 0,
     chats_pending_flags: u8 = 0,
     msg_cache: [max_msg_cache]MsgCacheEntry = [_]MsgCacheEntry{.{}} ** max_msg_cache,
@@ -5890,8 +5898,20 @@ fn refreshMessages(a: *App) void {
         defer a.allocator.free(cached);
         applyMessageData(a, cached, false);
     }
-    a.messages_gen += 1;
-    var job = WacliJob{ .kind = .messages, .gen = a.messages_gen };
+    // WAZI-79: only one messages read may be outstanding at a time. A
+    // refresh while one runs just records the chat it wants; the redo is
+    // issued when the read finishes. Stacking reads made each result
+    // invalidate the previous one, so the fresh tail never landed.
+    if (!message_fetch.shouldFetch(a.msg_fetch_inflight)) {
+        a.msg_fetch_jid.set(chat.jid.slice());
+        a.msg_fetch_dirty = true;
+        return;
+    }
+    a.msg_fetch_inflight = true;
+    a.msg_fetch_dirty = false;
+    a.msg_fetch_jid.set(chat.jid.slice());
+    a.msg_fetch_seq += 1;
+    var job = WacliJob{ .kind = .messages, .gen = a.msg_fetch_seq };
     job.jid.set(chat.jid.slice());
     wacliJobArgs(&job, &.{
         a.wacli_path, "--json", "--read-only", "messages", "list", "--chat", chat.jid.slice(), "--limit", "80",
@@ -9592,14 +9612,24 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
                     }
                 },
                 .messages => {
+                    // WAZI-79: exactly one messages read can be outstanding,
+                    // so its result frees the slot whatever the outcome; a
+                    // recorded redo (a refresh that arrived meanwhile) is
+                    // issued now for the chat the user is actually viewing.
+                    a.msg_fetch_inflight = false;
+                    const is_selected = a.selected_chat < a.chat_count and
+                        std.mem.eql(u8, a.chats[a.selected_chat].jid.slice(), result.jid.slice());
                     if (!result.ok) {
                         setStatus(a, "Unable to read messages from wacli");
-                    } else if (a.selected_chat < a.chat_count and
-                        std.mem.eql(u8, a.chats[a.selected_chat].jid.slice(), result.jid.slice()) and
-                        result.gen == a.messages_gen)
+                    } else if (is_selected and
+                        message_fetch.shouldApply(a.msg_fetch_seq, result.gen, a.chats[a.selected_chat].jid.slice(), result.jid.slice()))
                     {
                         applyMessageData(a, result.data, true);
                         msgCacheStore(a, result.jid.slice(), result.data);
+                    }
+                    if (a.msg_fetch_dirty) {
+                        a.msg_fetch_dirty = false;
+                        refreshMessages(a);
                     }
                 },
                 .reaction => applyReaction(a, result),
