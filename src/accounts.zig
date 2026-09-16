@@ -4,6 +4,19 @@
 const std = @import("std");
 const tj = @import("telegram_json.zig");
 
+// WAZI-82: a sync child that dies within seconds of spawn is not a transient
+// blip; after three consecutive fast deaths sync cannot run at all, so the
+// restart loop must halt and probe the WhatsApp login state instead.
+pub const sync_fast_death_secs: i64 = 30;
+pub const sync_halt_after_fast_deaths: u32 = 3;
+
+pub const SyncDeathAction = enum { restart, probe_login };
+
+pub fn syncDeathAction(lived_secs: i64, consecutive_fast_deaths: u32) SyncDeathAction {
+    if (lived_secs < sync_fast_death_secs and consecutive_fast_deaths >= sync_halt_after_fast_deaths) return .probe_login;
+    return .restart;
+}
+
 pub fn telegramLabel(state: tj.AuthState) []const u8 {
     return switch (state) {
         .ready => "Telegram - connected",
@@ -18,6 +31,13 @@ pub fn whatsappLabel(buffer: []u8, sync_running: bool, last_refresh_unix: i64) [
     if (last_refresh_unix <= 0) return "WhatsApp - live sync running, never refreshed";
     var stamp: [20]u8 = undefined;
     return std.fmt.bufPrint(buffer, "WhatsApp - live sync running, refreshed {s}", .{tj.formatTimestamp(&stamp, last_refresh_unix)}) catch "WhatsApp - live sync running";
+}
+
+test "sync death rule halts only on repeated fast exits" {
+    try std.testing.expectEqual(SyncDeathAction.restart, syncDeathAction(10, 1));
+    try std.testing.expectEqual(SyncDeathAction.restart, syncDeathAction(10, 2));
+    try std.testing.expectEqual(SyncDeathAction.probe_login, syncDeathAction(10, 3));
+    try std.testing.expectEqual(SyncDeathAction.restart, syncDeathAction(120, 5));
 }
 
 test "labels describe sync and Telegram states" {
