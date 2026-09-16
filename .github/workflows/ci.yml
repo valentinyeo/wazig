@@ -158,3 +158,30 @@ jobs:
         run: |
           $p = Start-Process -FilePath "bin\Messages.exe" -ArgumentList "--tdlib-smoke" -Wait -PassThru
           exit $p.ExitCode
+
+  # A ci run on main that was started by workflow_dispatch (the automerge
+  # bot-merge path and the automerge self-heal) gets no downstream
+  # workflow_run trigger: GitHub does not fire workflow_run for runs that
+  # were themselves dispatched. Push-triggered ci runs already start
+  # auto-release through workflow_run, so this handoff is dispatch-only.
+  notify-release:
+    name: notify-release
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [ci, tdlib, windows-smoke]
+    # success() must stay explicit: a job-level if replaces the implicit
+    # all-dependencies-succeeded check.
+    if: >-
+      success() &&
+      github.event_name == 'workflow_dispatch' &&
+      github.ref == 'refs/heads/main'
+    permissions:
+      actions: write
+    steps:
+      - name: Hand off to auto-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # auto-release re-verifies everything itself (head of main, tag
+          # dedupe, app-files-changed) before it tags anything.
+          gh workflow run auto-release.yml -R "${GITHUB_REPOSITORY}" --ref main
