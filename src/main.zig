@@ -1310,12 +1310,16 @@ fn wacliRunBoundedRead(a: *App, argv: [][]const u8, result: *WacliResult) void {
     var output: std.ArrayListUnmanaged(u8) = .empty;
     defer output.deinit(a.allocator);
     var timed_out = false;
+    var exit_code: win.DWORD = 1;
     while (true) {
         var code: win.DWORD = 0;
-        var exited = true;
+        var exited = false;
         if (child.id) |handle| {
             _ = win.WaitForSingleObject(handle, 50);
-            exited = win.GetExitCodeProcess(handle, &code) != 0 and code != win.STILL_ACTIVE;
+            if (win.GetExitCodeProcess(handle, &code) != 0 and code != win.STILL_ACTIVE) {
+                exited = true;
+                exit_code = code;
+            }
         }
         _ = drainChildPipe(a.allocator, child.stdout, &output, wacli_read_stdout_limit);
         // Stderr is small but must also drain or the child wedges on a full
@@ -1337,7 +1341,9 @@ fn wacliRunBoundedRead(a: *App, argv: [][]const u8, result: *WacliResult) void {
         wacliPost(a, result);
         return;
     }
-    result.ok = true;
+    // A nonzero wacli exit (store error, bad arguments) must fail the read
+    // like a timeout does, so the retry cycle runs and cached data survives.
+    result.ok = exit_code == 0;
     result.data = a.allocator.dupe(u8, output.items) catch blk: {
         result.ok = false;
         break :blk &.{};
