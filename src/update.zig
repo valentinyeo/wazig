@@ -51,6 +51,20 @@ pub fn isNewer(latest_tag: []const u8, current: Version) bool {
     return latest.patch > current.patch;
 }
 
+/// A check that re-finds an update the user already declined must not pop
+/// the modal prompt again: it returns true only when the pending update is
+/// new (or none was offered yet), so the offer happens once per release.
+pub fn isNewOffer(pending_tag: ?[]const u8, found_tag: []const u8) bool {
+    const pending = pending_tag orelse return true;
+    return !std.mem.eql(u8, pending, found_tag);
+}
+
+test isNewOffer {
+    try std.testing.expect(isNewOffer(null, "v0.9.44"));
+    try std.testing.expect(isNewOffer("v0.9.43", "v0.9.44"));
+    try std.testing.expect(!isNewOffer("v0.9.44", "v0.9.44"));
+}
+
 /// Checks the SHA-256 of `data` against a GitHub asset digest field
 /// ("sha256:<64 lowercase hex chars>").
 pub fn digestMatches(data: []const u8, digest_field: []const u8) bool {
