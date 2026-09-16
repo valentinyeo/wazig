@@ -521,6 +521,8 @@ const App = struct {
     sb_palette_total: i32 = -1,
     update_pending: ?*UpdateAvailable = null,
     update_check_running: bool = false,
+    // Touched by both the UI thread and the detached update worker.
+    update_install_running: std.atomic.Value(bool) = .init(false),
     update_last_check_ms: u64 = 0,
     update_failures: u32 = 0,
     chats: [max_chats]Chat = [_]Chat{.{}} ** max_chats,
@@ -9484,8 +9486,13 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
         wm_update_ready => {
             // wparam: 1 installed, 2 newer version found (lparam = *UpdateAvailable),
             // 3 no update, 4 check failed automatically, 5 check failed manually
-            // (lparam = static @errorName text), 6 blocked by another running copy.
-            a.update_check_running = false;
+            // (lparam = static @errorName text), 6 blocked by another running copy,
+            // 7 install failed (lparam like 5), 8 install found no update.
+            // Check threads post 2-5; install threads post 1 and 6-8. Each
+            // completion clears only its own slot, so overlapping operations
+            // can never free each other's flag.
+            if (wparam >= 2 and wparam <= 5) a.update_check_running = false;
+            if (wparam == 1 or wparam >= 6) a.update_install_running.store(false, .release);
             switch (wparam) {
                 1 => {
                     setStatus(a, "Update installed - restarting in 10 seconds");
@@ -9513,7 +9520,7 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
                     a.update_failures = 0;
                     showUpdatePrompt(a);
                 },
-                3 => {
+                3, 8 => {
                     a.update_failures = 0;
                     var none_buf: [96]u8 = undefined;
                     setStatus(a, std.fmt.bufPrint(&none_buf, "You are on v{s} - this is the newest version", .{app_version}) catch "No updates found");
@@ -9522,12 +9529,14 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
                     a.update_failures = 0;
                     setStatus(a, "Update blocked: another copy of Messages is running - close other copies and try again");
                 },
-                4, 5 => {
+                4, 5, 7 => {
                     const name: [*:0]const u8 = @ptrFromInt(@as(usize, @bitCast(lparam)));
                     a.update_failures += 1;
                     var fail_buf: [128]u8 = undefined;
-                    const text = std.fmt.bufPrint(&fail_buf, "Update check failed: {s}", .{std.mem.span(name)}) catch "Update check failed";
-                    if (wparam == 5 or a.update_failures >= 2) setStatus(a, text);
+                    const verb: []const u8 = if (wparam == 7) "install" else "check";
+                    const text = std.fmt.bufPrint(&fail_buf, "Update {s} failed: {s}", .{ verb, std.mem.span(name) }) catch "Update failed";
+                    // 5 and 7 are user-initiated, so their failures always show.
+                    if (wparam != 4 or a.update_failures >= 2) setStatus(a, text);
                 },
                 else => {},
             }
@@ -10921,15 +10930,40 @@ fn startUpdateCheck(hwnd: win.HWND, manual: bool) void {
 
 fn startUpdateInstall(hwnd: win.HWND) void {
     const a = app_ptr orelse return;
-    if (a.update_check_running and win.GetTickCount64() - a.update_last_check_ms < update_check_timeout_ms) return;
+    // WAZI-81: a concurrent read-only check must never swallow an explicit
+    // install request — activation fires checks constantly, so this guard
+    // used to turn the update button into a silent no-op. performUpdate
+    // re-checks and serializes on the update mutex itself.
+    if (a.update_install_running.load(.acquire)) {
+        setStatus(a, "An update install is already running");
+        return;
+    }
     const ctx = std.heap.page_allocator.create(UpdateContext) catch return;
     ctx.* = .{ .io = a.io, .hwnd = hwnd, .manual = true, .install = true };
+    // Claim the slot before spawning: the worker may post its completion
+    // (and free the slot) as soon as it starts, so claiming afterwards
+    // could leave a stale claim behind.
+    a.update_install_running.store(true, .release);
     const thread = std.Thread.spawn(.{}, updateThreadMain, .{ctx}) catch {
+        a.update_install_running.store(false, .release);
         std.heap.page_allocator.destroy(ctx);
         return;
     };
     thread.detach();
-    a.update_check_running = true;
+}
+
+/// A lost completion message would wedge the install slot (the button
+/// would refuse every later install until restart), so a full message
+/// queue is retried briefly instead of dropping the outcome. If even the
+/// retries fail, the slot is freed from here: a wrongly freed slot can
+/// at worst start a second install, which the update mutex serializes.
+fn postInstallResult(hwnd: win.HWND, code: u32, lparam: usize) void {
+    var tries: u32 = 0;
+    while (tries < 50) : (tries += 1) {
+        if (win.PostMessageW(hwnd, wm_update_ready, code, @bitCast(lparam)) != 0) return;
+        win.Sleep(100);
+    }
+    if (app_ptr) |a| a.update_install_running.store(false, .release);
 }
 
 fn postUpdateFailure(hwnd: win.HWND, manual: bool, err: anyerror) void {
@@ -10946,14 +10980,19 @@ fn updateThreadMain(ctx: *UpdateContext) void {
         // digest; a code-signing certificate would be needed to authenticate the
         // publisher itself. Upgrade path: verify an Authenticode signature here.
         const outcome = performUpdate(ctx.io) catch |err| {
-            postUpdateFailure(ctx.hwnd, ctx.manual, err);
+            logUpdateFailure(@errorName(err));
+            // 7 is install-only: a concurrent check posting 4/5 must never
+            // look like the install finished and free its slot.
+            const name: [*:0]const u8 = @errorName(err).ptr;
+            postInstallResult(ctx.hwnd, 7, @intCast(@intFromPtr(name)));
             return;
         };
         if (outcome == .blocked) logUpdateFailure("update blocked by another running copy");
-        _ = win.PostMessageW(ctx.hwnd, wm_update_ready, switch (outcome) {
+        postInstallResult(ctx.hwnd, switch (outcome) {
             .installed => @as(u32, 1),
             .blocked => 6,
-            .none => 3,
+            // 8 is install-only, same reason as 7.
+            .none => 8,
         }, 0);
         return;
     }
