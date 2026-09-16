@@ -9609,11 +9609,11 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
                     }
                 },
                 .messages => {
-                    // WAZI-79: exactly one messages read can be outstanding,
-                    // so its result frees the slot whatever the outcome; a
-                    // recorded redo (a refresh that arrived meanwhile) is
-                    // issued now for the chat the user is actually viewing.
-                    a.msg_fetch_inflight = false;
+                    // WAZI-79: only the newest issued read frees the slot;
+                    // a stale result may still sit queued behind a read the
+                    // tick recovery started (its slot leak path covers jobs
+                    // that never post at all).
+                    if (result.gen == a.msg_fetch_seq) a.msg_fetch_inflight = false;
                     const is_selected = a.selected_chat < a.chat_count and
                         std.mem.eql(u8, a.chats[a.selected_chat].jid.slice(), result.jid.slice());
                     if (!result.ok) {
