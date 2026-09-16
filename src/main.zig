@@ -7568,6 +7568,10 @@ fn removeWhatsAppAccount(a: *App) void {
 }
 
 fn addWhatsAppAccount(a: *App) void {
+    // WAZI-82: pairing is the escape hatch from a halted sync loop, so it
+    // must clear the halt or checkSync would stay stopped after a relink.
+    a.sync_fail_count = 0;
+    a.sync_logged_out = false;
     const exe_wide = utf8ToWide(a.allocator, a.wacli_path) catch {
         setStatus(a, "Could not open the pairing window");
         return;
