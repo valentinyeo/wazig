@@ -5712,8 +5712,11 @@ fn checkSync(a: *App) void {
                 _ = child.wait(a.io) catch {};
                 a.sync_child = null;
                 const lived_secs = nowUnixSeconds() - a.sync_started_secs;
-                if (lived_secs >= accounts.sync_fast_death_secs) a.sync_fail_count = 0;
-                a.sync_fail_count += 1;
+                if (lived_secs < accounts.sync_fast_death_secs) {
+                    a.sync_fail_count += 1;
+                } else {
+                    a.sync_fail_count = 0;
+                }
                 if (accounts.syncDeathAction(lived_secs, a.sync_fail_count) == .probe_login) {
                     a.sync_auth_probe = true;
                     enqueueCacheTagProbe(a);
