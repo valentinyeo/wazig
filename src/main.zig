@@ -1283,7 +1283,7 @@ fn wacliJobIsReadOnly(kind: WacliJobKind) bool {
 /// remainder drains on the next tick.
 const drain_pipe_max_chunks = 64;
 
-fn drainChildPipe(allocator: std.mem.Allocator, file: ?std.Io.File, sink: ?*std.ArrayListUnmanaged(u8), limit: usize) bool {
+fn drainChildPipe(allocator: std.mem.Allocator, file: ?std.Io.File, sink: ?*std.ArrayListUnmanaged(u8), limit: usize, truncated: *bool) bool {
     const stream = file orelse return false;
     var consumed = false;
     var chunks: u32 = 0;
@@ -1295,7 +1295,14 @@ fn drainChildPipe(allocator: std.mem.Allocator, file: ?std.Io.File, sink: ?*std.
         var got: win.DWORD = 0;
         if (win.ReadFile(stream.handle, &chunk, @min(available, chunk.len), &got, null) == 0 or got == 0) break;
         if (sink) |list| {
-            if (list.items.len < limit) list.appendSlice(allocator, chunk[0..got]) catch break;
+            if (list.items.len < limit) {
+                const room = limit - list.items.len;
+                if (got > room) truncated.* = true;
+                list.appendSlice(allocator, chunk[0..@min(got, room)]) catch {
+                    truncated.* = true;
+                    break;
+                };
+            } else truncated.* = true;
         }
         consumed = true;
     }
@@ -1318,6 +1325,7 @@ fn wacliRunBoundedRead(a: *App, argv: [][]const u8, result: *WacliResult) void {
     var output: std.ArrayListUnmanaged(u8) = .empty;
     defer output.deinit(a.allocator);
     var timed_out = false;
+    var truncated = false;
     var exit_code: win.DWORD = 1;
     while (true) {
         var code: win.DWORD = 0;
@@ -1329,18 +1337,18 @@ fn wacliRunBoundedRead(a: *App, argv: [][]const u8, result: *WacliResult) void {
                 exit_code = code;
             }
         }
-        _ = drainChildPipe(a.allocator, child.stdout, &output, wacli_read_stdout_limit);
+        _ = drainChildPipe(a.allocator, child.stdout, &output, wacli_read_stdout_limit, &truncated);
         // Stderr is small but must also drain or the child wedges on a full
         // pipe exactly like the incident being fixed here.
-        _ = drainChildPipe(a.allocator, child.stderr, null, 0);
+        _ = drainChildPipe(a.allocator, child.stderr, null, 0, &truncated);
         if (exited) break;
         if (win.GetTickCount64() >= deadline) {
             timed_out = true;
             result.extra.set("timeout");
             _ = child.kill(a.io);
             // Drain to EOF so a killed child cannot hold a broken pipe.
-            while (drainChildPipe(a.allocator, child.stdout, &output, wacli_read_stdout_limit)) {}
-            _ = drainChildPipe(a.allocator, child.stderr, null, 0);
+            while (drainChildPipe(a.allocator, child.stdout, &output, wacli_read_stdout_limit, &truncated)) {}
+            _ = drainChildPipe(a.allocator, child.stderr, null, 0, &truncated);
             break;
         }
     }
@@ -1349,9 +1357,10 @@ fn wacliRunBoundedRead(a: *App, argv: [][]const u8, result: *WacliResult) void {
         wacliPost(a, result);
         return;
     }
-    // A nonzero wacli exit (store error, bad arguments) must fail the read
-    // like a timeout does, so the retry cycle runs and cached data survives.
-    result.ok = exit_code == 0;
+    // A nonzero wacli exit (store error, bad arguments) or truncated capture
+    // must fail the read like a timeout does, so the retry cycle runs and
+    // cached data is never replaced with partial output.
+    result.ok = exit_code == 0 and !truncated;
     result.data = a.allocator.dupe(u8, output.items) catch blk: {
         result.ok = false;
         break :blk &.{};
