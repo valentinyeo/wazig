@@ -672,7 +672,6 @@ const App = struct {
     // results would invalidate each other (the tail never landed).
     msg_fetch_inflight: bool = false,
     msg_fetch_dirty: bool = false,
-    msg_fetch_jid: Utf8Text(191) = .{},
     msg_fetch_seq: u64 = 0,
     chats_gen: u64 = 0,
     chats_pending_flags: u8 = 0,
@@ -5903,13 +5902,11 @@ fn refreshMessages(a: *App) void {
     // issued when the read finishes. Stacking reads made each result
     // invalidate the previous one, so the fresh tail never landed.
     if (!message_fetch.shouldFetch(a.msg_fetch_inflight)) {
-        a.msg_fetch_jid.set(chat.jid.slice());
         a.msg_fetch_dirty = true;
         return;
     }
     a.msg_fetch_inflight = true;
     a.msg_fetch_dirty = false;
-    a.msg_fetch_jid.set(chat.jid.slice());
     a.msg_fetch_seq += 1;
     var job = WacliJob{ .kind = .messages, .gen = a.msg_fetch_seq };
     job.jid.set(chat.jid.slice());
@@ -9976,6 +9973,18 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
         },
         win.WM_TIMER => {
             if (wparam == timer_refresh) {
+                // WAZI-79: a queued messages job can be evicted when the
+                // queue fills, and a failed result allocation never posts;
+                // both leave the single-read slot stuck. The pending count
+                // drops on every terminal path, so a zero count with the
+                // slot still marked frees it and runs any recorded redo.
+                if (a.msg_fetch_inflight and wacliPendingGet(a, .messages) == 0) {
+                    a.msg_fetch_inflight = false;
+                    if (a.msg_fetch_dirty) {
+                        a.msg_fetch_dirty = false;
+                        refreshMessages(a);
+                    }
+                }
                 checkMediaDownload(a);
                 checkSend(a);
                 checkMarkRead(a);
