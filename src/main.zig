@@ -1278,11 +1278,16 @@ fn wacliJobIsReadOnly(kind: WacliJobKind) bool {
 /// Reads whatever is ready on a child's output pipe without blocking. Appends
 /// to `sink` when non-null, dropping chunks once `limit` is reached so the
 /// pipe still drains (a blocked child would masquerade as a timeout). Returns
-/// true when at least one chunk was consumed.
+/// true when at least one chunk was consumed. Bounded per call so a child
+/// writing continuously cannot starve the caller's deadline checks; the
+/// remainder drains on the next tick.
+const drain_pipe_max_chunks = 64;
+
 fn drainChildPipe(allocator: std.mem.Allocator, file: ?std.Io.File, sink: ?*std.ArrayListUnmanaged(u8), limit: usize) bool {
     const stream = file orelse return false;
     var consumed = false;
-    while (true) {
+    var chunks: u32 = 0;
+    while (chunks < drain_pipe_max_chunks) : (chunks += 1) {
         var available: win.DWORD = 0;
         if (win.PeekNamedPipe(stream.handle, null, 0, null, &available, null) == 0) break;
         if (available == 0) break;
