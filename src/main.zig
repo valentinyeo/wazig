@@ -11053,7 +11053,19 @@ fn showUpdatePrompt(a: *App) void {
     defer a.allocator.free(text_wide);
     const title_wide = utf8ToWide(a.allocator, "Messages update") catch return;
     defer a.allocator.free(title_wide);
+    // WAZI-84: a failed swap can leave two live copies of the app running,
+    // and both used to pop this modal box at once. One prompt at a time: a
+    // copy that loses the race falls back to the status line, which names
+    // the palette command, so nothing is lost and nothing is doubled.
+    const prompt_mutex = win.CreateMutexW(null, win.FALSE, lit("Local\\MessagesUpdatePromptMutex")) orelse return;
+    defer _ = win.CloseHandle(prompt_mutex);
+    if (update.classifyMutexWait(win.WaitForSingleObject(prompt_mutex, 0)) != .acquired) {
+        var later_buf: [160]u8 = undefined;
+        setStatus(a, std.fmt.bufPrint(&later_buf, "Update to {s} is ready - choose \"Restart now to install update\" in the command palette when you want it", .{upd.tag}) catch "An update is ready in the command palette");
+        return;
+    }
     const choice = win.MessageBoxW(a.hwnd.?, text_wide.ptr, title_wide.ptr, win.MB_YESNO | win.MB_ICONINFORMATION);
+    _ = win.ReleaseMutex(prompt_mutex);
     if (choice == win.IDYES) {
         if (a.hwnd) |hwnd| startUpdateInstall(hwnd);
     } else {
@@ -11066,6 +11078,18 @@ fn showUpdatePrompt(a: *App) void {
 /// %LOCALAPPDATA%\Wazig\update.log (WAZI-60): failures must never vanish
 /// into "nothing to do".
 fn logUpdateFailure(err_name: []const u8) void {
+    var clock = std.mem.zeroes(win.SYSTEMTIME);
+    win.GetLocalTime(&clock);
+    var line_buf: [160]u8 = undefined;
+    const line = std.fmt.bufPrint(&line_buf, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2} update check failed: {s}\r\n", .{
+        clock.wYear, clock.wMonth, clock.wDay, clock.wHour, clock.wMinute, clock.wSecond, err_name,
+    }) catch return;
+    appendUpdateLogLine(line);
+}
+
+/// Appends one pre-formatted line to %LOCALAPPDATA%\Wazig\update.log; a
+/// diagnostics channel shared with logUpdateFailure (WAZI-84).
+fn appendUpdateLogLine(line: []const u8) void {
     const allocator = std.heap.page_allocator;
     var local_buf: [256]u16 = undefined;
     const local_len: usize = @intCast(win.GetEnvironmentVariableW(lit("LOCALAPPDATA"), &local_buf, local_buf.len));
@@ -11076,17 +11100,31 @@ fn logUpdateFailure(err_name: []const u8) void {
     defer allocator.free(log_path);
     const wide = utf8ToWide(allocator, log_path) catch return;
     defer allocator.free(wide);
-    var clock = std.mem.zeroes(win.SYSTEMTIME);
-    win.GetLocalTime(&clock);
-    var line_buf: [160]u8 = undefined;
-    const line = std.fmt.bufPrint(&line_buf, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2} update check failed: {s}\r\n", .{
-        clock.wYear, clock.wMonth, clock.wDay, clock.wHour, clock.wMinute, clock.wSecond, err_name,
-    }) catch return;
     const handle = win.CreateFileW(wide.ptr, win.FILE_APPEND_DATA, win.FILE_SHARE_READ | win.FILE_SHARE_WRITE, null, win.OPEN_ALWAYS, win.FILE_ATTRIBUTE_NORMAL, null);
     if (handle == win.INVALID_HANDLE_VALUE or handle == null) return;
     defer _ = win.CloseHandle(handle);
     var written: win.DWORD = 0;
     _ = win.WriteFile(handle, line.ptr, @intCast(line.len), &written, null);
+}
+
+/// WAZI-84: a swap failure used to leave nothing in update.log but the error
+/// name, so the real machine could not be diagnosed. Record the exe path and
+/// what the staged swap actually held when the exe destination is the problem.
+fn logUpdateSwapDetail(exe_path: []const u8, pending: []const SwapPending) void {
+    const allocator = std.heap.page_allocator;
+    var line_buf: [1024]u8 = undefined;
+    var fbs: std.Io.Writer = .fixed(&line_buf);
+    fbs.print("swap detail: exe_path={s} staged={d}\r\n", .{ exe_path, pending.len }) catch {};
+    for (pending, 0..) |p, i| {
+        if (i >= 8) {
+            fbs.print("swap detail: ...\r\n", .{}) catch {};
+            break;
+        }
+        const dest = wideToUtf8(allocator, p.dest) catch continue;
+        defer allocator.free(dest);
+        fbs.print("swap detail: dest={s}\r\n", .{dest}) catch {};
+    }
+    appendUpdateLogLine(fbs.buffered());
 }
 
 fn utf8ToWide(allocator: std.mem.Allocator, text: []const u8) ![:0]u16 {
@@ -11319,7 +11357,11 @@ fn performUpdate(io: std.Io) !UpdateOutcome {
 
     var exe_wide_buf: [519]u16 = undefined;
     const exe_len: usize = @intCast(win.GetModuleFileNameW(null, &exe_wide_buf, exe_wide_buf.len));
-    if (exe_len == 0 or exe_len >= exe_wide_buf.len) return error.UpdateNoExePath;
+    if (exe_len == 0 or exe_len >= exe_wide_buf.len) {
+        var detail_buf: [96]u8 = undefined;
+        appendUpdateLogLine(std.fmt.bufPrint(&detail_buf, "swap detail: exe path unreadable, len={d}\r\n", .{exe_len}) catch return error.UpdateNoExePath);
+        return error.UpdateNoExePath;
+    }
     const exe_path = try wideToUtf8(allocator, exe_wide_buf[0..exe_len]);
     defer allocator.free(exe_path);
     const exe_dir = std.fs.path.dirname(exe_path) orelse return error.UpdateNoExePath;
@@ -11421,7 +11463,13 @@ fn performUpdate(io: std.Io) !UpdateOutcome {
         try zip_writer.interface.writeAll(body);
         try zip_writer.interface.flush();
     }
-    const stage = try root.createDirPathOpen(io, "stage", .{});
+    // WAZI-84: the stage handle must carry list rights, or copying the staged
+    // files walks an empty directory: on Windows a handle opened without
+    // .iterate lacks FILE_LIST_DIRECTORY, NtQueryDirectoryFile is denied, and
+    // the failed query looks like zero entries - so nothing matched the exe
+    // path and every install died with UpdateNoExePath before renaming a
+    // single file.
+    const stage = try root.createDirPathOpen(io, "stage", .{ .open_options = .{ .iterate = true } });
     defer stage.close(io);
     // Bound the archive before trusting it: entry count and decompressed size.
     {
@@ -11482,6 +11530,7 @@ fn performUpdate(io: std.Io) !UpdateOutcome {
     for (pending.items, 0..) |p, i| {
         if (eqlWideIgnoreCase(p.dest, exe_wide)) exe_index = i;
     }
+    if (exe_index == null) logUpdateSwapDetail(exe_path, pending.items);
     const exe_i = exe_index orelse return error.UpdateNoExePath;
     const exe_temp = pending.items[exe_i].temp;
 
