@@ -11794,10 +11794,21 @@ fn performUpdate(io: std.Io) !UpdateOutcome {
     // rollback journal, deliberately — the only files beside the exe are the
     // two IBM Plex fonts and the OFL license, so a partially renamed support
     // set leaves the app runnable and is redone on the next update attempt.
-    // Leftover temps and a stale .old are also cleared there.
+    // Leftover temps and a stale .old are also cleared there. The fonts are
+    // open in the running app (they load privately from beside the exe), so
+    // the swap goes through swapFileIntoPlace instead of a bare replace.
     for (pending.items, 0..) |p, i| {
         if (i == exe_i) continue;
-        if (win.MoveFileExW(p.temp.ptr, p.dest.ptr, win.MOVEFILE_REPLACE_EXISTING) == 0) {
+        if (!swapFileIntoPlace(p.temp, p.dest)) {
+            // WAZI-84: name the file that refused the swap, so a failure on
+            // the real machine says which open handle was in the way.
+            if (wideToUtf8(allocator, p.dest)) |dest_utf8| {
+                defer allocator.free(dest_utf8);
+                var detail_buf: [600]u8 = undefined;
+                if (std.fmt.bufPrint(&detail_buf, "swap detail: support rename failed: {s}\r\n", .{dest_utf8}) catch null) |line| {
+                    appendUpdateLogLine(line);
+                }
+            } else |_| {}
             for (pending.items, 0..) |q, j| {
                 if (j != i and j != exe_i) _ = win.DeleteFileW(q.temp.ptr);
             }
@@ -11831,6 +11842,33 @@ fn restoreExeFile(source: [:0]const u16, dest: [:0]const u16) bool {
         _ = win.DeleteFileW(tmp.ptr);
         return false;
     }
+    return true;
+}
+
+/// WAZI-84: move one staged replacement onto its destination. A direct
+/// replace has to delete the target first, and that fails while the running
+/// app holds the file open — the two privately loaded IBM Plex fonts are open
+/// exactly like the live exe. Fall back to the exe's own dance: rename the
+/// open destination aside (a rename needs no write access to the bytes), then
+/// the staged file renames onto the now-free name. The open handle keeps the
+/// aside copy alive under its new name until the app exits, so its delete is
+/// best effort and the next update attempt clears it.
+fn swapFileIntoPlace(temp: [:0]const u16, dest: [:0]const u16) bool {
+    if (win.MoveFileExW(temp.ptr, dest.ptr, win.MOVEFILE_REPLACE_EXISTING) != 0) return true;
+    const suffix = ".old";
+    var old_buf: [519 + suffix.len]u16 = undefined;
+    if (dest.len + suffix.len >= old_buf.len) return false;
+    @memcpy(old_buf[0..dest.len], dest[0..dest.len]);
+    for (suffix, 0..) |c, i| old_buf[dest.len + i] = c;
+    old_buf[dest.len + suffix.len] = 0;
+    const old_path = old_buf[0 .. dest.len + suffix.len :0];
+    if (win.MoveFileExW(dest.ptr, old_path.ptr, win.MOVEFILE_REPLACE_EXISTING) == 0) return false;
+    if (win.MoveFileExW(temp.ptr, dest.ptr, win.MOVEFILE_REPLACE_EXISTING) == 0) {
+        // Nothing is in place now; put the original back before giving up.
+        _ = win.MoveFileExW(old_path.ptr, dest.ptr, win.MOVEFILE_REPLACE_EXISTING);
+        return false;
+    }
+    _ = win.DeleteFileW(old_path.ptr);
     return true;
 }
 
