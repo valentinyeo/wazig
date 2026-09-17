@@ -575,6 +575,7 @@ const App = struct {
     read_child: ?std.process.Child = null,
     read_spawn_failures: u32 = 0,
     read_started_ms: u64 = 0,
+    read_backoff_until_ms: u64 = 0,
     pending_reads: [max_pending_reads]Utf8Text(191) = [_]Utf8Text(191){.{}} ** max_pending_reads,
     pending_read_count: usize = 0,
     read_retries: [max_pending_reads]u8 = [_]u8{0} ** max_pending_reads,
@@ -3617,25 +3618,32 @@ fn removeFirstPendingRead(a: *App) void {
     persistPendingReads(a);
 }
 
-// A failed write goes back in the queue (up to 3 attempts) instead of being
-// dropped: the store lock can be lost to a parallel job, and without a retry
-// the chat stays unread until the user opens it again.
+// A failed write goes back in the queue instead of being dropped: the store
+// lock can be lost to a parallel job, and without a retry the chat stays
+// unread until the user opens it again.
 const max_read_retries = 3;
 
-fn requeueFailedRead(a: *App) bool {
-    if (a.read_retries[0] + 1 >= max_read_retries) {
-        removeFirstPendingRead(a);
-        return false;
-    }
-    // Rotate in place: a full queue must not cost the failed read its retry.
+// After this many consecutive failures the read backs off before its next
+// attempt instead of being dropped.
+const read_retry_backoff_ms: u64 = 10 * 60 * 1000;
+
+// Next retry counter for a read that just failed: it climbs to the cap, then
+// the caller applies a backoff and the counter restarts. The read itself is
+// never dropped — its badge is already cleared, so a dropped read leaves the
+// chat unread in the store and it reappears after the next launch (WAZI-88).
+fn nextReadRetry(retries: u8) u8 {
+    return if (retries + 1 >= max_read_retries) 0 else retries + 1;
+}
+
+fn requeueFailedRead(a: *App) void {
     const jid = a.pending_reads[0];
-    const retries = a.read_retries[0] + 1;
+    const retries = nextReadRetry(a.read_retries[0]);
+    if (retries == 0) a.read_backoff_until_ms = win.GetTickCount64() + read_retry_backoff_ms;
     removeFirstPendingRead(a);
     a.pending_reads[a.pending_read_count] = jid;
     a.read_retries[a.pending_read_count] = retries;
     a.pending_read_count += 1;
     persistPendingReads(a);
-    return true;
 }
 
 // The pending mark-read queue mirrors to disk on every change: a read that
@@ -3712,6 +3720,7 @@ fn loadPendingReads(a: *App) void {
 // store lock took. Run it as a background job like sends and archives.
 fn startNextMarkRead(a: *App) void {
     if (a.read_child != null or a.pending_read_count == 0) return;
+    if (win.GetTickCount64() < a.read_backoff_until_ms) return;
     // Media downloads hold the store lock for up to 60s while a mark-read
     // write waits only 10s, so a read started next to them loses the lock
     // and its write is dropped. Jobs are serialized by the gates above, but
@@ -3766,10 +3775,12 @@ fn checkMarkRead(a: *App) void {
         }
         _ = child.wait(a.io) catch {};
         a.read_child = null;
-        if (code != 0) _ = requeueFailedRead(a) else removeFirstPendingRead(a);
+        if (code != 0) requeueFailedRead(a) else removeFirstPendingRead(a);
         // Drain the queue back-to-back before restarting live sync, which
-        // stays suspended while reads are pending.
-        if (a.pending_read_count > 0) {
+        // stays suspended while reads are pending. While a failed read is
+        // backing off, release the store and bring live sync back instead
+        // of holding it suspended for the whole backoff.
+        if (a.pending_read_count > 0 and win.GetTickCount64() >= a.read_backoff_until_ms) {
             startNextMarkRead(a);
             return;
         }
@@ -11958,6 +11969,12 @@ fn relaunchIntoUpdate(a: *App) void {
     } else {
         setStatus(a, "Update installed - restart the app to finish");
     }
+}
+
+test "a read that exhausts its retries backs off and restarts the counter" {
+    try std.testing.expectEqual(@as(u8, 1), nextReadRetry(0));
+    try std.testing.expectEqual(@as(u8, 2), nextReadRetry(1));
+    try std.testing.expectEqual(@as(u8, 0), nextReadRetry(2));
 }
 
 test "sender name shows only at the start of a same-sender run" {
