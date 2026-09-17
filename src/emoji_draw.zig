@@ -262,8 +262,12 @@ fn formatFor(em: i32) ?*win.IDWriteTextFormat {
 /// Measure and draw share this so both always go through a real layout
 /// (WAZI-85: DrawTextLayout must never be handed the cached IDWriteTextFormat
 /// — D2D dispatches layout calls through the object it is given, and a format
-/// has no such vtable slots). null on any failure, already logged.
+/// has no such vtable slots). This is the module boundary: every caller's
+/// input is validated here, before the expensive CreateTextLayout runs, so
+/// the invariant lives in one place and not in each caller. null on any
+/// failure, already logged.
 fn textLayout(text: []const u16, em: i32) ?*win.IDWriteTextLayout {
+    if (text.len == 0 or text.len > max_sequence_units or em <= 0 or em > 256) return null;
     const dwrite = state.dwrite orelse return null;
     const format = formatFor(em) orelse return null;
     var layout: ?*win.IDWriteTextLayout = null;
@@ -289,10 +293,13 @@ fn metricsFromLayout(layout: *win.IDWriteTextLayout) ?Metrics {
     var line: win.DWRITE_LINE_METRICS = undefined;
     var line_count: u32 = 0;
     const line_hr = layout.*.lpVtbl.*.GetLineMetrics.?(layout, &line, 1, &line_count);
-    if (line_hr != 0 or line_count == 0) {
+    if (line_hr != 0) {
         _ = fail(.layout, line_hr);
         return null;
     }
+    // A successful call with zero lines is an empty layout, not a DirectWrite
+    // failure: reject it silently so emoji.log never records "hr 0x00000000".
+    if (line_count == 0) return null;
     return .{
         .width = @intFromFloat(@ceil(text_metrics.widthIncludingTrailingWhitespace)),
         .baseline = @intFromFloat(@ceil(line.baseline)),
