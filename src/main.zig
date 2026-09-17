@@ -521,6 +521,8 @@ const App = struct {
     sb_palette_total: i32 = -1,
     update_pending: ?*UpdateAvailable = null,
     update_check_running: bool = false,
+    // Touched by both the UI thread and the detached update worker.
+    update_install_running: std.atomic.Value(bool) = .init(false),
     update_last_check_ms: u64 = 0,
     update_failures: u32 = 0,
     chats: [max_chats]Chat = [_]Chat{.{}} ** max_chats,
@@ -2392,6 +2394,394 @@ fn tdlibSmoke(io: std.Io) u8 {
         waited_ms += 100;
     }
     return 1;
+}
+
+// --- WAZI-68 affected-machine verification (--unfurl-smoke) ---
+// Runs the shipped unfurl pipeline on a real Windows desktop without a
+// WhatsApp session: classify the ticket's link forms, fetch live card data
+// through the real background fetch, render the real card painter offscreen,
+// then play through the real MFPlay player window and toggle real fullscreen.
+// Writes screenshots and a results log into UNFURL_SMOKE_DIR (default
+// "unfurl-smoke") and exits 0 only when every mechanical check passes.
+
+var smoke_unfurl_done_count: u32 = 0;
+
+fn smokeUnfurlProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.LPARAM) callconv(.winapi) win.LRESULT {
+    if (message == wm_unfurl_done) {
+        const result: *UnfurlResult = @ptrFromInt(@as(usize, @bitCast(lparam)));
+        if (app_ptr) |a| {
+            applyUnfurlResult(a, result);
+        } else {
+            if (result.thumb) |bytes| std.heap.page_allocator.free(bytes);
+            std.heap.page_allocator.destroy(result);
+        }
+        _ = @atomicRmw(u32, &smoke_unfurl_done_count, .Add, 1, .monotonic);
+        return 0;
+    }
+    return win.DefWindowProcW(hwnd, message, wparam, lparam);
+}
+
+fn smokePump(io: std.Io, timeout_ms: u32, target_done: u32) void {
+    var waited: u32 = 0;
+    while (waited < timeout_ms) {
+        var message = std.mem.zeroes(win.MSG);
+        while (win.PeekMessageW(&message, null, 0, 0, win.PM_REMOVE) != 0) {
+            _ = win.TranslateMessage(&message);
+            _ = win.DispatchMessageW(&message);
+        }
+        if (@atomicLoad(u32, &smoke_unfurl_done_count, .monotonic) >= target_done) return;
+        io.sleep(std.Io.Duration.fromMilliseconds(50), .awake) catch return;
+        waited += 50;
+    }
+}
+
+fn smokeRectsClose(a: win.RECT, b: win.RECT, tolerance: u32) bool {
+    return @abs(a.left - b.left) <= tolerance and @abs(a.top - b.top) <= tolerance and
+        @abs(a.right - b.right) <= tolerance and @abs(a.bottom - b.bottom) <= tolerance;
+}
+
+fn smokeWindowRect(hwnd: win.HWND) win.RECT {
+    var rect = std.mem.zeroes(win.RECT);
+    _ = win.GetWindowRect(hwnd, &rect);
+    return rect;
+}
+
+fn smokeHasCaption(hwnd: win.HWND) bool {
+    const style = win.GetWindowLongPtrW(hwnd, win.GWL_STYLE);
+    return (style & @as(isize, @intCast(win.WS_CAPTION))) != 0;
+}
+
+fn smokeMonitorRect(hwnd: win.HWND) win.RECT {
+    const monitor = win.MonitorFromWindow(hwnd, win.MONITOR_DEFAULTTONEAREST);
+    var info = std.mem.zeroes(win.MONITORINFO);
+    info.cbSize = @sizeOf(win.MONITORINFO);
+    _ = win.GetMonitorInfoW(monitor, &info);
+    return info.rcMonitor;
+}
+
+fn smokeWriteBmp(allocator: std.mem.Allocator, io: std.Io, dir: []const u8, name: []const u8, width: i32, height: i32, pixels: []const u8) void {
+    var blob: std.ArrayList(u8) = .empty;
+    defer blob.deinit(allocator);
+    const data_size: u32 = @intCast(pixels.len);
+    var file_header: [14]u8 = .{ 'B', 'M' } ++ [_]u8{0} ** 12;
+    std.mem.writeInt(u32, file_header[2..6], 54 + data_size, .little);
+    std.mem.writeInt(u32, file_header[10..14], 54, .little);
+    var info_header = std.mem.zeroes(win.BITMAPINFOHEADER);
+    info_header.biSize = @sizeOf(win.BITMAPINFOHEADER);
+    info_header.biWidth = width;
+    // Top-down rows, so no bottom-up flip is needed on capture.
+    info_header.biHeight = -height;
+    info_header.biPlanes = 1;
+    info_header.biBitCount = 32;
+    info_header.biCompression = win.BI_RGB;
+    info_header.biSizeImage = data_size;
+    blob.appendSlice(allocator, &file_header) catch return;
+    blob.appendSlice(allocator, std.mem.asBytes(&info_header)) catch return;
+    blob.appendSlice(allocator, pixels) catch return;
+    const path = std.fs.path.join(allocator, &.{ dir, name }) catch return;
+    defer allocator.free(path);
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = blob.items }) catch {};
+}
+
+// Offscreen capture of a real window: BitBlt from its own DC into a DIB.
+fn smokeCaptureWindow(allocator: std.mem.Allocator, io: std.Io, dir: []const u8, name: []const u8, hwnd: win.HWND) bool {
+    const rect = smokeWindowRect(hwnd);
+    const w = rect.right - rect.left;
+    const h = rect.bottom - rect.top;
+    if (w <= 0 or h <= 0) return false;
+    const window_dc = win.GetWindowDC(hwnd) orelse return false;
+    defer _ = win.ReleaseDC(hwnd, window_dc);
+    const memory = win.CreateCompatibleDC(window_dc) orelse return false;
+    defer _ = win.DeleteDC(memory);
+    var info = std.mem.zeroes(win.BITMAPINFO);
+    info.bmiHeader.biSize = @sizeOf(win.BITMAPINFOHEADER);
+    info.bmiHeader.biWidth = w;
+    info.bmiHeader.biHeight = -h;
+    info.bmiHeader.biPlanes = 1;
+    info.bmiHeader.biBitCount = 32;
+    info.bmiHeader.biCompression = win.BI_RGB;
+    var bits: ?*anyopaque = null;
+    const bitmap = win.CreateDIBSection(memory, &info, win.DIB_RGB_COLORS, &bits, null, 0) orelse return false;
+    defer _ = win.DeleteObject(bitmap);
+    if (bits == null) return false;
+    const old = win.SelectObject(memory, bitmap);
+    defer _ = win.SelectObject(memory, old);
+    if (win.BitBlt(memory, 0, 0, w, h, window_dc, 0, 0, win.SRCCOPY) == 0) return false;
+    const pixel_count = @as(usize, @intCast(w)) * @as(usize, @intCast(h)) * 4;
+    const pixels = @as([*]const u8, @ptrCast(bits.?))[0..pixel_count];
+    smokeWriteBmp(allocator, io, dir, name, w, h, pixels);
+    return true;
+}
+
+// Renders one card with the shipped painter into its own offscreen bitmap.
+fn smokeDrawCard(allocator: std.mem.Allocator, io: std.Io, a: *App, dir: []const u8, name: []const u8, provider: unfurl.Provider, id: []const u8, canonical: []const u8) bool {
+    const width: i32 = 360;
+    const height: i32 = 120;
+    const screen_dc = win.GetDC(null) orelse return false;
+    defer _ = win.ReleaseDC(null, screen_dc);
+    const memory = win.CreateCompatibleDC(screen_dc) orelse return false;
+    defer _ = win.DeleteDC(memory);
+    // The chat frame sets this once per paint before drawing messages;
+    // mirror it so the evidence shows the card as the app renders it.
+    _ = win.SetBkMode(memory, win.TRANSPARENT);
+    var info = std.mem.zeroes(win.BITMAPINFO);
+    info.bmiHeader.biSize = @sizeOf(win.BITMAPINFOHEADER);
+    info.bmiHeader.biWidth = width;
+    info.bmiHeader.biHeight = -height;
+    info.bmiHeader.biPlanes = 1;
+    info.bmiHeader.biBitCount = 32;
+    info.bmiHeader.biCompression = win.BI_RGB;
+    var bits: ?*anyopaque = null;
+    const bitmap = win.CreateDIBSection(memory, &info, win.DIB_RGB_COLORS, &bits, null, 0) orelse return false;
+    defer _ = win.DeleteObject(bitmap);
+    if (bits == null) return false;
+    const old = win.SelectObject(memory, bitmap);
+    defer _ = win.SelectObject(memory, old);
+    const background = win.CreateSolidBrush(color_bg) orelse return false;
+    defer _ = win.DeleteObject(background);
+    _ = win.FillRect(memory, &.{ .left = 0, .top = 0, .right = width, .bottom = height }, background);
+    var message = Message{};
+    message.unfurl_provider = provider;
+    message.unfurl_id.set(id);
+    message.unfurl_canonical.set(canonical);
+    drawUnfurlCard(memory, a, &message, 20, 10, 320);
+    const pixel_count = @as(usize, @intCast(width)) * @as(usize, @intCast(height)) * 4;
+    const pixels = @as([*]const u8, @ptrCast(bits.?))[0..pixel_count];
+    smokeWriteBmp(allocator, io, dir, name, width, height, pixels);
+    return true;
+}
+
+// One diagnostic media-open attempt so the log records the exact MFPlay
+// result when a machine refuses the sample clip. Diagnostic only: the
+// shipped play path above stays the one whose behaviour is judged.
+fn smokeMfProbe(a: *App) struct { hr: win.HRESULT, note: []const u8 } {
+    var player: ?*win.IMFPMediaPlayer = null;
+    const probe_url = lit("https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerBlazes.mp4");
+    const hr = win.MFPCreateMediaPlayer(probe_url, 0, win.MFP_OPTION_NONE, &player_callback, a.hwnd orelse null, &player);
+    if (hr >= 0 and player != null) {
+        _ = player.?.lpVtbl.*.Shutdown.?(player.?);
+        _ = player.?.lpVtbl.*.Release.?(player.?);
+        return .{ .hr = hr, .note = "the media source opens on retry; the earlier refusal was transient" };
+    }
+    return .{ .hr = hr, .note = "MFPlay refused the media source on this machine; whether video can decode is a capability of the machine the app runs on" };
+}
+
+const SmokeLog = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dir: []const u8,
+    buffer: std.ArrayList(u8) = .empty,
+
+    fn line(self: *SmokeLog, comptime fmt: []const u8, args: anytype) void {
+        const text = std.fmt.allocPrint(self.allocator, fmt ++ "\n", args) catch return;
+        defer self.allocator.free(text);
+        self.buffer.appendSlice(self.allocator, text) catch {};
+    }
+
+    fn flush(self: *SmokeLog) void {
+        const path = std.fs.path.join(self.allocator, &.{ self.dir, "results.txt" }) catch return;
+        defer self.allocator.free(path);
+        std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = path, .data = self.buffer.items }) catch {};
+    }
+};
+
+fn unfurlSmoke(init: std.process.Init) u8 {
+    const allocator = init.gpa;
+    const instance = win.GetModuleHandleW(null) orelse return 1;
+    const out_dir = init.environ_map.get("UNFURL_SMOKE_DIR") orelse "unfurl-smoke";
+    std.Io.Dir.cwd().createDirPath(init.io, out_dir) catch {};
+
+    var smoke_log = SmokeLog{ .allocator = allocator, .io = init.io, .dir = out_dir };
+    var failures: u32 = 0;
+
+    // 1. Classifier: every link form from the ticket, plus the fallbacks.
+    const Case = struct { url: []const u8, provider: unfurl.Provider, id: []const u8 = "" };
+    const cases = [_]Case{
+        .{ .url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ", .provider = .youtube, .id = "dQw4w9WgXcQ" },
+        .{ .url = "https://youtu.be/dQw4w9WgXcQ?t=42", .provider = .youtube, .id = "dQw4w9WgXcQ" },
+        .{ .url = "https://www.youtube.com/shorts/dQw4w9WgXcQ?feature=share", .provider = .youtube, .id = "dQw4w9WgXcQ" },
+        .{ .url = "https://www.instagram.com/reel/Cabcdefghij/", .provider = .instagram, .id = "Cabcdefghij" },
+        .{ .url = "https://www.instagram.com/p/Cabcdefghij/?img_index=1", .provider = .instagram, .id = "Cabcdefghij" },
+        .{ .url = "https://www.facebook.com/watch?v=1234567890", .provider = .facebook, .id = "1234567890" },
+        .{ .url = "https://www.facebook.com/nike/videos/9876543210/", .provider = .facebook, .id = "9876543210" },
+        .{ .url = "https://fb.watch/AbCdEf123/", .provider = .facebook, .id = "AbCdEf123" },
+        .{ .url = "https://example.com/watch?v=dQw4w9WgXcQ", .provider = .none },
+        .{ .url = "https://youtube.com.evil.com/watch?v=dQw4w9WgXcQ", .provider = .none },
+        .{ .url = "https://www.facebook.com/photo/?fbid=123", .provider = .none },
+    };
+    for (cases) |case| {
+        const info = unfurl.classify(case.url);
+        const ok = info.provider == case.provider and
+            (case.id.len == 0 or std.mem.eql(u8, info.idSlice(), case.id));
+        if (!ok) failures += 1;
+        smoke_log.line("classify {s}: {s} (got {s}/{s})", .{ case.url, if (ok) "PASS" else "FAIL", @tagName(info.provider), info.idSlice() });
+    }
+
+    // 2. Live fetch through the shipped pipeline. Canonical URLs are what
+    // classify() itself produces, so this exercises the exact path a chat
+    // opening triggers; what the providers return decides metadata versus
+    // the fallback, both of which are ticket behaviours.
+    const Target = struct { provider: unfurl.Provider, id: []const u8, url: []const u8 };
+    const targets = [_]Target{
+        .{ .provider = .youtube, .id = "dQw4w9WgXcQ", .url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ" },
+        .{ .provider = .instagram, .id = "Cabcdefghij", .url = "https://www.instagram.com/reel/Cabcdefghij/" },
+        .{ .provider = .facebook, .id = "1234567890", .url = "https://www.facebook.com/watch?v=1234567890" },
+    };
+
+    // Same initialization the GUI runs: private IBM Plex, COM, MF, WIC, fonts.
+    _ = win.SetProcessDpiAwarenessContext(win.DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    var plex_regular = bundledFilePath("IBMPlexSans-Regular.ttf");
+    var plex_semibold = bundledFilePath("IBMPlexSans-SemiBold.ttf");
+    const plex_loaded = win.AddFontResourceExW(plex_regular.ptr(), win.FR_PRIVATE, null) > 0 and
+        win.AddFontResourceExW(plex_semibold.ptr(), win.FR_PRIVATE, null) > 0;
+    smoke_log.line("fonts: private IBM Plex loaded = {}", .{plex_loaded});
+
+    _ = win.CoInitializeEx(null, win.COINIT_APARTMENTTHREADED);
+    defer win.CoUninitialize();
+    const mf_started = win.MFStartup(win.MF_VERSION, win.MFSTARTUP_FULL) >= 0;
+    defer {
+        if (mf_started) _ = win.MFShutdown();
+    }
+
+    var scratch: [1]u8 = .{0};
+    var app = App{
+        .allocator = allocator,
+        .io = init.io,
+        .instance = instance,
+        .wacli_path = scratch[0..0],
+        .avatar_dir = scratch[0..0],
+    };
+    app_ptr = &app;
+    defer app_ptr = null;
+    _ = win.CoCreateInstance(&win.CLSID_WICImagingFactory, null, win.CLSCTX_INPROC_SERVER, &win.IID_IWICImagingFactory, @ptrCast(&app.wic_factory));
+    recreateFonts(&app);
+
+    var smoke_class = win.WNDCLASSEXW{
+        .cbSize = @sizeOf(win.WNDCLASSEXW),
+        .lpfnWndProc = smokeUnfurlProc,
+        .hInstance = instance,
+        .lpszClassName = lit("MessagesUnfurlSmoke"),
+    };
+    if (win.RegisterClassExW(&smoke_class) == 0) {
+        smoke_log.line("FAIL: could not register the smoke window class", .{});
+        smoke_log.flush();
+        return 1;
+    }
+    const smoke_hwnd = win.CreateWindowExW(0, lit("MessagesUnfurlSmoke"), lit("Messages unfurl smoke"), win.WS_OVERLAPPED, 0, 0, 0, 0, null, null, instance, null) orelse {
+        smoke_log.line("FAIL: could not create the smoke message window", .{});
+        smoke_log.flush();
+        return 1;
+    };
+    defer _ = win.DestroyWindow(smoke_hwnd);
+    app.hwnd = smoke_hwnd;
+
+    for (targets, 0..) |target, index| {
+        app.unfurl_entries[index].provider = target.provider;
+        app.unfurl_entries[index].id.set(target.id);
+        app.unfurl_entry_count = index + 1;
+    }
+    for (targets, 0..) |target, index| startUnfurlFetch(&app, &app.unfurl_entries[index], target.url);
+    smokePump(init.io, 45_000, targets.len);
+    if (@atomicLoad(u32, &smoke_unfurl_done_count, .monotonic) < targets.len) {
+        failures += 1;
+        smoke_log.line("FAIL: only {d} of {d} unfurl fetches completed within the timeout", .{ @atomicLoad(u32, &smoke_unfurl_done_count, .monotonic), targets.len });
+    }
+    for (app.unfurl_entries[0..targets.len]) |*entry| {
+        // openUnfurlCard() plays inline exactly when a stream was resolved
+        // and opens the canonical URL externally otherwise; record which.
+        const decision: []const u8 = if (entry.play_url.len > 0) "inline play" else "open externally (ticket fallback)";
+        smoke_log.line("card {s}/{s}: status={s} title_bytes={d} author_bytes={d} thumbnail={} decision={s}", .{
+            @tagName(entry.provider),
+            entry.id.slice(),
+            @tagName(entry.status),
+            entry.title.len,
+            entry.author.len,
+            entry.thumb != null,
+            decision,
+        });
+    }
+
+    // 3. Card rendering through the shipped painter.
+    const card_names = [_][]const u8{ "card-youtube.bmp", "card-instagram.bmp", "card-facebook.bmp" };
+    for (targets, card_names) |spec, name| {
+        const drawn = smokeDrawCard(allocator, init.io, &app, out_dir, name, spec.provider, spec.id, spec.url);
+        if (!drawn) failures += 1;
+        smoke_log.line("render {s}: {s}", .{ name, if (drawn) "PASS" else "FAIL" });
+    }
+
+    // 4. Player and fullscreen through the shipped MFPlay window. When
+    // YouTube resolved a stream its entry is played as-is; otherwise a
+    // public sample clip keeps the player mechanics observable. MFPlay may
+    // still refuse the media on a server-class machine that cannot decode
+    // it; the player window and its fullscreen mechanics exist
+    // independently of the decoder, so they are then verified on the bare
+    // shipped window and the decode refusal is recorded, not hidden.
+    var play_entry = UnfurlEntry{};
+    var play_source: []const u8 = "the resolved YouTube stream";
+    var play_target: *const UnfurlEntry = &app.unfurl_entries[0];
+    if (app.unfurl_entries[0].play_url.len == 0) {
+        play_entry.play_url.set(allocator, "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerBlazes.mp4");
+        play_source = "a public sample clip (YouTube did not resolve a stream here)";
+        play_target = &play_entry;
+    }
+    playUnfurlVideo(&app, play_target);
+    smokePump(init.io, 8_000, 0xFFFFFFFF);
+    var media_opened = true;
+    var player_hwnd = app.player_window;
+    if (player_hwnd == null) {
+        media_opened = false;
+        const probe = smokeMfProbe(&app);
+        smoke_log.line("media open on this machine: MFPlay returned hr=0x{x:0>8}: {s}; fullscreen mechanics are verified on the bare shipped player window", .{ @as(u32, @bitCast(probe.hr)), probe.note });
+        player_hwnd = openPlayerWindow(&app, 800, 450);
+        if (player_hwnd) |hwnd| _ = win.ShowWindow(hwnd, win.SW_SHOW);
+    }
+    const bare_window = player_hwnd orelse {
+        failures += 1;
+        smoke_log.line("FAIL: the player window did not open for {s}", .{play_source});
+        smoke_log.line("SMOKE RESULT: FAIL ({d} checks failed)", .{failures});
+        smoke_log.flush();
+        return 1;
+    };
+    if (media_opened) {
+        if (app.mf_player == null) {
+            failures += 1;
+            smoke_log.line("FAIL: MFPlay did not start for {s}", .{play_source});
+        } else {
+            smoke_log.line("player: MFPlay started for {s}: PASS", .{play_source});
+        }
+    }
+    smokePump(init.io, 6_000, 0xFFFFFFFF);
+    const windowed_shot = smokeCaptureWindow(allocator, init.io, out_dir, "player-windowed.bmp", bare_window);
+    smoke_log.line("capture player-windowed.bmp: {}", .{windowed_shot});
+
+    // Fullscreen enter: borderless, covering the monitor.
+    const caption_before = smokeHasCaption(bare_window);
+    togglePlayerFullscreen(&app, bare_window);
+    const entered = !smokeHasCaption(bare_window) and smokeRectsClose(smokeWindowRect(bare_window), smokeMonitorRect(bare_window), 8);
+    if (!entered or !caption_before) failures += 1;
+    smoke_log.line("fullscreen enter: had caption before = {}, borderless and covering monitor after = {}: {s}", .{ caption_before, entered, if (entered and caption_before) "PASS" else "FAIL" });
+    smokePump(init.io, 2_000, 0xFFFFFFFF);
+    const fullscreen_shot = smokeCaptureWindow(allocator, init.io, out_dir, "player-fullscreen.bmp", bare_window);
+    smoke_log.line("capture player-fullscreen.bmp: {}", .{fullscreen_shot});
+
+    // Fullscreen exit: caption and placement restored, exactly what keeps
+    // the chat behind the player unchanged.
+    togglePlayerFullscreen(&app, bare_window);
+    const restored = smokeHasCaption(bare_window) and
+        smokeRectsClose(smokeWindowRect(bare_window), app.player_saved_placement.rcNormalPosition, 8);
+    if (!restored) failures += 1;
+    smoke_log.line("fullscreen exit: caption and placement restored = {}: {s}", .{ restored, if (restored) "PASS" else "FAIL" });
+
+    // ESC closes the player cleanly (first leaving fullscreen when needed).
+    _ = win.PostMessageW(bare_window, win.WM_KEYDOWN, win.VK_ESCAPE, 0);
+    smokePump(init.io, 3_000, 0xFFFFFFFF);
+    const closed = app.player_window == null and app.mf_player == null;
+    if (!closed) failures += 1;
+    smoke_log.line("player close on ESC: {s}", .{if (closed) "PASS" else "FAIL"});
+
+    smoke_log.line("SMOKE RESULT: {s} ({d} checks failed)", .{ if (failures == 0) "PASS" else "FAIL", failures });
+    smoke_log.flush();
+    return if (failures == 0) 0 else 1;
 }
 
 // --- Slack provider (WAZI-55) ---
@@ -9178,8 +9568,13 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
         wm_update_ready => {
             // wparam: 1 installed, 2 newer version found (lparam = *UpdateAvailable),
             // 3 no update, 4 check failed automatically, 5 check failed manually
-            // (lparam = static @errorName text), 6 blocked by another running copy.
-            a.update_check_running = false;
+            // (lparam = static @errorName text), 6 blocked by another running copy,
+            // 7 install failed (lparam like 5), 8 install found no update.
+            // Check threads post 2-5; install threads post 1 and 6-8. Each
+            // completion clears only its own slot, so overlapping operations
+            // can never free each other's flag.
+            if (wparam >= 2 and wparam <= 5) a.update_check_running = false;
+            if (wparam == 1 or wparam >= 6) a.update_install_running.store(false, .release);
             switch (wparam) {
                 1 => {
                     setStatus(a, "Update installed - restarting in 10 seconds");
@@ -9207,7 +9602,7 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
                     a.update_failures = 0;
                     showUpdatePrompt(a);
                 },
-                3 => {
+                3, 8 => {
                     a.update_failures = 0;
                     var none_buf: [96]u8 = undefined;
                     setStatus(a, std.fmt.bufPrint(&none_buf, "You are on v{s} - this is the newest version", .{app_version}) catch "No updates found");
@@ -9216,12 +9611,14 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
                     a.update_failures = 0;
                     setStatus(a, "Update blocked: another copy of Messages is running - close other copies and try again");
                 },
-                4, 5 => {
+                4, 5, 7 => {
                     const name: [*:0]const u8 = @ptrFromInt(@as(usize, @bitCast(lparam)));
                     a.update_failures += 1;
                     var fail_buf: [128]u8 = undefined;
-                    const text = std.fmt.bufPrint(&fail_buf, "Update check failed: {s}", .{std.mem.span(name)}) catch "Update check failed";
-                    if (wparam == 5 or a.update_failures >= 2) setStatus(a, text);
+                    const verb: []const u8 = if (wparam == 7) "install" else "check";
+                    const text = std.fmt.bufPrint(&fail_buf, "Update {s} failed: {s}", .{ verb, std.mem.span(name) }) catch "Update failed";
+                    // 5 and 7 are user-initiated, so their failures always show.
+                    if (wparam != 4 or a.update_failures >= 2) setStatus(a, text);
                 },
                 else => {},
             }
@@ -10334,6 +10731,9 @@ pub fn main(init: std.process.Init) !void {
             if (!tg.enabled) std.process.exit(2);
             std.process.exit(tdlibSmoke(init.io));
         }
+        if (std.mem.eql(u8, argument, "--unfurl-smoke")) {
+            std.process.exit(unfurlSmoke(init));
+        }
     }
     const instance = win.GetModuleHandleW(null) orelse return error.NoModuleHandle;
     const wacli_path = try findWacli(init, init.gpa);
@@ -10613,15 +11013,40 @@ fn startUpdateCheck(hwnd: win.HWND, manual: bool) void {
 
 fn startUpdateInstall(hwnd: win.HWND) void {
     const a = app_ptr orelse return;
-    if (a.update_check_running and win.GetTickCount64() - a.update_last_check_ms < update_check_timeout_ms) return;
+    // WAZI-81: a concurrent read-only check must never swallow an explicit
+    // install request — activation fires checks constantly, so this guard
+    // used to turn the update button into a silent no-op. performUpdate
+    // re-checks and serializes on the update mutex itself.
+    if (a.update_install_running.load(.acquire)) {
+        setStatus(a, "An update install is already running");
+        return;
+    }
     const ctx = std.heap.page_allocator.create(UpdateContext) catch return;
     ctx.* = .{ .io = a.io, .hwnd = hwnd, .manual = true, .install = true };
+    // Claim the slot before spawning: the worker may post its completion
+    // (and free the slot) as soon as it starts, so claiming afterwards
+    // could leave a stale claim behind.
+    a.update_install_running.store(true, .release);
     const thread = std.Thread.spawn(.{}, updateThreadMain, .{ctx}) catch {
+        a.update_install_running.store(false, .release);
         std.heap.page_allocator.destroy(ctx);
         return;
     };
     thread.detach();
-    a.update_check_running = true;
+}
+
+/// A lost completion message would wedge the install slot (the button
+/// would refuse every later install until restart), so a full message
+/// queue is retried briefly instead of dropping the outcome. If even the
+/// retries fail, the slot is freed from here: a wrongly freed slot can
+/// at worst start a second install, which the update mutex serializes.
+fn postInstallResult(hwnd: win.HWND, code: u32, lparam: usize) void {
+    var tries: u32 = 0;
+    while (tries < 50) : (tries += 1) {
+        if (win.PostMessageW(hwnd, wm_update_ready, code, @bitCast(lparam)) != 0) return;
+        win.Sleep(100);
+    }
+    if (app_ptr) |a| a.update_install_running.store(false, .release);
 }
 
 fn postUpdateFailure(hwnd: win.HWND, manual: bool, err: anyerror) void {
@@ -10638,14 +11063,19 @@ fn updateThreadMain(ctx: *UpdateContext) void {
         // digest; a code-signing certificate would be needed to authenticate the
         // publisher itself. Upgrade path: verify an Authenticode signature here.
         const outcome = performUpdate(ctx.io) catch |err| {
-            postUpdateFailure(ctx.hwnd, ctx.manual, err);
+            logUpdateFailure(@errorName(err));
+            // 7 is install-only: a concurrent check posting 4/5 must never
+            // look like the install finished and free its slot.
+            const name: [*:0]const u8 = @errorName(err).ptr;
+            postInstallResult(ctx.hwnd, 7, @intCast(@intFromPtr(name)));
             return;
         };
         if (outcome == .blocked) logUpdateFailure("update blocked by another running copy");
-        _ = win.PostMessageW(ctx.hwnd, wm_update_ready, switch (outcome) {
+        postInstallResult(ctx.hwnd, switch (outcome) {
             .installed => @as(u32, 1),
             .blocked => 6,
-            .none => 3,
+            // 8 is install-only, same reason as 7.
+            .none => 8,
         }, 0);
         return;
     }
@@ -10706,7 +11136,19 @@ fn showUpdatePrompt(a: *App) void {
     defer a.allocator.free(text_wide);
     const title_wide = utf8ToWide(a.allocator, "Messages update") catch return;
     defer a.allocator.free(title_wide);
+    // WAZI-84: a failed swap can leave two live copies of the app running,
+    // and both used to pop this modal box at once. One prompt at a time: a
+    // copy that loses the race falls back to the status line, which names
+    // the palette command, so nothing is lost and nothing is doubled.
+    const prompt_mutex = win.CreateMutexW(null, win.FALSE, lit("Local\\MessagesUpdatePromptMutex")) orelse return;
+    defer _ = win.CloseHandle(prompt_mutex);
+    if (update.classifyMutexWait(win.WaitForSingleObject(prompt_mutex, 0)) != .acquired) {
+        var later_buf: [160]u8 = undefined;
+        setStatus(a, std.fmt.bufPrint(&later_buf, "Update to {s} is ready - choose \"Restart now to install update\" in the command palette when you want it", .{upd.tag}) catch "An update is ready in the command palette");
+        return;
+    }
     const choice = win.MessageBoxW(a.hwnd.?, text_wide.ptr, title_wide.ptr, win.MB_YESNO | win.MB_ICONINFORMATION);
+    _ = win.ReleaseMutex(prompt_mutex);
     if (choice == win.IDYES) {
         if (a.hwnd) |hwnd| startUpdateInstall(hwnd);
     } else {
@@ -10719,6 +11161,18 @@ fn showUpdatePrompt(a: *App) void {
 /// %LOCALAPPDATA%\Wazig\update.log (WAZI-60): failures must never vanish
 /// into "nothing to do".
 fn logUpdateFailure(err_name: []const u8) void {
+    var clock = std.mem.zeroes(win.SYSTEMTIME);
+    win.GetLocalTime(&clock);
+    var line_buf: [160]u8 = undefined;
+    const line = std.fmt.bufPrint(&line_buf, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2} update check failed: {s}\r\n", .{
+        clock.wYear, clock.wMonth, clock.wDay, clock.wHour, clock.wMinute, clock.wSecond, err_name,
+    }) catch return;
+    appendUpdateLogLine(line);
+}
+
+/// Appends one pre-formatted line to %LOCALAPPDATA%\Wazig\update.log; a
+/// diagnostics channel shared with logUpdateFailure (WAZI-84).
+fn appendUpdateLogLine(line: []const u8) void {
     const allocator = std.heap.page_allocator;
     var local_buf: [256]u16 = undefined;
     const local_len: usize = @intCast(win.GetEnvironmentVariableW(lit("LOCALAPPDATA"), &local_buf, local_buf.len));
@@ -10729,17 +11183,31 @@ fn logUpdateFailure(err_name: []const u8) void {
     defer allocator.free(log_path);
     const wide = utf8ToWide(allocator, log_path) catch return;
     defer allocator.free(wide);
-    var clock = std.mem.zeroes(win.SYSTEMTIME);
-    win.GetLocalTime(&clock);
-    var line_buf: [160]u8 = undefined;
-    const line = std.fmt.bufPrint(&line_buf, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2} update check failed: {s}\r\n", .{
-        clock.wYear, clock.wMonth, clock.wDay, clock.wHour, clock.wMinute, clock.wSecond, err_name,
-    }) catch return;
     const handle = win.CreateFileW(wide.ptr, win.FILE_APPEND_DATA, win.FILE_SHARE_READ | win.FILE_SHARE_WRITE, null, win.OPEN_ALWAYS, win.FILE_ATTRIBUTE_NORMAL, null);
     if (handle == win.INVALID_HANDLE_VALUE or handle == null) return;
     defer _ = win.CloseHandle(handle);
     var written: win.DWORD = 0;
     _ = win.WriteFile(handle, line.ptr, @intCast(line.len), &written, null);
+}
+
+/// WAZI-84: a swap failure used to leave nothing in update.log but the error
+/// name, so the real machine could not be diagnosed. Record the exe path and
+/// what the staged swap actually held when the exe destination is the problem.
+fn logUpdateSwapDetail(exe_path: []const u8, pending: []const SwapPending) void {
+    const allocator = std.heap.page_allocator;
+    var line_buf: [1024]u8 = undefined;
+    var fbs: std.Io.Writer = .fixed(&line_buf);
+    fbs.print("swap detail: exe_path={s} staged={d}\r\n", .{ exe_path, pending.len }) catch {};
+    for (pending, 0..) |p, i| {
+        if (i >= 8) {
+            fbs.print("swap detail: ...\r\n", .{}) catch {};
+            break;
+        }
+        const dest = wideToUtf8(allocator, p.dest) catch continue;
+        defer allocator.free(dest);
+        fbs.print("swap detail: dest={s}\r\n", .{dest}) catch {};
+    }
+    appendUpdateLogLine(fbs.buffered());
 }
 
 fn utf8ToWide(allocator: std.mem.Allocator, text: []const u8) ![:0]u16 {
@@ -10972,7 +11440,11 @@ fn performUpdate(io: std.Io) !UpdateOutcome {
 
     var exe_wide_buf: [519]u16 = undefined;
     const exe_len: usize = @intCast(win.GetModuleFileNameW(null, &exe_wide_buf, exe_wide_buf.len));
-    if (exe_len == 0 or exe_len >= exe_wide_buf.len) return error.UpdateNoExePath;
+    if (exe_len == 0 or exe_len >= exe_wide_buf.len) {
+        var detail_buf: [96]u8 = undefined;
+        appendUpdateLogLine(std.fmt.bufPrint(&detail_buf, "swap detail: exe path unreadable, len={d}\r\n", .{exe_len}) catch return error.UpdateNoExePath);
+        return error.UpdateNoExePath;
+    }
     const exe_path = try wideToUtf8(allocator, exe_wide_buf[0..exe_len]);
     defer allocator.free(exe_path);
     const exe_dir = std.fs.path.dirname(exe_path) orelse return error.UpdateNoExePath;
@@ -11074,7 +11546,13 @@ fn performUpdate(io: std.Io) !UpdateOutcome {
         try zip_writer.interface.writeAll(body);
         try zip_writer.interface.flush();
     }
-    const stage = try root.createDirPathOpen(io, "stage", .{});
+    // WAZI-84: the stage handle must carry list rights, or copying the staged
+    // files walks an empty directory: on Windows a handle opened without
+    // .iterate lacks FILE_LIST_DIRECTORY, NtQueryDirectoryFile is denied, and
+    // the failed query looks like zero entries - so nothing matched the exe
+    // path and every install died with UpdateNoExePath before renaming a
+    // single file.
+    const stage = try root.createDirPathOpen(io, "stage", .{ .open_options = .{ .iterate = true } });
     defer stage.close(io);
     // Bound the archive before trusting it: entry count and decompressed size.
     {
@@ -11135,6 +11613,7 @@ fn performUpdate(io: std.Io) !UpdateOutcome {
     for (pending.items, 0..) |p, i| {
         if (eqlWideIgnoreCase(p.dest, exe_wide)) exe_index = i;
     }
+    if (exe_index == null) logUpdateSwapDetail(exe_path, pending.items);
     const exe_i = exe_index orelse return error.UpdateNoExePath;
     const exe_temp = pending.items[exe_i].temp;
 
