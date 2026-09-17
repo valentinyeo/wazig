@@ -3724,19 +3724,29 @@ fn loadPendingReads(a: *App) void {
 fn startNextMarkRead(a: *App) void {
     if (a.read_child != null or a.pending_read_count == 0) return;
     if (a.read_backoff_until[0] > win.GetTickCount64()) {
-        // The head read is waiting out its failure backoff: rotate it to the
-        // tail so reads behind it proceed. A lone backed-off read — or a
-        // queue that is entirely backing off — waits until the deadline.
-        if (a.pending_read_count < 2) return;
-        if (a.read_backoff_until[1] > win.GetTickCount64()) return;
+        // The head read is waiting out its failure backoff: swap in the
+        // first ready read behind it so the queue keeps draining. When no
+        // read is ready — a lone backed-off read or a queue that is entirely
+        // backing off — wait until the earliest deadline.
+        const now = win.GetTickCount64();
+        var ready: ?usize = null;
+        var index: usize = 1;
+        while (index < a.pending_read_count) : (index += 1) {
+            if (a.read_backoff_until[index] <= now) {
+                ready = index;
+                break;
+            }
+        }
+        const swap_with = ready orelse return;
         const jid = a.pending_reads[0];
         const retries = a.read_retries[0];
         const backoff = a.read_backoff_until[0];
-        removeFirstPendingRead(a);
-        a.pending_reads[a.pending_read_count] = jid;
-        a.read_retries[a.pending_read_count] = retries;
-        a.read_backoff_until[a.pending_read_count] = backoff;
-        a.pending_read_count += 1;
+        a.pending_reads[0] = a.pending_reads[swap_with];
+        a.read_retries[0] = a.read_retries[swap_with];
+        a.read_backoff_until[0] = a.read_backoff_until[swap_with];
+        a.pending_reads[swap_with] = jid;
+        a.read_retries[swap_with] = retries;
+        a.read_backoff_until[swap_with] = backoff;
         persistPendingReads(a);
     }
     // Media downloads hold the store lock for up to 60s while a mark-read
