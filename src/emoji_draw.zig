@@ -258,30 +258,40 @@ fn formatFor(em: i32) ?*win.IDWriteTextFormat {
     return format;
 }
 
+/// Builds the one object DirectWrite can actually draw: an IDWriteTextLayout.
+/// Measure and draw share this so both always go through a real layout
+/// (WAZI-85: DrawTextLayout must never be handed the cached IDWriteTextFormat
+/// — D2D dispatches layout calls through the object it is given, and a format
+/// has no such vtable slots). null on any failure, already logged.
+fn textLayout(text: []const u16, em: i32) ?*win.IDWriteTextLayout {
+    const dwrite = state.dwrite orelse return null;
+    const format = formatFor(em) orelse return null;
+    var layout: ?*win.IDWriteTextLayout = null;
+    const layout_hr = dwrite.*.lpVtbl.*.CreateTextLayout.?(dwrite, text.ptr, @intCast(text.len), format, 4096.0, 256.0, &layout);
+    if (layout_hr != 0 or layout == null) {
+        _ = fail(.layout, layout_hr);
+        return null;
+    }
+    return layout;
+}
+
 /// Width and baseline distance of one emoji sequence at the given em size in
 /// pixels. null means the color path is unavailable for this sequence and the
 /// caller should measure and draw with GDI instead.
 pub fn metrics(text: []const u16, em: i32) ?Metrics {
     if (text.len == 0 or text.len > max_sequence_units or em <= 0 or em > 256) return null;
     if (!ensureFactory()) return null;
-    const format = formatFor(em) orelse return null;
-    var layout: ?*win.IDWriteTextLayout = null;
-    const dwrite = state.dwrite.?;
-    const layout_hr = dwrite.*.lpVtbl.*.CreateTextLayout.?(dwrite, text.ptr, @intCast(text.len), format, 4096.0, 256.0, &layout);
-    if (layout_hr != 0 or layout == null) {
-        _ = fail(.layout, layout_hr);
-        return null;
-    }
-    defer _ = layout.?.*.lpVtbl.*.Release.?(layout.?);
+    const layout = textLayout(text, em) orelse return null;
+    defer _ = layout.*.lpVtbl.*.Release.?(layout);
     var text_metrics: win.DWRITE_TEXT_METRICS = undefined;
-    const metrics_hr = layout.?.*.lpVtbl.*.GetMetrics.?(layout.?, &text_metrics);
+    const metrics_hr = layout.*.lpVtbl.*.GetMetrics.?(layout, &text_metrics);
     if (metrics_hr != 0) {
         _ = fail(.layout, metrics_hr);
         return null;
     }
     var line: win.DWRITE_LINE_METRICS = undefined;
     var line_count: u32 = 0;
-    const line_hr = layout.?.*.lpVtbl.*.GetLineMetrics.?(layout.?, &line, 1, &line_count);
+    const line_hr = layout.*.lpVtbl.*.GetLineMetrics.?(layout, &line, 1, &line_count);
     if (line_hr != 0 or line_count == 0) {
         _ = fail(.layout, line_hr);
         return null;
@@ -301,8 +311,9 @@ pub fn metrics(text: []const u16, em: i32) ?Metrics {
 pub fn draw(hdc: win.HDC, text: []const u16, x: i32, top_y: i32, text_ascent: i32, em: i32) bool {
     if (!ensureFactory()) return false;
     if (!ensureTarget(hdc)) return false;
-    const format = formatFor(em) orelse return false;
     const run_metrics = metrics(text, em) orelse return false;
+    const layout = textLayout(text, em) orelse return false;
+    defer _ = layout.*.lpVtbl.*.Release.?(layout);
     const target = state.target.?;
     const brush: *win.ID2D1Brush = @ptrCast(state.brush.?);
     const origin_y = @as(f32, @floatFromInt(top_y + text_ascent - run_metrics.baseline));
@@ -311,7 +322,7 @@ pub fn draw(hdc: win.HDC, text: []const u16, x: i32, top_y: i32, text_ascent: i3
     base.*.lpVtbl.*.DrawTextLayout.?(
         base,
         .{ .x = @floatFromInt(x), .y = origin_y },
-        @ptrCast(format),
+        layout,
         brush,
         win.D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT,
     );

@@ -9099,6 +9099,10 @@ fn drawCanvas(hwnd: win.HWND, a: *App) void {
     while (index > 0) {
         index -= 1;
         const message = &a.messages[index];
+        // WAZI-85: name the message being painted in the crash log (its id,
+        // never its content); the defer fires on continue and return too.
+        setPaintingMessageId(message.id.slice());
+        defer clearPaintingMessageId();
         message.media_hit = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
         message.bubble_hit = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
         message.unfurl_card_hit = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
@@ -10497,6 +10501,121 @@ fn loadPlayed(a: *App) void {
     loadHashSet(a, a.played_path, &a.played_set);
 }
 
+// WAZI-85 crash diagnostics. When the process dies on an unhandled
+// exception, the filter below appends one line to
+// %LOCALAPPDATA%\Wazig\crash.log: exception code, faulting module with byte
+// offset, and the id of the message being painted. Never message content —
+// a bad message has to be quarantinable from the log alone. The filter runs
+// on a crashed process, so it uses no allocator: stack buffers and Win32
+// only, and every failure is swallowed silently.
+const crash_message_id_max = 48;
+var crash_message_id: [crash_message_id_max]u8 = undefined;
+var crash_message_id_len: usize = 0;
+
+/// Remembers which message id is on screen right now, so the crash log can
+/// name it. The id is the wire identifier, not content; non-printable bytes
+/// are replaced so the log line stays single-byte ASCII.
+fn setPaintingMessageId(id: []const u8) void {
+    const count = @min(id.len, crash_message_id_max);
+    for (id[0..count], 0..) |byte, index| {
+        crash_message_id[index] = if (byte >= 0x20 and byte < 0x7F) byte else '?';
+    }
+    crash_message_id_len = count;
+}
+
+fn clearPaintingMessageId() void {
+    crash_message_id_len = 0;
+}
+
+fn appendCrashLog(line: []const u8) void {
+    var path: [280]u16 = undefined;
+    const local_label = std.unicode.utf8ToUtf16LeStringLiteral("LOCALAPPDATA");
+    const local_len: usize = @intCast(win.GetEnvironmentVariableW(local_label, &path, path.len - 40));
+    if (local_len == 0 or local_len >= path.len - 40) return;
+    const suffix = std.unicode.utf8ToUtf16LeStringLiteral("\\Wazig\\crash.log");
+    @memcpy(path[local_len..][0..suffix.len], suffix);
+    const total = local_len + suffix.len;
+    path[total] = 0;
+    const after_dir = path[local_len + 7];
+    path[local_len + 7] = 0;
+    _ = win.CreateDirectoryW(path[0 .. local_len + 7 :0].ptr, null);
+    path[local_len + 7] = after_dir;
+    const handle = win.CreateFileW(path[0..total :0].ptr, win.FILE_APPEND_DATA, win.FILE_SHARE_READ | win.FILE_SHARE_WRITE, null, win.OPEN_ALWAYS, win.FILE_ATTRIBUTE_NORMAL, null);
+    if (handle == win.INVALID_HANDLE_VALUE or handle == null) return;
+    defer _ = win.CloseHandle(handle);
+    var written: win.DWORD = 0;
+    _ = win.WriteFile(handle, line.ptr, @intCast(line.len), &written, null);
+}
+
+/// UTF-16 file path to ASCII for the log line, keeping only the file name
+/// (after the last backslash): the module name plus offset is what a crash
+/// is diagnosed from, and system module names are ASCII.
+fn crashLogModuleName(out: []u8, path_utf16: []const u16) usize {
+    var start: usize = 0;
+    for (path_utf16, 0..) |unit, index| {
+        if (unit == '\\') start = index + 1;
+    }
+    var count: usize = 0;
+    for (path_utf16[start..]) |unit| {
+        if (count >= out.len) break;
+        out[count] = if (unit >= 0x20 and unit < 0x7F) @intCast(unit) else '?';
+        count += 1;
+    }
+    return count;
+}
+
+fn crashFilter(info: ?*win.EXCEPTION_POINTERS) callconv(.winapi) win.LONG {
+    var code: win.ULONG = 0;
+    var address: usize = 0;
+    if (info) |pointers| {
+        if (pointers.ExceptionRecord) |record| {
+            code = record.*.ExceptionCode;
+            address = @intFromPtr(record.*.ExceptionAddress);
+        }
+    }
+    var line_buffer: [512]u8 = undefined;
+    var clock = std.mem.zeroes(win.SYSTEMTIME);
+    win.GetLocalTime(&clock);
+    var module: win.HMODULE = null;
+    var module_path: [260]u16 = undefined;
+    var name_buffer: [64]u8 = undefined;
+    var module_name: []const u8 = "";
+    var offset: usize = 0;
+    if (address != 0 and win.GetModuleHandleExW(
+        win.GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | win.GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        @ptrFromInt(address),
+        &module,
+    ) != 0) {
+        const path_len: usize = @intCast(win.GetModuleFileNameW(module, &module_path, module_path.len));
+        const name_len = crashLogModuleName(&name_buffer, module_path[0..path_len]);
+        module_name = name_buffer[0..name_len];
+        const base: usize = @intFromPtr(module);
+        if (address >= base) offset = address - base;
+    }
+    const line = std.fmt.bufPrint(&line_buffer, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2} v{s} unhandled exception code 0x{X:0>8} at 0x{X} ({s} + 0x{X}) message-id: {s}\r\n", .{
+        clock.wYear,
+        clock.wMonth,
+        clock.wDay,
+        clock.wHour,
+        clock.wMinute,
+        clock.wSecond,
+        build_info.version,
+        @as(u32, code),
+        address,
+        if (module_name.len > 0) module_name else "?",
+        offset,
+        if (crash_message_id_len > 0) crash_message_id[0..crash_message_id_len] else "none",
+    }) catch return 0;
+    appendCrashLog(line);
+    // EXCEPTION_CONTINUE_SEARCH: Windows Error Reporting keeps writing its
+    // own dump exactly as before; this only adds the log line.
+    return win.EXCEPTION_CONTINUE_SEARCH;
+}
+
+fn installCrashFilter() void {
+    _ = win.SetUnhandledExceptionFilter(crashFilter);
+}
+
 fn markPlayed(a: *App, id: []const u8) void {
     if (a.played_path.len == 0) return;
     var line_buffer: [40]u8 = undefined;
@@ -10653,6 +10772,7 @@ pub fn main(init: std.process.Init) !void {
         }
     }
     const instance = win.GetModuleHandleW(null) orelse return error.NoModuleHandle;
+    installCrashFilter();
     const wacli_path = try findWacli(init, init.gpa);
     defer init.gpa.free(wacli_path);
     const avatar_dir = try createAvatarDirectory(init, init.gpa);
