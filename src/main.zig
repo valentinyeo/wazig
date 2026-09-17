@@ -698,6 +698,7 @@ const App = struct {
     chats_read_attempts: u32 = 0,
     msg_read_retry_ticks: u32 = 0,
     msg_read_attempts: u32 = 0,
+    msg_read_last_jid: Utf8Text(191) = .{},
 };
 
 var app_ptr: ?*App = null;
@@ -5898,6 +5899,13 @@ fn refreshMessages(a: *App) void {
         return;
     }
     const chat = &a.chats[a.selected_chat];
+    // The retry budget is per selection, not global: three failed reads on
+    // one chat must not leave the next chat the user opens without retries.
+    if (!std.mem.eql(u8, a.msg_read_last_jid.slice(), chat.jid.slice())) {
+        a.msg_read_last_jid.set(chat.jid.slice());
+        a.msg_read_attempts = 0;
+        a.msg_read_retry_ticks = 0;
+    }
     if (chat.provider == .telegram) return refreshTelegramMessages(a);
     const chat_changed = !std.mem.eql(u8, a.displayed_jid.slice(), chat.jid.slice());
     if (chat_changed) stopAudio(a);
@@ -9725,24 +9733,27 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
                     }
                 },
                 .messages => {
-                    if (!result.ok or !messagesPayloadValid(a, result.data)) {
+                    // Freshness first, like the chats handler above: a stale
+                    // result must not repaint the status, schedule a retry,
+                    // or pay for a parse of data nobody will use.
+                    if (a.selected_chat >= a.chat_count or
+                        !std.mem.eql(u8, a.chats[a.selected_chat].jid.slice(), result.jid.slice()) or
+                        result.gen != a.messages_gen)
+                    {
+                        // stale: drop
+                    } else if (!result.ok or !messagesPayloadValid(a, result.data)) {
                         // WAZI-87: without the fresh read the pane keeps
                         // showing the previous chat, so retry a few times
                         // like the chats read (WAZI-67); the usual cause is
                         // the store lock being held by a concurrent write.
-                        // A stale failure must not restart the retry cycle.
-                        if (result.gen == a.messages_gen and a.msg_read_attempts < 3 and
-                            a.selected_chat < a.chat_count and
-                            std.mem.eql(u8, a.chats[a.selected_chat].jid.slice(), result.jid.slice()))
-                        {
+                        // The budget is per selection; refreshMessages resets
+                        // it when the user opens a different chat.
+                        setStatus(a, "Unable to read messages from wacli");
+                        if (a.msg_read_attempts < 3) {
                             a.msg_read_attempts += 1;
                             a.msg_read_retry_ticks = 2;
                         }
-                        if (!result.ok) setStatus(a, "Unable to read messages from wacli");
-                    } else if (a.selected_chat < a.chat_count and
-                        std.mem.eql(u8, a.chats[a.selected_chat].jid.slice(), result.jid.slice()) and
-                        result.gen == a.messages_gen)
-                    {
+                    } else {
                         applyMessageData(a, result.data, true);
                         a.msg_read_attempts = 0;
                         a.msg_read_retry_ticks = 0;
