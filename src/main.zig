@@ -9700,11 +9700,10 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
                         var parsed = std.json.parseFromSlice(std.json.Value, a.allocator, result.data, .{}) catch return 0;
                         defer parsed.deinit();
                         const linked = auth_status.linkedJid(parsed.value) orelse return 0;
-                        if (linked.len > 0) {
-                            var tag_buffer: [32]u8 = undefined;
-                            const tag = std.fmt.bufPrint(&tag_buffer, "{x:0>16}", .{std.hash.Wyhash.hash(0, linked)}) catch return 0;
-                            a.cache_tag.set(tag);
-                        }
+                        // linkedJid never returns an empty slice, so no len guard here.
+                        var tag_buffer: [32]u8 = undefined;
+                        const tag = std.fmt.bufPrint(&tag_buffer, "{x:0>16}", .{std.hash.Wyhash.hash(0, linked)}) catch return 0;
+                        a.cache_tag.set(tag);
                     }
                     // An account changed while this probe was queued: run the
                     // deferred one now that the pending slot is free.
