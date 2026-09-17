@@ -58,5 +58,9 @@ jobs:
           # the action's 15-minute default per-file cap; 60 minutes lets the
           # same gate complete instead of timing out with zero findings.
           review_task_timeout: 60
+          # GLM 5.3 Flash via OpenRouter stalls past the 300s default on the
+          # very large single-file contexts this repo produces (two requests
+          # timed out mid-stream on the WAZI-83 review); 600s per request.
+          llm_timeout: 600
           base_ref: ${{ steps.pr-context.outputs.base_ref }}
           head_sha: ${{ steps.pr-context.outputs.head_sha }}
