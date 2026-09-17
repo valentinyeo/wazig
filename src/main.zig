@@ -3720,7 +3720,15 @@ fn loadPendingReads(a: *App) void {
 // store lock took. Run it as a background job like sends and archives.
 fn startNextMarkRead(a: *App) void {
     if (a.read_child != null or a.pending_read_count == 0) return;
-    if (win.GetTickCount64() < a.read_backoff_until_ms) return;
+    if (win.GetTickCount64() < a.read_backoff_until_ms) {
+        // The head read is backing off: let reads behind it proceed instead
+        // of blocking the whole queue. A lone backed-off read waits it out.
+        if (a.pending_read_count < 2) return;
+        const jid = a.pending_reads[0];
+        removeFirstPendingRead(a);
+        a.pending_reads[a.pending_read_count] = jid;
+        a.pending_read_count += 1;
+    }
     // Media downloads hold the store lock for up to 60s while a mark-read
     // write waits only 10s, so a read started next to them loses the lock
     // and its write is dropped. Jobs are serialized by the gates above, but
@@ -3777,12 +3785,12 @@ fn checkMarkRead(a: *App) void {
         a.read_child = null;
         if (code != 0) requeueFailedRead(a) else removeFirstPendingRead(a);
         // Drain the queue back-to-back before restarting live sync, which
-        // stays suspended while reads are pending. While a failed read is
-        // backing off, release the store and bring live sync back instead
-        // of holding it suspended for the whole backoff.
-        if (a.pending_read_count > 0 and win.GetTickCount64() >= a.read_backoff_until_ms) {
+        // stays suspended while reads are pending. A lone backed-off read
+        // starts no child: release the store and bring live sync back
+        // instead of holding it suspended for the whole backoff.
+        if (a.pending_read_count > 0) {
             startNextMarkRead(a);
-            return;
+            if (a.read_child != null) return;
         }
         // Release any sends or archives that queued up while the store was
         // held, then bring live sync back. startSync skips itself while a
