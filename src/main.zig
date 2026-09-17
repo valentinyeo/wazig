@@ -10511,6 +10511,12 @@ fn loadPlayed(a: *App) void {
 const crash_message_id_max = 48;
 var crash_message_id: [crash_message_id_max]u8 = undefined;
 var crash_message_id_len: usize = 0;
+// Length is the cross-thread publication point: the bytes are stored first,
+// the length last with release ordering, and crashFilter loads it with
+// acquire, so a crash on a worker thread cannot see a length longer than
+// what was already written. The filter also re-filters to printable ASCII at
+// read time, because the paint thread may be overwriting the buffer while it
+// reads; a worst-case torn id is a garbled log hint, never a crash.
 
 /// Remembers which message id is on screen right now, so the crash log can
 /// name it. The id is the wire identifier, not content; non-printable bytes
@@ -10520,11 +10526,11 @@ fn setPaintingMessageId(id: []const u8) void {
     for (id[0..count], 0..) |byte, index| {
         crash_message_id[index] = if (byte >= 0x20 and byte < 0x7F) byte else '?';
     }
-    crash_message_id_len = count;
+    @atomicStore(usize, &crash_message_id_len, count, .release);
 }
 
 fn clearPaintingMessageId() void {
-    crash_message_id_len = 0;
+    @atomicStore(usize, &crash_message_id_len, 0, .release);
 }
 
 fn appendCrashLog(line: []const u8) void {
@@ -10533,19 +10539,33 @@ fn appendCrashLog(line: []const u8) void {
     const local_len: usize = @intCast(win.GetEnvironmentVariableW(local_label, &path, path.len - 40));
     if (local_len == 0 or local_len >= path.len - 40) return;
     const suffix = std.unicode.utf8ToUtf16LeStringLiteral("\\Wazig\\crash.log");
+    // Units before the file name in suffix: the "\Wazig\" directory prefix
+    // (all-ASCII, so unit count equals character count), reused for the
+    // CreateDirectoryW split below so the two can never drift apart.
+    const crash_log_dir_units = suffix.len - "crash.log".len;
     @memcpy(path[local_len..][0..suffix.len], suffix);
     const total = local_len + suffix.len;
     path[total] = 0;
-    const after_dir = path[local_len + 7];
-    path[local_len + 7] = 0;
-    _ = win.CreateDirectoryW(path[0 .. local_len + 7 :0].ptr, null);
-    path[local_len + 7] = after_dir;
+    const after_dir = path[local_len + crash_log_dir_units];
+    path[local_len + crash_log_dir_units] = 0;
+    _ = win.CreateDirectoryW(path[0 .. local_len + crash_log_dir_units :0].ptr, null);
+    path[local_len + crash_log_dir_units] = after_dir;
     const handle = win.CreateFileW(path[0..total :0].ptr, win.FILE_APPEND_DATA, win.FILE_SHARE_READ | win.FILE_SHARE_WRITE, null, win.OPEN_ALWAYS, win.FILE_ATTRIBUTE_NORMAL, null);
     if (handle == win.INVALID_HANDLE_VALUE or handle == null) return;
     defer _ = win.CloseHandle(handle);
+    // Keep crash.log bounded: a repeating crash must not grow it forever.
+    var size: win.LARGE_INTEGER = undefined;
+    if (win.GetFileSizeEx(handle, &size) != 0 and size.QuadPart > crash_log_max_bytes) {
+        _ = win.SetFilePointer(handle, 0, null, win.FILE_BEGIN);
+        _ = win.SetEndOfFile(handle);
+    }
     var written: win.DWORD = 0;
     _ = win.WriteFile(handle, line.ptr, @intCast(line.len), &written, null);
 }
+
+/// One crash line is ~160 bytes; 4 MiB is weeks of crashes. Past the cap the
+/// log truncates instead of rotating: the newest crashes matter.
+const crash_log_max_bytes: i64 = 4 * 1024 * 1024;
 
 /// UTF-16 file path to ASCII for the log line, keeping only the file name
 /// (after the last backslash): the module name plus offset is what a crash
@@ -10592,6 +10612,13 @@ fn crashFilter(info: ?*win.EXCEPTION_POINTERS) callconv(.winapi) win.LONG {
         const base: usize = @intFromPtr(module);
         if (address >= base) offset = address - base;
     }
+    // Re-filter at read time: the paint thread may be overwriting the buffer
+    // while this runs, so never trust the stored bytes to stay printable.
+    var id_storage: [crash_message_id_max]u8 = undefined;
+    const id_len = @min(@atomicLoad(usize, &crash_message_id_len, .acquire), crash_message_id_max);
+    for (crash_message_id[0..id_len], 0..) |byte, index| {
+        id_storage[index] = if (byte >= 0x20 and byte < 0x7F) byte else '?';
+    }
     const line = std.fmt.bufPrint(&line_buffer, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2} v{s} unhandled exception code 0x{X:0>8} at 0x{X} ({s} + 0x{X}) message-id: {s}\r\n", .{
         clock.wYear,
         clock.wMonth,
@@ -10604,7 +10631,7 @@ fn crashFilter(info: ?*win.EXCEPTION_POINTERS) callconv(.winapi) win.LONG {
         address,
         if (module_name.len > 0) module_name else "?",
         offset,
-        if (crash_message_id_len > 0) crash_message_id[0..crash_message_id_len] else "none",
+        if (id_len > 0) id_storage[0..id_len] else "none",
     }) catch return 0;
     appendCrashLog(line);
     // EXCEPTION_CONTINUE_SEARCH: Windows Error Reporting keeps writing its

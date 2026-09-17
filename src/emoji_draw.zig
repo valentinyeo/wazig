@@ -275,14 +275,11 @@ fn textLayout(text: []const u16, em: i32) ?*win.IDWriteTextLayout {
     return layout;
 }
 
-/// Width and baseline distance of one emoji sequence at the given em size in
-/// pixels. null means the color path is unavailable for this sequence and the
-/// caller should measure and draw with GDI instead.
-pub fn metrics(text: []const u16, em: i32) ?Metrics {
-    if (text.len == 0 or text.len > max_sequence_units or em <= 0 or em > 256) return null;
-    if (!ensureFactory()) return null;
-    const layout = textLayout(text, em) orelse return null;
-    defer _ = layout.*.lpVtbl.*.Release.?(layout);
+/// Reads width and baseline out of an existing layout. Split from metrics()
+/// so draw() can build the layout once and reuse it for measuring and
+/// painting (the reviewer's WAZI-85 finding: CreateTextLayout is the
+/// expensive DirectWrite call and the paint path must not do it twice).
+fn metricsFromLayout(layout: *win.IDWriteTextLayout) ?Metrics {
     var text_metrics: win.DWRITE_TEXT_METRICS = undefined;
     const metrics_hr = layout.*.lpVtbl.*.GetMetrics.?(layout, &text_metrics);
     if (metrics_hr != 0) {
@@ -296,13 +293,24 @@ pub fn metrics(text: []const u16, em: i32) ?Metrics {
         _ = fail(.layout, line_hr);
         return null;
     }
-    // No clearError here: measurement proves the text engine only. Render
-    // stages (target, bind, draw) clear after a successful draw instead,
-    // so a measuring pass cannot wipe a diagnostic it did not verify.
     return .{
         .width = @intFromFloat(@ceil(text_metrics.widthIncludingTrailingWhitespace)),
         .baseline = @intFromFloat(@ceil(line.baseline)),
     };
+}
+
+/// Width and baseline distance of one emoji sequence at the given em size in
+/// pixels. null means the color path is unavailable for this sequence and the
+/// caller should measure and draw with GDI instead.
+pub fn metrics(text: []const u16, em: i32) ?Metrics {
+    if (text.len == 0 or text.len > max_sequence_units or em <= 0 or em > 256) return null;
+    if (!ensureFactory()) return null;
+    const layout = textLayout(text, em) orelse return null;
+    defer _ = layout.*.lpVtbl.*.Release.?(layout);
+    // No clearError here: measurement proves the text engine only. Render
+    // stages (target, bind, draw) clear after a successful draw instead,
+    // so a measuring pass cannot wipe a diagnostic it did not verify.
+    return metricsFromLayout(layout);
 }
 
 /// Draws one emoji sequence with color glyphs. `top_y` is the top of the text
@@ -311,9 +319,11 @@ pub fn metrics(text: []const u16, em: i32) ?Metrics {
 pub fn draw(hdc: win.HDC, text: []const u16, x: i32, top_y: i32, text_ascent: i32, em: i32) bool {
     if (!ensureFactory()) return false;
     if (!ensureTarget(hdc)) return false;
-    const run_metrics = metrics(text, em) orelse return false;
+    // One layout for both the measure and the paint: CreateTextLayout is the
+    // expensive DirectWrite call and must not run twice per emoji draw.
     const layout = textLayout(text, em) orelse return false;
     defer _ = layout.*.lpVtbl.*.Release.?(layout);
+    const run_metrics = metricsFromLayout(layout) orelse return false;
     const target = state.target.?;
     const brush: *win.ID2D1Brush = @ptrCast(state.brush.?);
     const origin_y = @as(f32, @floatFromInt(top_y + text_ascent - run_metrics.baseline));
