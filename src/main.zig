@@ -677,6 +677,15 @@ const App = struct {
     // older generation is stale and must never install a tag.
     cache_tag_gen: u64 = 0,
     cache_tag_probe_again: bool = false,
+    // WAZI-82: track sync-child deaths so a logged-out WhatsApp session can
+    // never crash-loop behind a "Live sync running" status line. After three
+    // consecutive fast exits the restart loop halts, one read-only
+    // `auth status` probe names the cause, and sync stays stopped until the
+    // user reconnects or restarts it from the palette.
+    sync_fail_count: u32 = 0,
+    sync_started_secs: i64 = 0,
+    sync_auth_probe: bool = false,
+    sync_logged_out: bool = false,
     store_watch_path: WideText(519) = .{},
     last_store_write: u64 = 0,
     // WAZI-67: a chats read that fails on the first launch after an update
@@ -6071,6 +6080,8 @@ fn startSync(a: *App) void {
         if (child.id) |handle| _ = win.AssignProcessToJobObject(job, handle);
     }
     a.sync_child = child;
+    a.sync_started_secs = nowUnixSeconds();
+    a.sync_logged_out = false;
     setStatus(a, "Live sync running");
 }
 
@@ -6081,16 +6092,70 @@ fn stopSync(a: *App) void {
 
 fn checkSync(a: *App) void {
     if (mediaBusy(a) or a.read_child != null or a.send_child != null or a.pending_send_count > 0 or a.archive_child != null or a.pending_archive_count > 0 or avatarBusy(a)) return;
+    // WAZI-82: while halted after repeated fast deaths, stay stopped; only
+    // the auth probe answer or an explicit palette command restarts sync.
+    if (a.sync_fail_count >= accounts.sync_halt_after_fast_deaths) return;
     if (a.sync_child) |*child| {
         if (child.id) |handle| {
             var code: win.DWORD = 0;
             if (win.GetExitCodeProcess(handle, &code) != 0 and code != win.STILL_ACTIVE) {
                 _ = child.wait(a.io) catch {};
                 a.sync_child = null;
+                const lived_secs = nowUnixSeconds() - a.sync_started_secs;
+                if (lived_secs < accounts.sync_fast_death_secs) {
+                    a.sync_fail_count += 1;
+                } else {
+                    a.sync_fail_count = 0;
+                }
+                if (accounts.syncDeathAction(lived_secs, a.sync_fail_count) == .probe_login) {
+                    a.sync_auth_probe = true;
+                    enqueueCacheTagProbe(a);
+                    setStatus(a, "Live sync keeps stopping - checking WhatsApp login");
+                    return;
+                }
+                setStatus(a, "Live sync stopped - restarting");
                 startSync(a);
             }
         }
     } else startSync(a);
+}
+
+/// Answer of the login probe that follows a halted sync child: name the
+/// cause on the status line instead of crash-looping (WAZI-82).
+fn applySyncAuthProbe(a: *App, ok: bool, data: []const u8) void {
+    a.sync_auth_probe = false;
+    if (!ok) {
+        setStatus(a, "Live sync keeps stopping - run wacli doctor in a terminal");
+        return;
+    }
+    var parsed = std.json.parseFromSlice(std.json.Value, a.allocator, data, .{}) catch {
+        setStatus(a, "Live sync keeps stopping - run wacli doctor in a terminal");
+        return;
+    };
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |object| object,
+        else => {
+            setStatus(a, "Live sync keeps stopping - run wacli doctor in a terminal");
+            return;
+        },
+    };
+    if (root.get("data") == null and root.get("authenticated") == null) {
+        setStatus(a, "Live sync keeps stopping - run wacli doctor in a terminal");
+        return;
+    }
+    const holder = root.get("data") orelse parsed.value;
+    const authenticated = switch (holder) {
+        .object => |object| object.get("authenticated") orelse std.json.Value{ .bool = false },
+        else => std.json.Value{ .bool = false },
+    };
+    if (authenticated != .bool or authenticated.bool == false) {
+        a.sync_logged_out = true;
+        setStatus(a, "WhatsApp is logged out - press Ctrl+K, Manage accounts, Reconnect WhatsApp");
+    } else {
+        setStatus(a, "Live sync keeps stopping - press Ctrl+K and pick Restart live sync");
+    }
+    if (a.canvas) |canvas| _ = win.InvalidateRect(canvas, null, win.TRUE);
 }
 
 fn setStatus(a: *App, text: []const u8) void {
@@ -7795,7 +7860,11 @@ fn openAccountsPalette(a: *App) void {
 fn buildAccountsItems(a: *App) void {
     a.palette_item_count = 0;
     var line_buf: [128]u8 = undefined;
-    appendPalette(a, accounts.whatsappLabel(&line_buf, a.sync_child != null, a.last_refresh_unix), "", 0);
+    if (a.sync_logged_out) {
+        appendPalette(a, "WhatsApp - logged out; scan the QR again to relink", "", 0);
+    } else {
+        appendPalette(a, accounts.whatsappLabel(&line_buf, a.sync_child != null, a.last_refresh_unix), "", 0);
+    }
     const store_present = whatsappStorePresent(a);
     if (!store_present) {
         appendPalette(a, "Add WhatsApp account (opens the pairing window)", "", command_accounts_add);
@@ -7889,6 +7958,10 @@ fn removeWhatsAppAccount(a: *App) void {
 }
 
 fn addWhatsAppAccount(a: *App) void {
+    // WAZI-82: pairing is the escape hatch from a halted sync loop, so it
+    // must clear the halt or checkSync would stay stopped after a relink.
+    a.sync_fail_count = 0;
+    a.sync_logged_out = false;
     const exe_wide = utf8ToWide(a.allocator, a.wacli_path) catch {
         setStatus(a, "Could not open the pairing window");
         return;
@@ -8154,6 +8227,8 @@ fn runCommand(a: *App, command: u16) void {
         },
         command_sync => {
             stopSync(a);
+            a.sync_fail_count = 0;
+            a.sync_logged_out = false;
             startSync(a);
         },
         command_update_check => {
@@ -8245,7 +8320,14 @@ fn runCommand(a: *App, command: u16) void {
         command_accounts => openAccountsPalette(a),
         command_accounts_reconnect => {
             stopSync(a);
-            startSync(a);
+            // WAZI-82: a logged-out session cannot be fixed by restarting the
+            // sync child; run the pairing window so the QR flow can relink.
+            if (a.sync_logged_out) {
+                addWhatsAppAccount(a);
+            } else {
+                a.sync_fail_count = 0;
+                startSync(a);
+            }
         },
         command_accounts_add => addWhatsAppAccount(a),
         command_accounts_remove => {
@@ -9604,6 +9686,7 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
                 },
                 .reaction => applyReaction(a, result),
                 .cache_tag => {
+                    if (a.sync_auth_probe and result.gen == a.cache_tag_gen) applySyncAuthProbe(a, result.ok, result.data);
                     if (result.ok and result.gen == a.cache_tag_gen) {
                         var parsed = std.json.parseFromSlice(std.json.Value, a.allocator, result.data, .{}) catch return 0;
                         defer parsed.deinit();
