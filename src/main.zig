@@ -575,8 +575,7 @@ const App = struct {
     read_child: ?std.process.Child = null,
     read_spawn_failures: u32 = 0,
     read_started_ms: u64 = 0,
-    read_backoff_until_ms: u64 = 0,
-    read_backoff_jid: Utf8Text(191) = .{},
+    read_backoff_until: [max_pending_reads]u64 = [_]u64{0} ** max_pending_reads,
     pending_reads: [max_pending_reads]Utf8Text(191) = [_]Utf8Text(191){.{}} ** max_pending_reads,
     pending_read_count: usize = 0,
     read_retries: [max_pending_reads]u8 = [_]u8{0} ** max_pending_reads,
@@ -3612,10 +3611,12 @@ fn removeFirstPendingRead(a: *App) void {
     while (index < a.pending_read_count) : (index += 1) {
         a.pending_reads[index - 1] = a.pending_reads[index];
         a.read_retries[index - 1] = a.read_retries[index];
+        a.read_backoff_until[index - 1] = a.read_backoff_until[index];
     }
     a.pending_read_count -= 1;
     a.pending_reads[a.pending_read_count] = .{};
     a.read_retries[a.pending_read_count] = 0;
+    a.read_backoff_until[a.pending_read_count] = 0;
     persistPendingReads(a);
 }
 
@@ -3639,13 +3640,11 @@ fn nextReadRetry(retries: u8) u8 {
 fn requeueFailedRead(a: *App) void {
     const jid = a.pending_reads[0];
     const retries = nextReadRetry(a.read_retries[0]);
-    if (retries == 0) {
-        a.read_backoff_until_ms = win.GetTickCount64() + read_retry_backoff_ms;
-        a.read_backoff_jid.set(jid.slice());
-    }
+    const backoff = if (retries == 0) win.GetTickCount64() + read_retry_backoff_ms else a.read_backoff_until[0];
     removeFirstPendingRead(a);
     a.pending_reads[a.pending_read_count] = jid;
     a.read_retries[a.pending_read_count] = retries;
+    a.read_backoff_until[a.pending_read_count] = backoff;
     a.pending_read_count += 1;
     persistPendingReads(a);
 }
@@ -3724,21 +3723,21 @@ fn loadPendingReads(a: *App) void {
 // store lock took. Run it as a background job like sends and archives.
 fn startNextMarkRead(a: *App) void {
     if (a.read_child != null or a.pending_read_count == 0) return;
-    if (win.GetTickCount64() < a.read_backoff_until_ms) {
-        // The backed-off read must not block reads behind it: rotate it to
-        // the tail (once, when it reaches the head again) and let the rest
-        // of the queue proceed. A lone backed-off read waits it out.
+    if (a.read_backoff_until[0] > win.GetTickCount64()) {
+        // The head read is waiting out its failure backoff: rotate it to the
+        // tail so reads behind it proceed. A lone backed-off read — or a
+        // queue that is entirely backing off — waits until the deadline.
         if (a.pending_read_count < 2) return;
-        if (std.mem.eql(u8, a.pending_reads[0].slice(), a.read_backoff_jid.slice())) {
-            const jid = a.pending_reads[0];
-            const retries = a.read_retries[0];
-            removeFirstPendingRead(a);
-            a.pending_reads[a.pending_read_count] = jid;
-            a.read_retries[a.pending_read_count] = retries;
-            a.pending_read_count += 1;
-            persistPendingReads(a);
-        }
-        if (std.mem.eql(u8, a.pending_reads[0].slice(), a.read_backoff_jid.slice())) return;
+        if (a.read_backoff_until[1] > win.GetTickCount64()) return;
+        const jid = a.pending_reads[0];
+        const retries = a.read_retries[0];
+        const backoff = a.read_backoff_until[0];
+        removeFirstPendingRead(a);
+        a.pending_reads[a.pending_read_count] = jid;
+        a.read_retries[a.pending_read_count] = retries;
+        a.read_backoff_until[a.pending_read_count] = backoff;
+        a.pending_read_count += 1;
+        persistPendingReads(a);
     }
     // Media downloads hold the store lock for up to 60s while a mark-read
     // write waits only 10s, so a read started next to them loses the lock
@@ -6075,7 +6074,12 @@ fn enqueueCacheTagProbe(a: *App) void {
 // waiting out a failure backoff leave it free (WAZI-88): no write child is
 // running and the next attempt is minutes away.
 fn readsPendingBlockingSync(a: *const App) bool {
-    return a.pending_read_count > 0 and win.GetTickCount64() >= a.read_backoff_until_ms;
+    if (a.pending_read_count == 0) return false;
+    const now = win.GetTickCount64();
+    for (a.read_backoff_until[0..a.pending_read_count]) |backoff| {
+        if (backoff <= now) return true;
+    }
+    return false;
 }
 
 fn startSync(a: *App) void {
