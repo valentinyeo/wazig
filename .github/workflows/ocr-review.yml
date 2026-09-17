@@ -54,5 +54,9 @@ jobs:
           llm_auth_token: ${{ secrets.OPENROUTER_API_KEY }}
           llm_model: z-ai/glm-5.3-flash
           llm_use_anthropic: 'false'
+          # WAZI-83: whole-file reviews of src/main.zig (11.7k lines) exceed
+          # the action's 15-minute default per-file cap; 60 minutes lets the
+          # same gate complete instead of timing out with zero findings.
+          review_task_timeout: 60
           base_ref: ${{ steps.pr-context.outputs.base_ref }}
           head_sha: ${{ steps.pr-context.outputs.head_sha }}
