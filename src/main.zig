@@ -11057,15 +11057,19 @@ fn showUpdatePrompt(a: *App) void {
     // and both used to pop this modal box at once. One prompt at a time: a
     // copy that loses the race falls back to the status line, which names
     // the palette command, so nothing is lost and nothing is doubled.
-    const prompt_mutex = win.CreateMutexW(null, win.FALSE, lit("Local\\MessagesUpdatePromptMutex")) orelse return;
-    defer _ = win.CloseHandle(prompt_mutex);
-    if (update.classifyMutexWait(win.WaitForSingleObject(prompt_mutex, 0)) != .acquired) {
-        var later_buf: [160]u8 = undefined;
-        setStatus(a, std.fmt.bufPrint(&later_buf, "Update to {s} is ready - choose \"Restart now to install update\" in the command palette when you want it", .{upd.tag}) catch "An update is ready in the command palette");
-        return;
+    // The mutex is best effort: if it cannot even be created, showing the
+    // prompt unprotected beats never showing it.
+    const prompt_mutex = win.CreateMutexW(null, win.FALSE, lit("Local\\MessagesUpdatePromptMutex"));
+    if (prompt_mutex) |m| {
+        defer _ = win.CloseHandle(m);
+        if (update.classifyMutexWait(win.WaitForSingleObject(m, 0)) != .acquired) {
+            var later_buf: [160]u8 = undefined;
+            setStatus(a, std.fmt.bufPrint(&later_buf, "Update to {s} is ready - choose \"Restart now to install update\" in the command palette when you want it", .{upd.tag}) catch "An update is ready in the command palette");
+            return;
+        }
     }
     const choice = win.MessageBoxW(a.hwnd.?, text_wide.ptr, title_wide.ptr, win.MB_YESNO | win.MB_ICONINFORMATION);
-    _ = win.ReleaseMutex(prompt_mutex);
+    if (prompt_mutex) |m| _ = win.ReleaseMutex(m);
     if (choice == win.IDYES) {
         if (a.hwnd) |hwnd| startUpdateInstall(hwnd);
     } else {
@@ -11110,21 +11114,27 @@ fn appendUpdateLogLine(line: []const u8) void {
 /// WAZI-84: a swap failure used to leave nothing in update.log but the error
 /// name, so the real machine could not be diagnosed. Record the exe path and
 /// what the staged swap actually held when the exe destination is the problem.
+/// One line per item, each truncated to fit its own buffer: a near-limit path
+/// (519 UTF-16 units can be ~1.5 KB of UTF-8) must not swallow the other lines.
 fn logUpdateSwapDetail(exe_path: []const u8, pending: []const SwapPending) void {
     const allocator = std.heap.page_allocator;
-    var line_buf: [1024]u8 = undefined;
-    var fbs: std.Io.Writer = .fixed(&line_buf);
-    fbs.print("swap detail: exe_path={s} staged={d}\r\n", .{ exe_path, pending.len }) catch {};
+    var line_buf: [2048]u8 = undefined;
+    const exe = exe_path[0..@min(exe_path.len, 1500)];
+    if (std.fmt.bufPrint(&line_buf, "swap detail: exe_path={s} staged={d}\r\n", .{ exe, pending.len })) |line| {
+        appendUpdateLogLine(line);
+    } else |_| {}
     for (pending, 0..) |p, i| {
         if (i >= 8) {
-            fbs.print("swap detail: ...\r\n", .{}) catch {};
+            appendUpdateLogLine("swap detail: ...\r\n");
             break;
         }
         const dest = wideToUtf8(allocator, p.dest) catch continue;
         defer allocator.free(dest);
-        fbs.print("swap detail: dest={s}\r\n", .{dest}) catch {};
+        const shown = dest[0..@min(dest.len, 1500)];
+        if (std.fmt.bufPrint(&line_buf, "swap detail: dest={s}\r\n", .{shown})) |line| {
+            appendUpdateLogLine(line);
+        } else |_| {}
     }
-    appendUpdateLogLine(fbs.buffered());
 }
 
 fn utf8ToWide(allocator: std.mem.Allocator, text: []const u8) ![:0]u16 {
