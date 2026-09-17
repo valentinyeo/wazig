@@ -258,51 +258,92 @@ fn formatFor(em: i32) ?*win.IDWriteTextFormat {
     return format;
 }
 
-/// Width and baseline distance of one emoji sequence at the given em size in
-/// pixels. null means the color path is unavailable for this sequence and the
-/// caller should measure and draw with GDI instead.
-pub fn metrics(text: []const u16, em: i32) ?Metrics {
-    if (text.len == 0 or text.len > max_sequence_units or em <= 0 or em > 256) return null;
-    if (!ensureFactory()) return null;
+/// The one bounds check for an emoji sequence and its em size, shared by the
+/// measure and draw funnels so the two can never disagree about what takes
+/// the colour path versus the GDI fallback.
+fn validSequence(text: []const u16, em: i32) bool {
+    return text.len != 0 and text.len <= max_sequence_units and em > 0 and em <= 256;
+}
+
+/// Builds the one object DirectWrite can actually draw: an IDWriteTextLayout.
+/// Measure and draw share this so both always go through a real layout
+/// (WAZI-85: DrawTextLayout must never be handed the cached IDWriteTextFormat
+/// — D2D dispatches layout calls through the object it is given, and a format
+/// has no such vtable slots). This is the module boundary: every caller's
+/// input is validated here, before the expensive CreateTextLayout runs, so
+/// the invariant lives in one place and not in each caller. DirectWrite
+/// errors are logged here; input and factory-state rejections return null
+/// silently, and callers must run ensureFactory() first (metrics() and
+/// draw() do).
+fn textLayout(text: []const u16, em: i32) ?*win.IDWriteTextLayout {
+    if (!validSequence(text, em)) return null;
+    const dwrite = state.dwrite orelse return null;
     const format = formatFor(em) orelse return null;
     var layout: ?*win.IDWriteTextLayout = null;
-    const dwrite = state.dwrite.?;
     const layout_hr = dwrite.*.lpVtbl.*.CreateTextLayout.?(dwrite, text.ptr, @intCast(text.len), format, 4096.0, 256.0, &layout);
     if (layout_hr != 0 or layout == null) {
         _ = fail(.layout, layout_hr);
         return null;
     }
-    defer _ = layout.?.*.lpVtbl.*.Release.?(layout.?);
+    return layout;
+}
+
+/// Reads width and baseline out of an existing layout. Split from metrics()
+/// so draw() can build the layout once and reuse it for measuring and
+/// painting (the reviewer's WAZI-85 finding: CreateTextLayout is the
+/// expensive DirectWrite call and the paint path must not do it twice).
+fn metricsFromLayout(layout: *win.IDWriteTextLayout) ?Metrics {
     var text_metrics: win.DWRITE_TEXT_METRICS = undefined;
-    const metrics_hr = layout.?.*.lpVtbl.*.GetMetrics.?(layout.?, &text_metrics);
+    const metrics_hr = layout.*.lpVtbl.*.GetMetrics.?(layout, &text_metrics);
     if (metrics_hr != 0) {
         _ = fail(.layout, metrics_hr);
         return null;
     }
     var line: win.DWRITE_LINE_METRICS = undefined;
     var line_count: u32 = 0;
-    const line_hr = layout.?.*.lpVtbl.*.GetLineMetrics.?(layout.?, &line, 1, &line_count);
-    if (line_hr != 0 or line_count == 0) {
+    const line_hr = layout.*.lpVtbl.*.GetLineMetrics.?(layout, &line, 1, &line_count);
+    if (line_hr != 0) {
         _ = fail(.layout, line_hr);
         return null;
     }
-    // No clearError here: measurement proves the text engine only. Render
-    // stages (target, bind, draw) clear after a successful draw instead,
-    // so a measuring pass cannot wipe a diagnostic it did not verify.
+    // A successful call with zero lines is an empty layout, not a DirectWrite
+    // failure: reject it silently so emoji.log never records "hr 0x00000000".
+    if (line_count == 0) return null;
     return .{
         .width = @intFromFloat(@ceil(text_metrics.widthIncludingTrailingWhitespace)),
         .baseline = @intFromFloat(@ceil(line.baseline)),
     };
 }
 
-/// Draws one emoji sequence with color glyphs. `top_y` is the top of the text
-/// line's character cell and `ascent` the text font's ascent, matching how
-/// GDI TextOutW positions the neighbouring runs. Returns false on any failure.
-pub fn draw(hdc: win.HDC, text: []const u16, x: i32, top_y: i32, text_ascent: i32, em: i32) bool {
-    if (!ensureFactory()) return false;
-    if (!ensureTarget(hdc)) return false;
-    const format = formatFor(em) orelse return false;
-    const run_metrics = metrics(text, em) orelse return false;
+/// Width and baseline distance of one emoji sequence at the given em size in
+/// pixels. null means the color path is unavailable for this sequence and the
+/// caller should measure and draw with GDI instead.
+pub fn metrics(text: []const u16, em: i32) ?Metrics {
+    if (!validSequence(text, em)) return null;
+    if (!ensureFactory()) return null;
+    const layout = textLayout(text, em) orelse return null;
+    defer _ = layout.*.lpVtbl.*.Release.?(layout);
+    // No clearError here: measurement proves the text engine only. Render
+    // stages (target, bind, draw) clear after a successful draw instead,
+    // so a measuring pass cannot wipe a diagnostic it did not verify.
+    return metricsFromLayout(layout);
+}
+
+/// Draws one emoji sequence with color glyphs and returns its measured run
+/// width. `top_y` is the top of the text line's character cell and `ascent`
+/// the text font's ascent, matching how GDI TextOutW positions the
+/// neighbouring runs. Returning the width lets a paint pass measure and
+/// paint from the one layout built here instead of a separate measuring
+/// call. null on any failure (the reason lands in emoji.log via failureNotice),
+/// meaning the caller should fall back to the GDI monochrome path.
+pub fn draw(hdc: win.HDC, text: []const u16, x: i32, top_y: i32, text_ascent: i32, em: i32) ?Metrics {
+    if (!ensureFactory()) return null;
+    if (!ensureTarget(hdc)) return null;
+    // One layout for both the measure and the paint: CreateTextLayout is the
+    // expensive DirectWrite call and must not run twice per emoji draw.
+    const layout = textLayout(text, em) orelse return null;
+    defer _ = layout.*.lpVtbl.*.Release.?(layout);
+    const run_metrics = metricsFromLayout(layout) orelse return null;
     const target = state.target.?;
     const brush: *win.ID2D1Brush = @ptrCast(state.brush.?);
     const origin_y = @as(f32, @floatFromInt(top_y + text_ascent - run_metrics.baseline));
@@ -311,7 +352,7 @@ pub fn draw(hdc: win.HDC, text: []const u16, x: i32, top_y: i32, text_ascent: i3
     base.*.lpVtbl.*.DrawTextLayout.?(
         base,
         .{ .x = @floatFromInt(x), .y = origin_y },
-        @ptrCast(format),
+        layout,
         brush,
         win.D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT,
     );
@@ -323,10 +364,10 @@ pub fn draw(hdc: win.HDC, text: []const u16, x: i32, top_y: i32, text_ascent: i3
         // The target may need recreation after device loss; drop it so the
         // next call rebuilds, and fall back to GDI for this run.
         releaseTarget();
-        return false;
+        return null;
     }
     clearError();
-    return true;
+    return run_metrics;
 }
 
 fn releaseTarget() void {

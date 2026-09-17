@@ -7232,7 +7232,7 @@ fn drawEmojiCell(a: *App, item: *win.DRAWITEMSTRUCT) void {
         const em: i32 = 28;
         const offset_x = cell.left + @divTrunc(emoji_picker.cell_size - em, 2);
         const offset_y = cell.top + @divTrunc(emoji_picker.cell_size - em, 2);
-        if (!emoji_draw.draw(item.hDC, wide.slice(), offset_x, offset_y, em, em)) {
+        if (emoji_draw.draw(item.hDC, wide.slice(), offset_x, offset_y, em, em) == null) {
             const fallback_font = (if (a.font_emoji != null) a.font_emoji else a.font) orelse return;
             _ = win.SelectObject(item.hDC, @ptrCast(fallback_font));
             _ = win.TextOutW(item.hDC, offset_x, offset_y, wide.ptr(), @intCast(wide.len));
@@ -8548,8 +8548,12 @@ fn runWidth(hdc: win.HDC, text: []const u16) i32 {
 /// painting always use the same source so wrapping stays consistent.
 fn drawEmojiRun(hdc: win.HDC, emoji_font: win.HFONT, text_ascent: i32, line_height: i32, slice: []const u16, cursor: i32, y: i32, draw: bool) i32 {
     const em = line_height;
-    if (emoji_draw.metrics(slice, em)) |run_metrics| {
-        if (!draw or emoji_draw.draw(hdc, slice, cursor, y, text_ascent, em)) return run_metrics.width;
+    // A paint pass measures and paints from the one layout draw() builds;
+    // a measuring pass only needs the width and must not build a target.
+    if (draw) {
+        if (emoji_draw.draw(hdc, slice, cursor, y, text_ascent, em)) |run_metrics| return run_metrics.width;
+    } else if (emoji_draw.metrics(slice, em)) |run_metrics| {
+        return run_metrics.width;
     }
     // WAZI-65: colour fallback is never silent; each new reason shows once.
     // Only announce on real paint passes: measuring passes cannot show the
@@ -9181,6 +9185,10 @@ fn drawCanvas(hwnd: win.HWND, a: *App) void {
     while (index > 0) {
         index -= 1;
         const message = &a.messages[index];
+        // WAZI-85: name the message being painted in the crash log (its id,
+        // never its content); the defer fires on continue and return too.
+        setPaintingMessageId(message.id.slice());
+        defer clearPaintingMessageId();
         message.media_hit = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
         message.bubble_hit = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
         message.unfurl_card_hit = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
@@ -10580,6 +10588,148 @@ fn loadPlayed(a: *App) void {
     loadHashSet(a, a.played_path, &a.played_set);
 }
 
+// WAZI-85 crash diagnostics. When the process dies on an unhandled
+// exception, the filter below appends one line to
+// %LOCALAPPDATA%\Wazig\crash.log: exception code, faulting module with byte
+// offset, and the id of the message being painted. Never message content —
+// a bad message has to be quarantinable from the log alone. The filter runs
+// on a crashed process, so it uses no allocator: stack buffers and Win32
+// only, and every failure is swallowed silently.
+const crash_message_id_max = 48;
+var crash_message_id: [crash_message_id_max]u8 = undefined;
+var crash_message_id_len: usize = 0;
+// Length is the cross-thread publication point: the bytes are stored first,
+// the length last with release ordering, and crashFilter loads it with
+// acquire, so a crash on a worker thread cannot see a length longer than
+// what was already written. The filter also re-filters to printable ASCII at
+// read time, because the paint thread may be overwriting the buffer while it
+// reads; a worst-case torn id is a garbled log hint, never a crash.
+
+/// Remembers which message id is on screen right now, so the crash log can
+/// name it. The id is the wire identifier, not content; non-printable bytes
+/// are replaced so the log line stays single-byte ASCII.
+fn setPaintingMessageId(id: []const u8) void {
+    const count = @min(id.len, crash_message_id_max);
+    for (id[0..count], 0..) |byte, index| {
+        crash_message_id[index] = if (byte >= 0x20 and byte < 0x7F) byte else '?';
+    }
+    @atomicStore(usize, &crash_message_id_len, count, .release);
+}
+
+fn clearPaintingMessageId() void {
+    @atomicStore(usize, &crash_message_id_len, 0, .release);
+}
+
+fn appendCrashLog(line: []const u8) void {
+    var path: [280]u16 = undefined;
+    const local_label = std.unicode.utf8ToUtf16LeStringLiteral("LOCALAPPDATA");
+    const local_len: usize = @intCast(win.GetEnvironmentVariableW(local_label, &path, path.len - 40));
+    if (local_len == 0 or local_len >= path.len - 40) return;
+    const suffix = std.unicode.utf8ToUtf16LeStringLiteral("\\Wazig\\crash.log");
+    // Units before the file name in suffix: the "\Wazig\" directory prefix
+    // (all-ASCII, so unit count equals character count), reused for the
+    // CreateDirectoryW split below so the two can never drift apart.
+    const crash_log_dir_units = suffix.len - "crash.log".len;
+    @memcpy(path[local_len..][0..suffix.len], suffix);
+    const total = local_len + suffix.len;
+    path[total] = 0;
+    const after_dir = path[local_len + crash_log_dir_units];
+    path[local_len + crash_log_dir_units] = 0;
+    _ = win.CreateDirectoryW(path[0 .. local_len + crash_log_dir_units :0].ptr, null);
+    path[local_len + crash_log_dir_units] = after_dir;
+    const handle = win.CreateFileW(path[0..total :0].ptr, win.FILE_APPEND_DATA, win.FILE_SHARE_READ | win.FILE_SHARE_WRITE, null, win.OPEN_ALWAYS, win.FILE_ATTRIBUTE_NORMAL, null);
+    if (handle == win.INVALID_HANDLE_VALUE or handle == null) return;
+    defer _ = win.CloseHandle(handle);
+    // Keep crash.log bounded: a repeating crash must not grow it forever.
+    var size: win.LARGE_INTEGER = undefined;
+    if (win.GetFileSizeEx(handle, &size) != 0 and size.QuadPart > crash_log_max_bytes) {
+        _ = win.SetFilePointer(handle, 0, null, win.FILE_BEGIN);
+        _ = win.SetEndOfFile(handle);
+    }
+    var written: win.DWORD = 0;
+    _ = win.WriteFile(handle, line.ptr, @intCast(line.len), &written, null);
+}
+
+/// One crash line is ~160 bytes; 4 MiB is weeks of crashes. Past the cap the
+/// log truncates instead of rotating: the newest crashes matter.
+const crash_log_max_bytes: i64 = 4 * 1024 * 1024;
+
+/// UTF-16 file path to ASCII for the log line, keeping only the file name
+/// (after the last backslash): the module name plus offset is what a crash
+/// is diagnosed from, and system module names are ASCII.
+fn crashLogModuleName(out: []u8, path_utf16: []const u16) usize {
+    var start: usize = 0;
+    for (path_utf16, 0..) |unit, index| {
+        if (unit == '\\') start = index + 1;
+    }
+    var count: usize = 0;
+    for (path_utf16[start..]) |unit| {
+        if (count >= out.len) break;
+        out[count] = if (unit >= 0x20 and unit < 0x7F) @intCast(unit) else '?';
+        count += 1;
+    }
+    return count;
+}
+
+fn crashFilter(info: ?*win.EXCEPTION_POINTERS) callconv(.winapi) win.LONG {
+    var code: win.ULONG = 0;
+    var address: usize = 0;
+    if (info) |pointers| {
+        if (pointers.ExceptionRecord) |record| {
+            code = record.*.ExceptionCode;
+            address = @intFromPtr(record.*.ExceptionAddress);
+        }
+    }
+    var line_buffer: [512]u8 = undefined;
+    var clock = std.mem.zeroes(win.SYSTEMTIME);
+    win.GetLocalTime(&clock);
+    var module: win.HMODULE = null;
+    var module_path: [260]u16 = undefined;
+    var name_buffer: [64]u8 = undefined;
+    var module_name: []const u8 = "";
+    var offset: usize = 0;
+    if (address != 0 and win.GetModuleHandleExW(
+        win.GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | win.GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        @ptrFromInt(address),
+        &module,
+    ) != 0) {
+        const path_len: usize = @intCast(win.GetModuleFileNameW(module, &module_path, module_path.len));
+        const name_len = crashLogModuleName(&name_buffer, module_path[0..path_len]);
+        module_name = name_buffer[0..name_len];
+        const base: usize = @intFromPtr(module);
+        if (address >= base) offset = address - base;
+    }
+    // Re-filter at read time: the paint thread may be overwriting the buffer
+    // while this runs, so never trust the stored bytes to stay printable.
+    var id_storage: [crash_message_id_max]u8 = undefined;
+    const id_len = @min(@atomicLoad(usize, &crash_message_id_len, .acquire), crash_message_id_max);
+    for (crash_message_id[0..id_len], 0..) |byte, index| {
+        id_storage[index] = if (byte >= 0x20 and byte < 0x7F) byte else '?';
+    }
+    const line = std.fmt.bufPrint(&line_buffer, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2} v{s} unhandled exception code 0x{X:0>8} at 0x{X} ({s} + 0x{X}) message-id: {s}\r\n", .{
+        clock.wYear,
+        clock.wMonth,
+        clock.wDay,
+        clock.wHour,
+        clock.wMinute,
+        clock.wSecond,
+        build_info.version,
+        @as(u32, code),
+        address,
+        if (module_name.len > 0) module_name else "?",
+        offset,
+        if (id_len > 0) id_storage[0..id_len] else "none",
+    }) catch return 0;
+    appendCrashLog(line);
+    // EXCEPTION_CONTINUE_SEARCH: Windows Error Reporting keeps writing its
+    // own dump exactly as before; this only adds the log line.
+    return win.EXCEPTION_CONTINUE_SEARCH;
+}
+
+fn installCrashFilter() void {
+    _ = win.SetUnhandledExceptionFilter(crashFilter);
+}
+
 fn markPlayed(a: *App, id: []const u8) void {
     if (a.played_path.len == 0) return;
     var line_buffer: [40]u8 = undefined;
@@ -10736,6 +10886,7 @@ pub fn main(init: std.process.Init) !void {
         }
     }
     const instance = win.GetModuleHandleW(null) orelse return error.NoModuleHandle;
+    installCrashFilter();
     const wacli_path = try findWacli(init, init.gpa);
     defer init.gpa.free(wacli_path);
     const avatar_dir = try createAvatarDirectory(init, init.gpa);

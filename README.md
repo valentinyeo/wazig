@@ -9,6 +9,7 @@ The interface uses Win32, Windows Imaging Component, and Windows shell thumbnail
 - WhatsApp chats, messages, search, sending, archive, and unarchive through `wacli`
 - Official WhatsApp group names from the local group metadata store
 - Automatic image downloads, inline images, animated GIFs, and video thumbnails after download
+- Colour emoji in chat names and message text; if the Windows text engine cannot draw them, messages fall back to monochrome emoji instead of stopping
 - Click-to-download videos and click-to-open local attachments
 - Per-message WhatsApp reactions from the message context menu
 - IBM Plex Sans bundled as a private application font
