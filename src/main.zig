@@ -575,7 +575,7 @@ const App = struct {
     read_child: ?std.process.Child = null,
     read_spawn_failures: u32 = 0,
     read_started_ms: u64 = 0,
-    read_backoff_until_ms: u64 = 0,
+    read_backoff_until: [max_pending_reads]u64 = [_]u64{0} ** max_pending_reads,
     pending_reads: [max_pending_reads]Utf8Text(191) = [_]Utf8Text(191){.{}} ** max_pending_reads,
     pending_read_count: usize = 0,
     read_retries: [max_pending_reads]u8 = [_]u8{0} ** max_pending_reads,
@@ -3611,10 +3611,12 @@ fn removeFirstPendingRead(a: *App) void {
     while (index < a.pending_read_count) : (index += 1) {
         a.pending_reads[index - 1] = a.pending_reads[index];
         a.read_retries[index - 1] = a.read_retries[index];
+        a.read_backoff_until[index - 1] = a.read_backoff_until[index];
     }
     a.pending_read_count -= 1;
     a.pending_reads[a.pending_read_count] = .{};
     a.read_retries[a.pending_read_count] = 0;
+    a.read_backoff_until[a.pending_read_count] = 0;
     persistPendingReads(a);
 }
 
@@ -3638,10 +3640,11 @@ fn nextReadRetry(retries: u8) u8 {
 fn requeueFailedRead(a: *App) void {
     const jid = a.pending_reads[0];
     const retries = nextReadRetry(a.read_retries[0]);
-    if (retries == 0) a.read_backoff_until_ms = win.GetTickCount64() + read_retry_backoff_ms;
+    const backoff = if (retries == 0) win.GetTickCount64() + read_retry_backoff_ms else a.read_backoff_until[0];
     removeFirstPendingRead(a);
     a.pending_reads[a.pending_read_count] = jid;
     a.read_retries[a.pending_read_count] = retries;
+    a.read_backoff_until[a.pending_read_count] = backoff;
     a.pending_read_count += 1;
     persistPendingReads(a);
 }
@@ -3720,14 +3723,31 @@ fn loadPendingReads(a: *App) void {
 // store lock took. Run it as a background job like sends and archives.
 fn startNextMarkRead(a: *App) void {
     if (a.read_child != null or a.pending_read_count == 0) return;
-    if (win.GetTickCount64() < a.read_backoff_until_ms) {
-        // The head read is backing off: let reads behind it proceed instead
-        // of blocking the whole queue. A lone backed-off read waits it out.
-        if (a.pending_read_count < 2) return;
+    if (a.read_backoff_until[0] > win.GetTickCount64()) {
+        // The head read is waiting out its failure backoff: swap in the
+        // first ready read behind it so the queue keeps draining. When no
+        // read is ready — a lone backed-off read or a queue that is entirely
+        // backing off — wait until the earliest deadline.
+        const now = win.GetTickCount64();
+        var ready: ?usize = null;
+        var index: usize = 1;
+        while (index < a.pending_read_count) : (index += 1) {
+            if (a.read_backoff_until[index] <= now) {
+                ready = index;
+                break;
+            }
+        }
+        const swap_with = ready orelse return;
         const jid = a.pending_reads[0];
-        removeFirstPendingRead(a);
-        a.pending_reads[a.pending_read_count] = jid;
-        a.pending_read_count += 1;
+        const retries = a.read_retries[0];
+        const backoff = a.read_backoff_until[0];
+        a.pending_reads[0] = a.pending_reads[swap_with];
+        a.read_retries[0] = a.read_retries[swap_with];
+        a.read_backoff_until[0] = a.read_backoff_until[swap_with];
+        a.pending_reads[swap_with] = jid;
+        a.read_retries[swap_with] = retries;
+        a.read_backoff_until[swap_with] = backoff;
+        persistPendingReads(a);
     }
     // Media downloads hold the store lock for up to 60s while a mark-read
     // write waits only 10s, so a read started next to them loses the lock
@@ -6060,6 +6080,18 @@ fn enqueueCacheTagProbe(a: *App) void {
     wacliEnqueue(a, job, false);
 }
 
+// Pending reads normally hold live sync off the store, but reads that are
+// waiting out a failure backoff leave it free (WAZI-88): no write child is
+// running and the next attempt is minutes away.
+fn readsPendingBlockingSync(a: *const App) bool {
+    if (a.pending_read_count == 0) return false;
+    const now = win.GetTickCount64();
+    for (a.read_backoff_until[0..a.pending_read_count]) |backoff| {
+        if (backoff <= now) return true;
+    }
+    return false;
+}
+
 fn startSync(a: *App) void {
     // Hold off while any write job is pending: they pause live sync and
     // serialize on the store lock, so don't fight them. checkSync restarts
@@ -6074,7 +6106,7 @@ fn startSync(a: *App) void {
         a.cache_tag.set("");
         enqueueCacheTagProbe(a);
     }
-    if (a.sync_child != null or a.read_child != null or a.pending_read_count > 0 or
+    if (a.sync_child != null or a.read_child != null or readsPendingBlockingSync(a) or
         mediaBusy(a) or a.send_child != null or a.pending_send_count > 0 or
         a.archive_child != null or a.pending_archive_count > 0 or avatarBusy(a) or
         wacliPendingGet(a, .reaction) > 0) return;
