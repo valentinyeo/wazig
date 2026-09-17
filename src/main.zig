@@ -7167,7 +7167,7 @@ fn drawEmojiCell(a: *App, item: *win.DRAWITEMSTRUCT) void {
         const em: i32 = 28;
         const offset_x = cell.left + @divTrunc(emoji_picker.cell_size - em, 2);
         const offset_y = cell.top + @divTrunc(emoji_picker.cell_size - em, 2);
-        if (!emoji_draw.draw(item.hDC, wide.slice(), offset_x, offset_y, em, em)) {
+        if (emoji_draw.draw(item.hDC, wide.slice(), offset_x, offset_y, em, em) == null) {
             const fallback_font = (if (a.font_emoji != null) a.font_emoji else a.font) orelse return;
             _ = win.SelectObject(item.hDC, @ptrCast(fallback_font));
             _ = win.TextOutW(item.hDC, offset_x, offset_y, wide.ptr(), @intCast(wide.len));
@@ -8466,8 +8466,12 @@ fn runWidth(hdc: win.HDC, text: []const u16) i32 {
 /// painting always use the same source so wrapping stays consistent.
 fn drawEmojiRun(hdc: win.HDC, emoji_font: win.HFONT, text_ascent: i32, line_height: i32, slice: []const u16, cursor: i32, y: i32, draw: bool) i32 {
     const em = line_height;
-    if (emoji_draw.metrics(slice, em)) |run_metrics| {
-        if (!draw or emoji_draw.draw(hdc, slice, cursor, y, text_ascent, em)) return run_metrics.width;
+    // A paint pass measures and paints from the one layout draw() builds;
+    // a measuring pass only needs the width and must not build a target.
+    if (draw) {
+        if (emoji_draw.draw(hdc, slice, cursor, y, text_ascent, em)) |run_metrics| return run_metrics.width;
+    } else if (emoji_draw.metrics(slice, em)) |run_metrics| {
+        return run_metrics.width;
     }
     // WAZI-65: colour fallback is never silent; each new reason shows once.
     // Only announce on real paint passes: measuring passes cannot show the

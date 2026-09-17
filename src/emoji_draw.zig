@@ -258,16 +258,25 @@ fn formatFor(em: i32) ?*win.IDWriteTextFormat {
     return format;
 }
 
+/// The one bounds check for an emoji sequence and its em size, shared by the
+/// measure and draw funnels so the two can never disagree about what takes
+/// the colour path versus the GDI fallback.
+fn validSequence(text: []const u16, em: i32) bool {
+    return text.len != 0 and text.len <= max_sequence_units and em > 0 and em <= 256;
+}
+
 /// Builds the one object DirectWrite can actually draw: an IDWriteTextLayout.
 /// Measure and draw share this so both always go through a real layout
 /// (WAZI-85: DrawTextLayout must never be handed the cached IDWriteTextFormat
 /// — D2D dispatches layout calls through the object it is given, and a format
 /// has no such vtable slots). This is the module boundary: every caller's
 /// input is validated here, before the expensive CreateTextLayout runs, so
-/// the invariant lives in one place and not in each caller. null on any
-/// failure, already logged.
+/// the invariant lives in one place and not in each caller. DirectWrite
+/// errors are logged here; input and factory-state rejections return null
+/// silently, and callers must run ensureFactory() first (metrics() and
+/// draw() do).
 fn textLayout(text: []const u16, em: i32) ?*win.IDWriteTextLayout {
-    if (text.len == 0 or text.len > max_sequence_units or em <= 0 or em > 256) return null;
+    if (!validSequence(text, em)) return null;
     const dwrite = state.dwrite orelse return null;
     const format = formatFor(em) orelse return null;
     var layout: ?*win.IDWriteTextLayout = null;
@@ -310,7 +319,7 @@ fn metricsFromLayout(layout: *win.IDWriteTextLayout) ?Metrics {
 /// pixels. null means the color path is unavailable for this sequence and the
 /// caller should measure and draw with GDI instead.
 pub fn metrics(text: []const u16, em: i32) ?Metrics {
-    if (text.len == 0 or text.len > max_sequence_units or em <= 0 or em > 256) return null;
+    if (!validSequence(text, em)) return null;
     if (!ensureFactory()) return null;
     const layout = textLayout(text, em) orelse return null;
     defer _ = layout.*.lpVtbl.*.Release.?(layout);
@@ -320,17 +329,21 @@ pub fn metrics(text: []const u16, em: i32) ?Metrics {
     return metricsFromLayout(layout);
 }
 
-/// Draws one emoji sequence with color glyphs. `top_y` is the top of the text
-/// line's character cell and `ascent` the text font's ascent, matching how
-/// GDI TextOutW positions the neighbouring runs. Returns false on any failure.
-pub fn draw(hdc: win.HDC, text: []const u16, x: i32, top_y: i32, text_ascent: i32, em: i32) bool {
-    if (!ensureFactory()) return false;
-    if (!ensureTarget(hdc)) return false;
+/// Draws one emoji sequence with color glyphs and returns its measured run
+/// width. `top_y` is the top of the text line's character cell and `ascent`
+/// the text font's ascent, matching how GDI TextOutW positions the
+/// neighbouring runs. Returning the width lets a paint pass measure and
+/// paint from the one layout built here instead of a separate measuring
+/// call. null on any failure (the reason lands in emoji.log via failureNotice),
+/// meaning the caller should fall back to the GDI monochrome path.
+pub fn draw(hdc: win.HDC, text: []const u16, x: i32, top_y: i32, text_ascent: i32, em: i32) ?Metrics {
+    if (!ensureFactory()) return null;
+    if (!ensureTarget(hdc)) return null;
     // One layout for both the measure and the paint: CreateTextLayout is the
     // expensive DirectWrite call and must not run twice per emoji draw.
-    const layout = textLayout(text, em) orelse return false;
+    const layout = textLayout(text, em) orelse return null;
     defer _ = layout.*.lpVtbl.*.Release.?(layout);
-    const run_metrics = metricsFromLayout(layout) orelse return false;
+    const run_metrics = metricsFromLayout(layout) orelse return null;
     const target = state.target.?;
     const brush: *win.ID2D1Brush = @ptrCast(state.brush.?);
     const origin_y = @as(f32, @floatFromInt(top_y + text_ascent - run_metrics.baseline));
@@ -351,10 +364,10 @@ pub fn draw(hdc: win.HDC, text: []const u16, x: i32, top_y: i32, text_ascent: i3
         // The target may need recreation after device loss; drop it so the
         // next call rebuilds, and fall back to GDI for this run.
         releaseTarget();
-        return false;
+        return null;
     }
     clearError();
-    return true;
+    return run_metrics;
 }
 
 fn releaseTarget() void {
