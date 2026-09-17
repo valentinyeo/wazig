@@ -1,4 +1,5 @@
 const std = @import("std");
+const auth_status = @import("auth_status.zig");
 const audio = @import("audio.zig");
 const avatar = @import("avatar.zig");
 const avatar_mask = @import("avatar_mask.zig");
@@ -9698,14 +9699,7 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
                     if (result.ok and result.gen == a.cache_tag_gen) {
                         var parsed = std.json.parseFromSlice(std.json.Value, a.allocator, result.data, .{}) catch return 0;
                         defer parsed.deinit();
-                        const root = switch (parsed.value) {
-                            .object => |object| object,
-                            else => return 0,
-                        };
-                        const linked = switch (root.get("linked_jid") orelse return 0) {
-                            .string => |value| value,
-                            else => return 0,
-                        };
+                        const linked = auth_status.linkedJid(parsed.value) orelse return 0;
                         if (linked.len > 0) {
                             var tag_buffer: [32]u8 = undefined;
                             const tag = std.fmt.bufPrint(&tag_buffer, "{x:0>16}", .{std.hash.Wyhash.hash(0, linked)}) catch return 0;
@@ -10793,14 +10787,7 @@ fn findCacheTag(init: std.process.Init, wacli_path: []u8, scratch_dir: []const u
     deleteFileUtf8(out_path);
     var parsed = std.json.parseFromSlice(std.json.Value, init.gpa, data, .{}) catch return null;
     defer parsed.deinit();
-    const linked = switch (parsed.value) {
-        .object => |object| object.get("linked_jid") orelse return null,
-        else => return null,
-    };
-    const jid = switch (linked) {
-        .string => |value| value,
-        else => return null,
-    };
+    const jid = auth_status.linkedJid(parsed.value) orelse return null;
     if (jid.len == 0) return null;
     return try std.fmt.allocPrint(init.gpa, "{x:0>16}", .{std.hash.Wyhash.hash(0, jid)});
 }
