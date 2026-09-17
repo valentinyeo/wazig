@@ -696,6 +696,9 @@ const App = struct {
     // most, so the reads stay bounded even when wacli keeps failing.
     chats_read_retry_ticks: u32 = 0,
     chats_read_attempts: u32 = 0,
+    msg_read_retry_ticks: u32 = 0,
+    msg_read_attempts: u32 = 0,
+    msg_read_last_jid: Utf8Text(191) = .{},
 };
 
 var app_ptr: ?*App = null;
@@ -3823,6 +3826,16 @@ fn messagesAreCurrent(a: *const App) bool {
         std.mem.eql(u8, a.displayed_timestamp.slice(), chat.timestamp.slice());
 }
 
+/// True when the selected WhatsApp chat's messages are not the ones on
+/// screen. Telegram paints synchronously and Slack has its own lanes, so
+/// the WAZI-87 watchdog only drives the wacli read path.
+fn selectedPaneStale(a: *const App) bool {
+    if (a.selected_chat >= a.chat_count) return a.displayed_jid.len != 0;
+    const chat = &a.chats[a.selected_chat];
+    if (chat.provider != .whatsapp) return false;
+    return !std.mem.eql(u8, a.displayed_jid.slice(), chat.jid.slice());
+}
+
 fn isImage(message: *const Message) bool {
     return std.ascii.eqlIgnoreCase(message.media_type.slice(), "image") or
         std.ascii.eqlIgnoreCase(message.media_type.slice(), "sticker");
@@ -5886,6 +5899,13 @@ fn refreshMessages(a: *App) void {
         return;
     }
     const chat = &a.chats[a.selected_chat];
+    // The retry budget is per selection, not global: three failed reads on
+    // one chat must not leave the next chat the user opens without retries.
+    if (!std.mem.eql(u8, a.msg_read_last_jid.slice(), chat.jid.slice())) {
+        a.msg_read_last_jid.set(chat.jid.slice());
+        a.msg_read_attempts = 0;
+        a.msg_read_retry_ticks = 0;
+    }
     if (chat.provider == .telegram) return refreshTelegramMessages(a);
     const chat_changed = !std.mem.eql(u8, a.displayed_jid.slice(), chat.jid.slice());
     if (chat_changed) stopAudio(a);
@@ -5909,6 +5929,42 @@ fn refreshMessages(a: *App) void {
     wacliEnqueue(a, job, true);
 }
 
+/// wacli wraps some payloads in `{"data":{...}}` and returns others flat at
+/// the top level (WAZI-86 found both shapes on auth status). Returns the
+/// `messages` array for either shape, null when the body cannot render a
+/// conversation.
+fn messagesListValue(root: std.json.ObjectMap) ?std.json.Value {
+    if (root.get("messages")) |direct| {
+        switch (direct) {
+            .array => return direct,
+            else => {},
+        }
+    }
+    const data = root.get("data") orelse return null;
+    const wrapper = switch (data) {
+        .object => |o| o,
+        else => return null,
+    };
+    const value = wrapper.get("messages") orelse return null;
+    return switch (value) {
+        .array => value,
+        else => null,
+    };
+}
+
+/// Structural check without painting: a read that exits 0 but carries no
+/// messages array must count as a failure, or the pane would keep showing
+/// the previous chat with nothing ever retrying (WAZI-87).
+fn messagesPayloadValid(a: *App, raw: []const u8) bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, a.allocator, raw, .{}) catch return false;
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |o| o,
+        else => return false,
+    };
+    return messagesListValue(root) != null;
+}
+
 fn applyMessageData(a: *App, raw: []const u8, final: bool) void {
     var parsed = std.json.parseFromSlice(std.json.Value, a.allocator, raw, .{}) catch return;
     defer parsed.deinit();
@@ -5919,13 +5975,7 @@ fn applyMessageData(a: *App, raw: []const u8, final: bool) void {
         .object => |o| o,
         else => return,
     };
-    const data_value = root.get("data") orelse return;
-    const data_object = switch (data_value) {
-        .object => |o| o,
-        else => return,
-    };
-    const list_value = data_object.get("messages") orelse return;
-    const list = switch (list_value) {
+    const list = switch (messagesListValue(root) orelse return) {
         .array => |items| items,
         else => return,
     };
@@ -9683,13 +9733,30 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
                     }
                 },
                 .messages => {
-                    if (!result.ok) {
-                        setStatus(a, "Unable to read messages from wacli");
-                    } else if (a.selected_chat < a.chat_count and
-                        std.mem.eql(u8, a.chats[a.selected_chat].jid.slice(), result.jid.slice()) and
-                        result.gen == a.messages_gen)
+                    // Freshness first, like the chats handler above: a stale
+                    // result must not repaint the status, schedule a retry,
+                    // or pay for a parse of data nobody will use.
+                    if (a.selected_chat >= a.chat_count or
+                        !std.mem.eql(u8, a.chats[a.selected_chat].jid.slice(), result.jid.slice()) or
+                        result.gen != a.messages_gen)
                     {
+                        // stale: drop
+                    } else if (!result.ok or !messagesPayloadValid(a, result.data)) {
+                        // WAZI-87: without the fresh read the pane keeps
+                        // showing the previous chat, so retry a few times
+                        // like the chats read (WAZI-67); the usual cause is
+                        // the store lock being held by a concurrent write.
+                        // The budget is per selection; refreshMessages resets
+                        // it when the user opens a different chat.
+                        setStatus(a, "Unable to read messages from wacli");
+                        if (a.msg_read_attempts < 3) {
+                            a.msg_read_attempts += 1;
+                            a.msg_read_retry_ticks = 2;
+                        }
+                    } else {
                         applyMessageData(a, result.data, true);
+                        a.msg_read_attempts = 0;
+                        a.msg_read_retry_ticks = 0;
                         msgCacheStore(a, result.jid.slice(), result.data);
                     }
                 },
@@ -10052,9 +10119,24 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
                     a.chats_read_retry_ticks -= 1;
                     if (a.chats_read_retry_ticks == 0) refreshChats(a);
                 }
+                if (a.msg_read_retry_ticks > 0) {
+                    a.msg_read_retry_ticks -= 1;
+                    if (a.msg_read_retry_ticks == 0) refreshMessages(a);
+                }
                 if (changed and !a.chat_selection_pending) {
                     refreshChats(a);
                     if (!messagesAreCurrent(a)) refreshMessages(a);
+                }
+                // WAZI-87: a messages read that never produced a result (queue
+                // eviction, failed post) must not leave the previous chat on
+                // screen: when nothing is in flight and the pane still shows
+                // another chat, read the selection again.
+                if (!a.chat_selection_pending and a.msg_read_retry_ticks == 0 and
+                    a.msg_read_attempts < 3 and wacliPendingGet(a, .messages) == 0 and
+                    selectedPaneStale(a))
+                {
+                    a.msg_read_attempts += 1;
+                    refreshMessages(a);
                 }
                 // A queued manual click goes first: the auto scan skips
                 // attachments older than the cutoff, so without this it
