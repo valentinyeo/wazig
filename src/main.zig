@@ -690,6 +690,15 @@ const App = struct {
     sync_fail_count: u32 = 0,
     sync_started_secs: i64 = 0,
     sync_auth_probe: bool = false,
+    // Heartbeat watchdog (2026-09-22): wacli touches .wacli\HEARTBEAT on
+    // WhatsApp activity, so a quiet account leaves it frozen for a long
+    // while. A child whose socket died silently kept running with that file
+    // frozen, so checkSyncHeartbeat restarts it. See there.
+    sync_heartbeat_path: WideText(519) = .{},
+    sync_heartbeat_ticks: u32 = 0,
+    sync_heartbeat_mtime: i64 = 0,
+    sync_heartbeat_restart_secs: i64 = 0,
+    sync_heartbeat_unreadable: bool = false,
     sync_logged_out: bool = false,
     store_watch_path: WideText(519) = .{},
     last_store_write: u64 = 0,
@@ -4442,6 +4451,12 @@ fn fillDibFromSource(a: *App, message: *Message, source: *win.IWICBitmapSource, 
 fn nowUnixSeconds() i64 {
     var ft: win.FILETIME = undefined;
     win.GetSystemTimeAsFileTime(&ft);
+    return filetimeToUnixSeconds(ft);
+}
+
+/// FILETIME (100ns ticks since 1601) to unix seconds. The heartbeat watchdog
+/// compares the file's stamp against wall-clock time.
+fn filetimeToUnixSeconds(ft: win.FILETIME) i64 {
     const q: i64 = (@as(i64, ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
     return @divTrunc(q - 116444736000000000, 10_000_000);
 }
@@ -6189,6 +6204,11 @@ fn startSync(a: *App) void {
     }
     appendLaunchLog(a, "sync: child started");
     a.sync_started_secs = nowUnixSeconds();
+    // A fresh child gets a fresh watchdog: unknown heartbeat stamp, first
+    // check after sync_heartbeat_check_ticks, and the unreadable notice once.
+    a.sync_heartbeat_ticks = 0;
+    a.sync_heartbeat_mtime = 0;
+    a.sync_heartbeat_unreadable = false;
     a.sync_logged_out = false;
     setStatus(a, "Live sync running");
 }
@@ -6199,6 +6219,56 @@ fn stopSync(a: *App) void {
         appendLaunchLog(a, "sync: child stopped");
     }
     a.sync_child = null;
+}
+
+// Heartbeat watchdog tuning: look once every 30 one-second refresh ticks,
+// and treat a child older than stale_secs whose heartbeat is at least as
+// old and unmoved since the previous look as stuck. The same span also
+// keeps the watchdog from firing again right after a restart. 15 minutes,
+// not 3: wacli only touches the file on WhatsApp activity, and a quiet
+// account is not a dead socket.
+const sync_heartbeat_check_ticks: u32 = 30;
+const sync_heartbeat_stale_secs: i64 = 900;
+
+/// Last-write time of the sync heartbeat file in unix seconds, or null when
+/// the lookup fails (missing, locked, unreadable). Null means "do nothing":
+/// the watchdog must never restart a child on evidence it could not read.
+fn syncHeartbeatMtime(a: *App) ?i64 {
+    if (a.sync_heartbeat_path.len == 0) return null;
+    var attributes = std.mem.zeroes(win.WIN32_FILE_ATTRIBUTE_DATA);
+    if (win.GetFileAttributesExW(a.sync_heartbeat_path.ptr(), win.GetFileExInfoStandard, &attributes) == 0) return null;
+    return filetimeToUnixSeconds(attributes.ftLastWriteTime);
+}
+
+/// Runs while the sync child is alive. A child past the stale span with a
+/// heartbeat just as old that did not advance since the previous check has a
+/// dead socket behind a live process: stop it, and checkSync respawns on the
+/// next tick. A missing or unreadable file fails closed and logs once.
+fn checkSyncHeartbeat(a: *App) void {
+    a.sync_heartbeat_ticks += 1;
+    if (a.sync_heartbeat_ticks < sync_heartbeat_check_ticks) return;
+    a.sync_heartbeat_ticks = 0;
+    const mtime = syncHeartbeatMtime(a) orelse {
+        if (!a.sync_heartbeat_unreadable) {
+            a.sync_heartbeat_unreadable = true;
+            appendLaunchLog(a, "sync: heartbeat unreadable");
+        }
+        return;
+    };
+    const previous = a.sync_heartbeat_mtime;
+    a.sync_heartbeat_mtime = mtime;
+    const now = nowUnixSeconds();
+    const age = now - mtime;
+    // "Has not advanced" needs two looks: the first only records the stamp.
+    if (previous == 0 or mtime != previous) return;
+    if (now - a.sync_started_secs <= sync_heartbeat_stale_secs) return;
+    if (age <= sync_heartbeat_stale_secs) return;
+    if (now - a.sync_heartbeat_restart_secs <= sync_heartbeat_stale_secs) return;
+    var event_buffer: [64]u8 = undefined;
+    const event = std.fmt.bufPrint(&event_buffer, "sync: heartbeat stale {d}s, restarting child", .{age}) catch return;
+    appendLaunchLog(a, event);
+    a.sync_heartbeat_restart_secs = now;
+    stopSync(a);
 }
 
 fn checkSync(a: *App) void {
@@ -6227,7 +6297,7 @@ fn checkSync(a: *App) void {
                 }
                 setStatus(a, "Live sync stopped - restarting");
                 startSync(a);
-            }
+            } else checkSyncHeartbeat(a);
         }
     } else startSync(a);
 }
@@ -10927,6 +10997,13 @@ fn createStoreWatchPath(init: std.process.Init, allocator: std.mem.Allocator) ![
     return std.fs.path.join(allocator, &.{ home, ".wacli", "wacli.db-wal" });
 }
 
+/// The heartbeat sits beside wacli.db-wal: same directory, file name
+/// HEARTBEAT. Built the same way as the store watch path.
+fn createSyncHeartbeatPath(init: std.process.Init, allocator: std.mem.Allocator) ![]u8 {
+    const home = init.environ_map.get("USERPROFILE") orelse return error.MissingUserProfile;
+    return std.fs.path.join(allocator, &.{ home, ".wacli", "HEARTBEAT" });
+}
+
 fn createSlackMediaDirectory(init: std.process.Init, allocator: std.mem.Allocator) ![]u8 {
     const local = init.environ_map.get("LOCALAPPDATA") orelse return error.MissingLocalAppData;
     const messages_dir = try std.fs.path.join(allocator, &.{ local, "Messages" });
@@ -11000,6 +11077,8 @@ pub fn main(init: std.process.Init) !void {
     defer init.gpa.free(slack_media_dir);
     const store_watch_path = try createStoreWatchPath(init, init.gpa);
     defer init.gpa.free(store_watch_path);
+    const sync_heartbeat_path = try createSyncHeartbeatPath(init, init.gpa);
+    defer init.gpa.free(sync_heartbeat_path);
     // store_watch_path is <home>\.wacli\wacli.db-wal; the parent is the
     // WhatsApp data folder that account removal moves aside.
     const wacli_dir = std.fs.path.dirname(store_watch_path) orelse return error.MissingUserProfile;
@@ -11056,6 +11135,7 @@ pub fn main(init: std.process.Init) !void {
     app.read_path = hashStorePath(init, init.gpa, "pending-reads.txt");
     loadPendingReads(&app);
     app.store_watch_path.set(init.gpa, store_watch_path);
+    app.sync_heartbeat_path.set(init.gpa, sync_heartbeat_path);
     app_ptr = &app;
     defer app_ptr = null;
 
