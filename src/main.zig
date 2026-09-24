@@ -143,6 +143,7 @@ const command_accounts_tg_remove_confirm = 2050;
 const command_update_check = 2052;
 const command_update_install = 2053;
 const command_emoji_diag = 2054;
+const command_open_image_external = 2055;
 const reaction_like = 3001;
 const reaction_love = 3002;
 const reaction_laugh = 3003;
@@ -684,6 +685,12 @@ const App = struct {
     // WAZI-68 fullscreen state for the video player window.
     player_saved_placement: win.WINDOWPLACEMENT = undefined,
     player_fullscreen: bool = false,
+    // In-app full-resolution image viewer; one at a time, decoded at open so
+    // WM_PAINT only blits and never re-decodes.
+    image_viewer_window: ?win.HWND = null,
+    viewer_bitmap: ?win.HBITMAP = null,
+    viewer_width: i32 = 0,
+    viewer_height: i32 = 0,
     unfurl_entries: [max_unfurl_entries]UnfurlEntry = [_]UnfurlEntry{.{}} ** max_unfurl_entries,
     unfurl_entry_count: usize = 0,
     unfurl_evict_slot: usize = 0,
@@ -5756,6 +5763,217 @@ fn togglePlayerFullscreen(a: *App, hwnd: win.HWND) void {
     if (a.mf_player) |player| _ = player.lpVtbl.*.UpdateVideo.?(player);
 }
 
+// Double-click an image to see it large inside the app. The window is an
+// owned WS_POPUP covering the monitor work area; the image is decoded once at
+// open (WIC, full resolution) and blitted centered on every paint.
+fn closeImageViewer(a: *App) void {
+    // Drop the handle first so a re-entrant paint never sees a destroyed
+    // window, then free the decoded bitmap.
+    if (a.image_viewer_window) |hwnd| {
+        a.image_viewer_window = null;
+        _ = win.DestroyWindow(hwnd);
+    }
+    if (a.viewer_bitmap) |bitmap| {
+        a.viewer_bitmap = null;
+        _ = win.DeleteObject(bitmap);
+    }
+    a.viewer_width = 0;
+    a.viewer_height = 0;
+}
+
+// Fit the source into the work area: shrink to fit, but never grow a small
+// image past 2x. Aspect ratio is preserved.
+fn viewerTargetSize(source_width: u32, source_height: u32, max_width: i32, max_height: i32) webp_detect.FitBox {
+    if (source_width == 0 or source_height == 0) return .{ .width = 1, .height = 1 };
+    if (max_width <= 0 or max_height <= 0) return .{ .width = source_width, .height = source_height };
+    const sw: f32 = @floatFromInt(source_width);
+    const sh: f32 = @floatFromInt(source_height);
+    var scale: f32 = @min(@as(f32, @floatFromInt(max_width)) / sw, @as(f32, @floatFromInt(max_height)) / sh);
+    if (scale > 2.0) scale = 2.0;
+    if (scale <= 0.0) scale = 1.0;
+    return .{
+        .width = @max(1, @as(u32, @intFromFloat(sw * scale))),
+        .height = @max(1, @as(u32, @intFromFloat(sh * scale))),
+    };
+}
+
+// Decode the attachment's first frame at viewer size into a top-down 32bpp
+// DIB. Fills out_width/out_height with the bitmap's pixel size.
+fn decodeImageViewerBitmap(a: *App, message: *const Message, max_width: i32, max_height: i32, out_width: *i32, out_height: *i32) ?win.HBITMAP {
+    if (a.wic_factory == null or message.local_path.len == 0) return null;
+    var decoder: [*c]win.IWICBitmapDecoder = null;
+    if (a.wic_factory.*.lpVtbl.*.CreateDecoderFromFilename.?(
+        a.wic_factory,
+        message.local_path.ptr(),
+        null,
+        win.GENERIC_READ,
+        win.WICDecodeMetadataCacheOnLoad,
+        &decoder,
+    ) < 0 or decoder == null) return null;
+    defer _ = decoder.*.lpVtbl.*.Release.?(decoder);
+
+    var frame: [*c]win.IWICBitmapFrameDecode = null;
+    if (decoder.*.lpVtbl.*.GetFrame.?(decoder, 0, &frame) < 0 or frame == null) return null;
+    defer _ = frame.*.lpVtbl.*.Release.?(frame);
+    var source_width: win.UINT = 0;
+    var source_height: win.UINT = 0;
+    if (frame.*.lpVtbl.*.GetSize.?(@ptrCast(frame), &source_width, &source_height) < 0 or source_width == 0 or source_height == 0) return null;
+
+    const target = viewerTargetSize(source_width, source_height, max_width, max_height);
+    var converter: [*c]win.IWICFormatConverter = null;
+    if (a.wic_factory.*.lpVtbl.*.CreateFormatConverter.?(a.wic_factory, &converter) < 0 or converter == null) return null;
+    defer _ = converter.*.lpVtbl.*.Release.?(converter);
+    if (converter.*.lpVtbl.*.Initialize.?(
+        converter,
+        @ptrCast(frame),
+        &win.GUID_WICPixelFormat32bppPBGRA,
+        win.WICBitmapDitherTypeNone,
+        null,
+        0,
+        win.WICBitmapPaletteTypeCustom,
+    ) < 0) return null;
+
+    var source: *win.IWICBitmapSource = @ptrCast(converter);
+    var scaler: [*c]win.IWICBitmapScaler = null;
+    defer {
+        if (scaler != null) _ = scaler.*.lpVtbl.*.Release.?(scaler);
+    }
+    if (source_width != target.width or source_height != target.height) {
+        if (a.wic_factory.*.lpVtbl.*.CreateBitmapScaler.?(a.wic_factory, &scaler) < 0 or scaler == null) return null;
+        // Fant = high quality downscaling; small images grow cleanly too.
+        if (scaler.*.lpVtbl.*.Initialize.?(scaler, @ptrCast(converter), target.width, target.height, win.WICBitmapInterpolationModeFant) < 0) return null;
+        source = @ptrCast(scaler);
+    }
+
+    const stride: win.UINT = target.width * 4;
+    const byte_count: usize = @as(usize, stride) * target.height;
+    const pixels = a.allocator.alloc(u8, byte_count) catch return null;
+    defer a.allocator.free(pixels);
+    if (source.*.lpVtbl.*.CopyPixels.?(source, null, stride, @intCast(byte_count), pixels.ptr) < 0) return null;
+
+    var info = std.mem.zeroes(win.BITMAPINFO);
+    info.bmiHeader.biSize = @sizeOf(win.BITMAPINFOHEADER);
+    info.bmiHeader.biWidth = @intCast(target.width);
+    info.bmiHeader.biHeight = -@as(win.LONG, @intCast(target.height));
+    info.bmiHeader.biPlanes = 1;
+    info.bmiHeader.biBitCount = 32;
+    info.bmiHeader.biCompression = win.BI_RGB;
+    var bits: ?*anyopaque = null;
+    const bitmap = win.CreateDIBSection(null, &info, win.DIB_RGB_COLORS, &bits, null, 0) orelse return null;
+    if (bits == null) {
+        _ = win.DeleteObject(bitmap);
+        return null;
+    }
+    @memcpy(@as([*]u8, @ptrCast(bits.?))[0..byte_count], pixels);
+    out_width.* = @intCast(target.width);
+    out_height.* = @intCast(target.height);
+    return bitmap;
+}
+
+fn openImageViewer(a: *App, message: *const Message) void {
+    if (message.local_path.len == 0) return;
+    if (a.image_viewer_window != null) closeImageViewer(a);
+    const owner = a.hwnd orelse return;
+    const monitor = win.MonitorFromWindow(owner, win.MONITOR_DEFAULTTONEAREST);
+    var info = std.mem.zeroes(win.MONITORINFO);
+    info.cbSize = @sizeOf(win.MONITORINFO);
+    if (win.GetMonitorInfoW(monitor, &info) == 0) return;
+    const work = info.rcWork;
+    const width = @max(1, work.right - work.left);
+    const height = @max(1, work.bottom - work.top);
+
+    var bitmap_width: i32 = 0;
+    var bitmap_height: i32 = 0;
+    const bitmap = decodeImageViewerBitmap(a, message, width, height, &bitmap_width, &bitmap_height) orelse {
+        // WebP stickers have no WIC codec; the external viewer is the only path.
+        openMedia(a, message);
+        return;
+    };
+
+    const hwnd = win.CreateWindowExW(
+        0,
+        lit("MessagesImageViewer"),
+        lit("Messages · Image"),
+        win.WS_POPUP,
+        work.left,
+        work.top,
+        width,
+        height,
+        owner,
+        null,
+        a.instance,
+        null,
+    ) orelse {
+        _ = win.DeleteObject(bitmap);
+        setStatus(a, "Could not open the image");
+        return;
+    };
+    a.image_viewer_window = hwnd;
+    a.viewer_bitmap = bitmap;
+    a.viewer_width = bitmap_width;
+    a.viewer_height = bitmap_height;
+    _ = win.ShowWindow(hwnd, win.SW_SHOW);
+    _ = win.SetForegroundWindow(hwnd);
+    _ = win.SetFocus(hwnd);
+}
+
+fn imageViewerProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.LPARAM) callconv(.winapi) win.LRESULT {
+    const a = app_ptr orelse return win.DefWindowProcW(hwnd, message, wparam, lparam);
+    switch (message) {
+        win.WM_ERASEBKGND => return 1,
+        win.WM_PAINT => {
+            var ps = win.PAINTSTRUCT{};
+            const hdc = win.BeginPaint(hwnd, &ps);
+            var client = std.mem.zeroes(win.RECT);
+            _ = win.GetClientRect(hwnd, &client);
+            const background = win.CreateSolidBrush(rgb(9, 9, 9));
+            if (background) |brush| {
+                _ = win.FillRect(hdc, &client, brush);
+                _ = win.DeleteObject(brush);
+            }
+            if (a.viewer_bitmap) |bitmap| {
+                if (win.CreateCompatibleDC(hdc)) |memory| {
+                    const old = win.SelectObject(memory, bitmap);
+                    const x = @divTrunc(client.right - a.viewer_width, 2);
+                    const y = @divTrunc(client.bottom - a.viewer_height, 2);
+                    _ = win.BitBlt(hdc, x, y, a.viewer_width, a.viewer_height, memory, 0, 0, win.SRCCOPY);
+                    _ = win.SelectObject(memory, old);
+                    _ = win.DeleteDC(memory);
+                }
+            }
+            _ = win.EndPaint(hwnd, &ps);
+            return 0;
+        },
+        // Close on the button release, not the press: closing on the press
+        // would hand the release to the chat underneath as a click.
+        win.WM_LBUTTONDOWN, win.WM_LBUTTONDBLCLK => {
+            _ = win.SetCapture(hwnd);
+            return 0;
+        },
+        win.WM_LBUTTONUP => {
+            _ = win.ReleaseCapture();
+            closeImageViewer(a);
+            return 0;
+        },
+        win.WM_KEYDOWN => {
+            if (wparam == 27) { // escape
+                closeImageViewer(a);
+                return 0;
+            }
+        },
+        win.WM_CLOSE => {
+            closeImageViewer(a);
+            return 0;
+        },
+        win.WM_DESTROY => {
+            if (a.image_viewer_window != null and a.image_viewer_window.? == hwnd) a.image_viewer_window = null;
+            return 0;
+        },
+        else => {},
+    }
+    return win.DefWindowProcW(hwnd, message, wparam, lparam);
+}
+
 fn detectUnfurl(message: *Message) void {
     if (message.unfurl_provider != .none or message.link_count == 0) return;
     var buffer: [1024]u8 = undefined;
@@ -7526,6 +7744,9 @@ fn handleCanvasClick(a: *App, hwnd: win.HWND, x: i32, y: i32) void {
                 handleAudioClick(a, item, x);
             } else if (std.ascii.eqlIgnoreCase(item.media_type.slice(), "video")) {
                 playVideoInline(a, item);
+            } else if (isImage(item)) {
+                // Images open in the in-app viewer on double-click; a single
+                // click only selects the message.
             } else if (!isGif(item)) {
                 // GIFs already animate in place; popping them out to
                 // an external player was unwanted.
@@ -7563,6 +7784,26 @@ fn handleCanvasClick(a: *App, hwnd: win.HWND, x: i32, y: i32) void {
             return;
         }
     }
+}
+
+/// True when the double-click landed on an image and was handled.
+fn handleCanvasDoubleClick(a: *App, x: i32, y: i32) bool {
+    for (a.messages[0..a.message_count], 0..) |*item, index| {
+        const media = item.media_hit;
+        if (x < media.left or x > media.right or y < media.top or y > media.bottom) continue;
+        // Still images, stickers and animated GIFs (first frame) all open;
+        // video GIFs need Media Foundation and stay a single click.
+        if (!isImage(item) and (!isGif(item) or isVideoGif(item))) return false;
+        a.selected_message = index;
+        if (item.local_path.len == 0) {
+            setStatus(a, "Downloading image...");
+            downloadMedia(a, index, false);
+            return true;
+        }
+        openImageViewer(a, item);
+        return true;
+    }
+    return false;
 }
 
 fn reactToSelected(a: *App, command: u16) void {
@@ -8200,6 +8441,7 @@ fn buildPaletteItems(a: *App) void {
         appendPalette(a, "Add Telegram account", "", command_telegram_login);
     }
     appendPalette(a, "Open video in external player", "", command_open_video_external);
+    appendPalette(a, "Open image in Windows viewer", "", command_open_image_external);
     appendPalette(a, "Attach image to send", "", command_slack_attach);
     appendPalette(a, "Set up Slack...", "", command_slack_setup);
     appendPalette(a, "Disconnect Slack", "", command_slack_disconnect);
@@ -8925,6 +9167,23 @@ fn runCommand(a: *App, command: u16) void {
             }
             if (message.local_path.len == 0) {
                 setStatus(a, "The video is still downloading");
+                return;
+            }
+            openMedia(a, message);
+        },
+        command_open_image_external => {
+            const selected = a.selected_message orelse {
+                setStatus(a, "Select an image first");
+                return;
+            };
+            if (selected >= a.message_count) return;
+            const message = &a.messages[selected];
+            if (!isImage(message)) {
+                setStatus(a, "Select an image first");
+                return;
+            }
+            if (message.local_path.len == 0) {
+                setStatus(a, "The image is still downloading");
                 return;
             }
             openMedia(a, message);
@@ -10109,6 +10368,15 @@ fn canvasProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win
             }
             return 0;
         },
+        win.WM_LBUTTONDBLCLK => {
+            const x: i32 = @as(i16, @bitCast(loword(@as(usize, @bitCast(lparam)))));
+            const y: i32 = @as(i16, @bitCast(hiword(@as(usize, @bitCast(lparam)))));
+            if (handleCanvasDoubleClick(a, x, y)) return 0;
+            // CS_DBLCLKS turns a fast second press into a double-click;
+            // anywhere but an image it is still a press (scrollbar drag,
+            // text selection).
+            return canvasProc(hwnd, win.WM_LBUTTONDOWN, wparam, lparam);
+        },
         win.WM_MOUSEMOVE => {
             if (a.sb_drag == .canvas) {
                 const y: i32 = @as(i16, @bitCast(hiword(@as(usize, @bitCast(lparam)))));
@@ -10779,6 +11047,7 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
         win.WM_DESTROY => {
             wacliShutdown(a);
             closePlayer(a);
+            closeImageViewer(a);
             _ = win.KillTimer(hwnd, timer_refresh);
             _ = win.KillTimer(hwnd, timer_search);
             _ = win.KillTimer(hwnd, timer_animation);
@@ -10909,6 +11178,9 @@ fn handleKeyboard(a: *App, message: *const win.MSG) bool {
     // loop routes them through IsDialogMessageW, and the global shortcuts
     // (Ctrl+K palette, hotkeys) must not fire underneath the login flow.
     if (a.tg_login_window != null) return false;
+    // The image viewer owns the keyboard too: shortcuts like Q (quit) or
+    // E (archive) must not act on the chat hidden behind it.
+    if (a.image_viewer_window != null) return false;
     if (control and key == 'F') {
         if (a.search) |search| {
             _ = win.SetFocus(search);
@@ -11679,7 +11951,7 @@ pub fn main(init: std.process.Init) !void {
     );
     var canvas_class = win.WNDCLASSEXW{
         .cbSize = @sizeOf(win.WNDCLASSEXW),
-        .style = win.CS_HREDRAW | win.CS_VREDRAW,
+        .style = win.CS_HREDRAW | win.CS_VREDRAW | win.CS_DBLCLKS,
         .lpfnWndProc = canvasProc,
         .cbClsExtra = 0,
         .cbWndExtra = 0,
@@ -11754,6 +12026,22 @@ pub fn main(init: std.process.Init) !void {
         .hIconSm = icon_small,
     };
     if (win.RegisterClassExW(&emoji_class) == 0) return error.RegisterEmojiPickerClassFailed;
+
+    var viewer_class = win.WNDCLASSEXW{
+        .cbSize = @sizeOf(win.WNDCLASSEXW),
+        .style = win.CS_HREDRAW | win.CS_VREDRAW | win.CS_DBLCLKS,
+        .lpfnWndProc = imageViewerProc,
+        .cbClsExtra = 0,
+        .cbWndExtra = 0,
+        .hInstance = instance,
+        .hIcon = icon_big,
+        .hCursor = cursor,
+        .hbrBackground = null,
+        .lpszMenuName = null,
+        .lpszClassName = lit("MessagesImageViewer"),
+        .hIconSm = icon_small,
+    };
+    if (win.RegisterClassExW(&viewer_class) == 0) return error.RegisterImageViewerClassFailed;
 
     const hwnd = win.CreateWindowExW(
         0,
