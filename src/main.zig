@@ -11592,6 +11592,25 @@ fn handleKeyboard(a: *App, message: *const win.MSG) bool {
     // The image viewer owns the keyboard too: shortcuts like Q (quit) or
     // E (archive) must not act on the chat hidden behind it.
     if (a.image_viewer_window != null) return false;
+    // With the composer empty, Up/Down walk the message highlight like
+    // Alt+K/J; Down past the newest message clears it. Once there is text,
+    // the arrows move the caret as usual.
+    if (!control and !alt and !shift and (key == win.VK_UP or key == win.VK_DOWN)) {
+        if (a.compose) |compose| {
+            if (win.GetFocus() == compose and win.GetWindowTextLengthW(compose) == 0 and a.message_count > 0) {
+                if (key == win.VK_DOWN) {
+                    if (a.selected_message) |selected| {
+                        if (selected + 1 >= a.message_count) {
+                            a.selected_message = null;
+                            a.scroll_y = 0;
+                            if (a.canvas) |canvas| _ = win.InvalidateRect(canvas, null, win.TRUE);
+                        } else selectMessage(a, 1);
+                    }
+                } else selectMessage(a, -1);
+                return true;
+            }
+        }
+    }
     // Ctrl+1..9 open the chat at that position in the list.
     if (control and !alt and key >= '1' and key <= '9') {
         const target: i32 = @intCast(key - '1');
