@@ -364,6 +364,11 @@ const Message = struct {
     sender_jid: Utf8Text(191) = .{},
     sender: WideText(159) = .{},
     text: WideText(4095) = .{},
+    // WAZI-reply: a reply renders as its own quote block above the body; the
+    // quoted text and its sender are split out of wacli's DisplayText.
+    quote: WideText(4095) = .{},
+    quote_sender: WideText(159) = .{},
+    quote_sender_jid: Utf8Text(191) = .{},
     time: WideText(15) = .{},
     timestamp: Utf8Text(47) = .{},
     media_type: Utf8Text(31) = .{},
@@ -1185,6 +1190,42 @@ fn getInt(object: std.json.ObjectMap, key: []const u8) i64 {
         .integer => |number| number,
         else => 0,
     };
+}
+
+const QuoteParts = struct { quote: []const u8, body: []const u8 };
+
+/// wacli renders a reply as "> <quoted text>\n<reply>". The quoted text can
+/// itself contain newlines, so the split point comes from the known reply
+/// tail, never from the first newline. A missing reply means no quote.
+fn splitQuote(display: []const u8, reply: []const u8) ?QuoteParts {
+    if (reply.len == 0) return null;
+    if (display.len < 2 or !std.mem.startsWith(u8, display, "> ")) return null;
+    if (!std.mem.endsWith(u8, display, reply)) return null;
+    const separator = display.len - reply.len - 1;
+    if (separator < 2 or display[separator] != '\n') return null;
+    return .{ .quote = display[2..separator], .body = reply };
+}
+
+test "splitQuote recovers a normal reply" {
+    const parts = splitQuote("> earlier message\nmy reply", "my reply").?;
+    try std.testing.expectEqualStrings("earlier message", parts.quote);
+    try std.testing.expectEqualStrings("my reply", parts.body);
+}
+
+test "splitQuote keeps newlines inside the quoted text" {
+    const display = "> first line\nsecond line\nmy reply";
+    const parts = splitQuote(display, "my reply").?;
+    try std.testing.expectEqualStrings("first line\nsecond line", parts.quote);
+    try std.testing.expectEqualStrings("my reply", parts.body);
+}
+
+test "splitQuote rejects plain messages and mismatched replies" {
+    try std.testing.expect(splitQuote("not a reply", "not a reply") == null);
+    try std.testing.expect(splitQuote("just some text", "text") == null);
+    try std.testing.expect(splitQuote("> quoted\nreal reply", "other reply") == null);
+    try std.testing.expect(splitQuote("> quoted\nreal reply", "") == null);
+    // The reply appears at the end but is not preceded by the separator.
+    try std.testing.expect(splitQuote("> quoted\nreal reply", "reply") == null);
 }
 
 fn wacliJobArgs(job: *WacliJob, args: []const []const u8) void {
@@ -6440,6 +6481,37 @@ fn refreshMessages(a: *App) void {
     wacliEnqueue(a, job, true);
 }
 
+fn youSender(allocator: std.mem.Allocator) WideText(159) {
+    var sender = WideText(159){};
+    sender.set(allocator, "You");
+    return sender;
+}
+
+/// Resolve the reply target's display name from messages already parsed for
+/// this chat, using the same per-sender name and from-me logic the bubbles
+/// use. Older messages are parsed first, so the quoted message usually is in
+/// the list by the time the reply is reached; nothing found stays empty.
+fn resolveQuoteSender(a: *const App, chat_jid: []const u8, jid: []const u8) WideText(159) {
+    if (jid.len == 0) return .{};
+    for (a.messages[0..a.message_count]) |*prior| {
+        if (!std.mem.eql(u8, prior.sender_jid.slice(), jid)) continue;
+        if (prior.from_me) return youSender(a.allocator);
+        if (prior.sender.len > 0) return prior.sender;
+    }
+    // In a direct chat the other party is the chat itself. Compare only the
+    // user part: jids can carry a device suffix (":5"). Anything else (an
+    // @lid alias, say) stays unnamed rather than risk calling them "You".
+    if (!std.mem.endsWith(u8, chat_jid, "@g.us") and std.mem.eql(u8, jidUser(jid), jidUser(chat_jid))) {
+        if (a.selected_chat < a.chat_count) return a.chats[a.selected_chat].name;
+    }
+    return .{};
+}
+
+fn jidUser(jid: []const u8) []const u8 {
+    const end = std.mem.indexOfAny(u8, jid, "@:") orelse jid.len;
+    return jid[0..end];
+}
+
 fn applyMessageData(a: *App, raw: []const u8, final: bool) void {
     var parsed = std.json.parseFromSlice(std.json.Value, a.allocator, raw, .{}) catch return;
     defer parsed.deinit();
@@ -6501,7 +6573,17 @@ fn applyMessageData(a: *App, raw: []const u8, final: bool) void {
         message.sender_jid.set(getString(object, "SenderJID"));
         message.sender.set(a.allocator, if (getBool(object, "FromMe")) "You" else getString(object, "SenderName"));
         message.revoked = revoked;
-        if (message.revoked) text = "Message deleted";
+        if (message.revoked) {
+            text = "Message deleted";
+        } else if (getString(object, "quoted_msg_id").len > 0) {
+            if (splitQuote(text, getString(object, "Text"))) |parts| {
+                const quoted_sender_jid = getString(object, "quoted_sender_jid");
+                message.quote.set(a.allocator, parts.quote);
+                message.quote_sender_jid.set(quoted_sender_jid);
+                message.quote_sender = resolveQuoteSender(a, chat.jid.slice(), quoted_sender_jid);
+                text = parts.body;
+            }
+        }
         message.text.set(a.allocator, text);
         message.from_me = getBool(object, "FromMe");
         message.media_type.set(media_type);
@@ -9781,10 +9863,57 @@ fn messageGap(a: *App, index: usize) i32 {
     return if (showSenderName(a, index)) 8 else 2;
 }
 
+// WAZI-reply: a reply's quote block sits between the sender line and the
+// body. Measure and draw share these constants so the reserved height always
+// matches what is painted; a mismatch shifts every bubble below.
+const quote_inset: i32 = 12;
+const quote_bar_width: i32 = 3;
+const quote_text_gap: i32 = 6;
+const quote_vertical_pad: i32 = 6;
+const quote_after_gap: i32 = 6;
+const quote_max_lines: i32 = 2;
+
+fn quoteTextWidth(bubble_width: i32) i32 {
+    return @max(1, bubble_width - quote_inset * 2 - quote_bar_width - quote_text_gap * 2);
+}
+
+fn quoteBodyHeight(hdc: win.HDC, a: *App, text: []const u16, width: i32) i32 {
+    if (text.len == 0) return 0;
+    const font = a.font_small orelse return 0;
+    _ = win.SelectObject(hdc, @ptrCast(font));
+    const line_height = textLineHeight(hdc, font);
+    var rect = win.RECT{ .left = 0, .top = 0, .right = width, .bottom = 0 };
+    _ = win.DrawTextW(hdc, text.ptr, @intCast(text.len), &rect, win.DT_CALCRECT | win.DT_WORDBREAK | win.DT_EDITCONTROL | win.DT_NOPREFIX);
+    return @min(rect.bottom - rect.top, line_height * quote_max_lines);
+}
+
+fn quoteBlockHeight(hdc: win.HDC, a: *App, message: *const Message, width: i32) i32 {
+    if (message.quote.len == 0) return 0;
+    var name_height: i32 = 0;
+    if (message.quote_sender.len > 0) {
+        const font = a.font_small orelse return 0;
+        name_height = textLineHeight(hdc, font);
+    }
+    return quote_vertical_pad + name_height + quoteBodyHeight(hdc, a, message.quote.slice(), quoteTextWidth(width)) + quote_after_gap;
+}
+
+// Blend a bubble color 12% toward white (incoming) or black (own).
+fn quoteBlockTint(base: win.COLORREF, toward: u8) win.COLORREF {
+    const r: i32 = @intCast(base & 0xff);
+    const g: i32 = @intCast((base >> 8) & 0xff);
+    const b: i32 = @intCast((base >> 16) & 0xff);
+    const t: i32 = toward;
+    return rgb(
+        @intCast(@divTrunc(r * 88 + t * 12, 100)),
+        @intCast(@divTrunc(g * 88 + t * 12, 100)),
+        @intCast(@divTrunc(b * 88 + t * 12, 100)),
+    );
+}
+
 fn measureMessage(hdc: win.HDC, a: *App, message: *const Message, width: i32, show_sender: bool) i32 {
     _ = win.SelectObject(hdc, @ptrCast(a.font.?));
     const header_height: i32 = if (show_sender) 34 else 12;
-    var height = wrapMixedSink(hdc, a, if (message.text.len > 0) message.text.ptr() else lit(" "), if (message.text.len > 0) @intCast(message.text.len) else 1, width - 24, false, 0, 0, message) + header_height;
+    var height = quoteBlockHeight(hdc, a, message, width) + wrapMixedSink(hdc, a, if (message.text.len > 0) message.text.ptr() else lit(" "), if (message.text.len > 0) @intCast(message.text.len) else 1, width - 24, false, 0, 0, message) + header_height;
     // WAZI-68: a video link unfurls into a fixed-size card below the text.
     // Links are collected during the measure pass above, so classify here;
     // once classified the result is sticky for the message's lifetime.
@@ -10015,6 +10144,53 @@ fn syncScrollbarStrips(a: *App) void {
     }
 }
 
+fn drawQuoteBlock(hdc: win.HDC, a: *App, message: *const Message, left: i32, right: i32, top: i32) i32 {
+    const font = a.font_small orelse return top;
+    const block_left = left + quote_inset;
+    const block_right = right - quote_inset;
+    const body_height = quoteBodyHeight(hdc, a, message.quote.slice(), quoteTextWidth(right - left));
+    var name_height: i32 = 0;
+    if (message.quote_sender.len > 0) name_height = textLineHeight(hdc, font);
+    const block_bottom = top + quote_vertical_pad + name_height + body_height;
+
+    const tint = if (message.from_me) quoteBlockTint(color_outgoing, 0) else quoteBlockTint(color_incoming, 255);
+    if (win.CreateSolidBrush(tint)) |block_brush| {
+        const old_brush = win.SelectObject(hdc, block_brush);
+        const old_pen = win.SelectObject(hdc, win.GetStockObject(win.NULL_PEN));
+        _ = win.RoundRect(hdc, block_left, top, block_right, block_bottom, 8, 8);
+        _ = win.SelectObject(hdc, old_brush);
+        _ = win.SelectObject(hdc, old_pen);
+        _ = win.DeleteObject(block_brush);
+    }
+
+    // Accent bar and sender name share the same stable per-sender colour.
+    const accent = senderColorFor(message.quote_sender_jid.slice());
+    const accent_color = rgb(accent.r, accent.g, accent.b);
+    if (win.CreateSolidBrush(accent_color)) |bar_brush| {
+        var bar = win.RECT{ .left = block_left, .top = top + quote_vertical_pad / 2, .right = block_left + quote_bar_width, .bottom = block_bottom - quote_vertical_pad / 2 };
+        _ = win.FillRect(hdc, &bar, bar_brush);
+        _ = win.DeleteObject(bar_brush);
+    }
+
+    _ = win.SelectObject(hdc, @ptrCast(font));
+    const text_left = block_left + quote_bar_width + quote_text_gap;
+    const text_right = block_right - quote_text_gap;
+    var cursor = top + quote_vertical_pad / 2;
+    if (message.quote_sender.len > 0) {
+        _ = win.SetTextColor(hdc, accent_color);
+        var name_rect = win.RECT{ .left = text_left, .top = cursor, .right = text_right, .bottom = cursor + name_height };
+        _ = win.DrawTextW(hdc, message.quote_sender.ptr(), @intCast(message.quote_sender.len), &name_rect, win.DT_LEFT | win.DT_SINGLELINE | win.DT_END_ELLIPSIS | win.DT_NOPREFIX);
+        cursor += name_height;
+    }
+    if (body_height > 0) {
+        _ = win.SetTextColor(hdc, color_muted);
+        var body_rect = win.RECT{ .left = text_left, .top = cursor, .right = text_right, .bottom = cursor + body_height };
+        _ = win.DrawTextW(hdc, message.quote.ptr(), @intCast(message.quote.len), &body_rect, win.DT_LEFT | win.DT_WORDBREAK | win.DT_EDITCONTROL | win.DT_WORD_ELLIPSIS | win.DT_NOPREFIX);
+    }
+    _ = win.SetTextColor(hdc, color_text);
+    return block_bottom + quote_after_gap;
+}
+
 fn drawCanvas(hwnd: win.HWND, a: *App) void {
     var paint: win.PAINTSTRUCT = undefined;
     const screen_dc = win.BeginPaint(hwnd, &paint);
@@ -10129,6 +10305,7 @@ fn drawCanvas(hwnd: win.HWND, a: *App) void {
             text_top = y + 26;
         }
         if (show_sender and in_group and !message.from_me and message.sender.len > 0) drawSenderAvatar(hdc, a, left - 38, y + 6, message);
+        if (message.quote.len > 0) text_top = drawQuoteBlock(hdc, a, message, left, right, text_top);
         if (message.bitmap) |bitmap| {
             const image_left = left + @divTrunc(bubble_width - message.bitmap_width, 2);
             const image_top = text_top + 4;
