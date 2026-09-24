@@ -36,6 +36,13 @@ const max_groups = 1024;
 const max_messages = 100;
 const max_pending_sends = 32;
 const max_pending_reads = 8;
+// A send that fails is retried instead of dropped: at most 3 retries, each
+// started 5s after the previous result so a transient store-lock loss clears.
+const max_send_retries: u8 = 3;
+const send_retry_delay_ms: u64 = 5_000;
+// One profile-picture fetch per sync pause, spaced so a long chat list does
+// not keep live sync off for minutes.
+const avatar_request_spacing_ms: u64 = 20_000;
 const max_avatars = 256;
 const timer_refresh = 1;
 const timer_search = 2;
@@ -244,6 +251,26 @@ const PendingSend = struct {
     // Paste-to-send (WAZI-37): when set, the queued send is
     // `wacli send file --file <path>` with `text` as the caption.
     file: Utf8Text(519) = .{},
+    // Optimistic-bubble correlation and retry bookkeeping: `seq` names the
+    // local bubble, `retries` counts failed attempts, `not_before_ms` delays
+    // the next attempt, and `queued_unix` is the enqueue time (unix seconds)
+    // that same-text dedup compares message timestamps against.
+    seq: u64 = 0,
+    retries: u8 = 0,
+    not_before_ms: u64 = 0,
+    queued_unix: i64 = 0,
+};
+
+// A permanently failed send kept for the next reload: the composer got the
+// text back and a muted "(not sent)" bubble shows again in its chat.
+const max_failed_sends = 8;
+const FailedSend = struct {
+    jid: Utf8Text(191) = .{},
+    text: Utf8Text(4095) = .{},
+    // Enqueue time (unix seconds); the reload dedup ignores stored messages
+    // older than this, so an old same-text message is not mistaken for this
+    // failed (then delivered) send.
+    queued_unix: i64 = 0,
 };
 
 // An image staged from the clipboard (WAZI-37): a PNG copy written to the
@@ -598,8 +625,22 @@ const App = struct {
     pin_count: usize = 0,
     pins_loaded: bool = false,
     send_child: ?std.process.Child = null,
+    // True when the running send was spawned with live sync already stopped:
+    // sync must wait for that send, unlike a delegated send wacli hands to the
+    // running sync process.
+    send_direct: bool = false,
+    // Ticks when the running send child spawned; checkSend kills it past
+    // send_timeout_ms the way checkMarkRead reaps a wedged read.
+    send_started_ms: u64 = 0,
     pending_sends: [max_pending_sends]PendingSend = [_]PendingSend{.{}} ** max_pending_sends,
     pending_send_count: usize = 0,
+    // Monotonic id handed to each queued send, so its optimistic bubble can be
+    // re-appended after a reload and found again on a permanent failure.
+    send_seq: u64 = 0,
+    // Failed sends survive a reload as "(not sent)" bubbles for their chat; at
+    // most max_failed_sends, the oldest dropped first.
+    failed_sends: [max_failed_sends]FailedSend = [_]FailedSend{.{}} ** max_failed_sends,
+    failed_send_count: usize = 0,
     staged_image: StagedImage = .{},
     media_attempts: [512]u64 = [_]u64{0} ** 512,
     media_attempt_count: usize = 0,
@@ -630,6 +671,10 @@ const App = struct {
     avatars: [max_avatars]AvatarEntry = [_]AvatarEntry{.{}} ** max_avatars,
     avatar_count: usize = 0,
     avatar_active_index: ?usize = null,
+    // Ticks at which the last avatar fetch started; requestNextAvatar spaces
+    // its own fetches by avatar_request_spacing_ms (explicit user requests are
+    // unaffected).
+    last_avatar_request_ms: u64 = 0,
     wic_factory: [*c]win.IWICImagingFactory = null,
     player_window: ?win.HWND = null,
     mf_player: ?*win.IMFPMediaPlayer = null,
@@ -3172,6 +3217,186 @@ fn oldestPendingSend(a: *App) ?usize {
     return null;
 }
 
+/// Local bubble id for a queued WhatsApp send: a reload re-appends the same
+/// bubble and a permanent failure finds it by this id.
+fn localSendId(buffer: []u8, seq: u64) []const u8 {
+    return std.fmt.bufPrint(buffer, "local-{d}", .{seq}) catch "local";
+}
+
+/// Optimistic bubble for a queued WhatsApp send (mirrors appendSlackPending):
+/// the message shows the moment the composer clears, and applyMessageData
+/// re-appends it after every reload until wacli stores the real message. On a
+/// reload (`from_reload`) the stored message may already be present, and
+/// re-appending would show it twice.
+fn appendWhatsAppPending(a: *App, pending: *const PendingSend, from_reload: bool) void {
+    if (a.message_count >= max_messages or a.chat_count == 0 or a.selected_chat >= a.chat_count) return;
+    if (!std.mem.eql(u8, a.chats[a.selected_chat].jid.slice(), pending.jid.slice())) return;
+    if (from_reload) {
+        for (a.messages[0..a.message_count]) |*message| {
+            if (!message.from_me or message.send_state != .none) continue;
+            const text = std.unicode.utf16LeToUtf8Alloc(a.allocator, message.text.slice()) catch continue;
+            defer a.allocator.free(text);
+            if (!std.mem.eql(u8, text, pending.text.slice())) continue;
+            // Only a stored message at or after the queued time proves this
+            // send landed; an unparseable timestamp never counts as a match.
+            const stored_unix = media_age.unixSeconds(message.timestamp.slice()) orelse continue;
+            if (stored_unix >= pending.queued_unix - 5) return;
+        }
+    }
+    var message = Message{};
+    message.from_me = true;
+    message.sender.set(a.allocator, "You");
+    if (pending.file.len > 0 and pending.text.len == 0) {
+        message.text.set(a.allocator, "Sending file...");
+    } else {
+        message.text.set(a.allocator, pending.text.slice());
+    }
+    var id_buffer: [32]u8 = undefined;
+    message.id.set(localSendId(&id_buffer, pending.seq));
+    var local = std.mem.zeroes(win.SYSTEMTIME);
+    win.GetLocalTime(&local);
+    var time_buffer: [6]u8 = undefined;
+    if (std.fmt.bufPrint(&time_buffer, "{d:0>2}:{d:0>2}", .{ local.wHour, local.wMinute })) |rendered| {
+        message.time.set(a.allocator, rendered);
+    } else |_| {}
+    message.send_state = .pending;
+    a.messages[a.message_count] = message;
+    a.message_count += 1;
+    if (a.canvas) |canvas| _ = win.InvalidateRect(canvas, null, win.TRUE);
+}
+
+/// Mark the optimistic bubble for a permanently failed send the way Slack
+/// renders failures: a muted bubble with a "(not sent)" marker.
+fn markPendingSendFailed(a: *App, pending: *const PendingSend) void {
+    var id_buffer: [32]u8 = undefined;
+    const id = localSendId(&id_buffer, pending.seq);
+    for (a.messages[0..a.message_count]) |*message| {
+        if (!message.from_me or message.send_state != .pending or
+            !std.mem.eql(u8, message.id.slice(), id)) continue;
+        message.send_state = .failed;
+        const old = std.unicode.utf16LeToUtf8Alloc(a.allocator, message.text.slice()) catch return;
+        defer a.allocator.free(old);
+        if (old.len + " (not sent)".len < 4095) {
+            const marked = std.fmt.allocPrint(a.allocator, "{s} (not sent)", .{old}) catch return;
+            defer a.allocator.free(marked);
+            message.text.set(a.allocator, marked);
+        }
+        if (a.canvas) |canvas| _ = win.InvalidateRect(canvas, null, win.TRUE);
+        return;
+    }
+}
+
+/// Re-append a remembered failed send as a muted "(not sent)" bubble after a
+/// reload, the same way pending bubbles are re-appended.
+fn appendWhatsAppFailed(a: *App, failed: *const FailedSend) void {
+    if (a.message_count >= max_messages or a.chat_count == 0 or a.selected_chat >= a.chat_count) return;
+    if (!std.mem.eql(u8, a.chats[a.selected_chat].jid.slice(), failed.jid.slice())) return;
+    var message = Message{};
+    message.from_me = true;
+    message.sender.set(a.allocator, "You");
+    if (failed.text.len == 0) {
+        message.text.set(a.allocator, "(not sent)");
+    } else if (failed.text.len + " (not sent)".len < 4095) {
+        const marked = std.fmt.allocPrint(a.allocator, "{s} (not sent)", .{failed.text.slice()}) catch return;
+        defer a.allocator.free(marked);
+        message.text.set(a.allocator, marked);
+    } else {
+        message.text.set(a.allocator, failed.text.slice());
+    }
+    var local = std.mem.zeroes(win.SYSTEMTIME);
+    win.GetLocalTime(&local);
+    var time_buffer: [6]u8 = undefined;
+    if (std.fmt.bufPrint(&time_buffer, "{d:0>2}:{d:0>2}", .{ local.wHour, local.wMinute })) |rendered| {
+        message.time.set(a.allocator, rendered);
+    } else |_| {}
+    message.send_state = .failed;
+    a.messages[a.message_count] = message;
+    a.message_count += 1;
+    if (a.canvas) |canvas| _ = win.InvalidateRect(canvas, null, win.TRUE);
+}
+
+/// Remember a permanently failed send (jid and text) so its bubble survives
+/// the next reload. Keeps the newest max_failed_sends entries.
+fn rememberFailedSend(a: *App, pending: *const PendingSend) void {
+    for (a.failed_sends[0..a.failed_send_count]) |*entry| {
+        if (std.mem.eql(u8, entry.jid.slice(), pending.jid.slice()) and
+            std.mem.eql(u8, entry.text.slice(), pending.text.slice())) return;
+    }
+    if (a.failed_send_count == a.failed_sends.len) {
+        var index: usize = 1;
+        while (index < a.failed_send_count) : (index += 1) a.failed_sends[index - 1] = a.failed_sends[index];
+        a.failed_send_count -= 1;
+    }
+    a.failed_sends[a.failed_send_count].jid.set(pending.jid.slice());
+    a.failed_sends[a.failed_send_count].text.set(pending.text.slice());
+    a.failed_sends[a.failed_send_count].queued_unix = pending.queued_unix;
+    a.failed_send_count += 1;
+}
+
+/// Drop a remembered failure the user just resent so its stale "(not sent)"
+/// bubble is not resurrected by the next reload.
+fn forgetFailedSend(a: *App, jid: []const u8, text: []const u8) void {
+    for (a.failed_sends[0..a.failed_send_count], 0..) |*entry, index| {
+        if (!std.mem.eql(u8, entry.jid.slice(), jid) or !std.mem.eql(u8, entry.text.slice(), text)) continue;
+        var shift = index;
+        while (shift + 1 < a.failed_send_count) : (shift += 1) a.failed_sends[shift] = a.failed_sends[shift + 1];
+        a.failed_send_count -= 1;
+        a.failed_sends[a.failed_send_count] = .{};
+        return;
+    }
+}
+
+/// Drop remembered failures the reloaded store already contains: the message
+/// was delivered (or resent) after all, so no "(not sent)" bubble remains.
+fn pruneFailedSends(a: *App, jid: []const u8) void {
+    var index: usize = 0;
+    while (index < a.failed_send_count) {
+        const entry = &a.failed_sends[index];
+        var delivered = false;
+        if (std.mem.eql(u8, entry.jid.slice(), jid)) {
+            for (a.messages[0..a.message_count]) |*message| {
+                if (!message.from_me or message.send_state != .none) continue;
+                const text = std.unicode.utf16LeToUtf8Alloc(a.allocator, message.text.slice()) catch continue;
+                defer a.allocator.free(text);
+                if (!std.mem.eql(u8, text, entry.text.slice())) continue;
+                // Same-time guard as appendWhatsAppPending: an old same-text
+                // message is not evidence this send was delivered.
+                const stored_unix = media_age.unixSeconds(message.timestamp.slice()) orelse continue;
+                if (stored_unix >= entry.queued_unix - 5) {
+                    delivered = true;
+                    break;
+                }
+            }
+        }
+        if (!delivered) {
+            index += 1;
+            continue;
+        }
+        var shift = index;
+        while (shift + 1 < a.failed_send_count) : (shift += 1) a.failed_sends[shift] = a.failed_sends[shift + 1];
+        a.failed_send_count -= 1;
+        a.failed_sends[a.failed_send_count] = .{};
+    }
+}
+
+/// A failed text send goes back into the composer when the user has not typed
+/// something new and is still looking at the chat the send belonged to, so the
+/// message is recoverable instead of lost or pasted into the wrong chat.
+fn restoreFailedSendText(a: *App, failed: *const PendingSend) void {
+    if (failed.file.len > 0 or failed.text.len == 0) return;
+    if (a.chat_count == 0 or a.selected_chat >= a.chat_count) return;
+    if (!std.mem.eql(u8, a.chats[a.selected_chat].jid.slice(), failed.jid.slice())) return;
+    const compose = a.compose orelse return;
+    var probe: [2]u16 = undefined;
+    if (win.GetWindowTextW(compose, &probe, probe.len) != 0) return;
+    var wide_buffer: [4096]u16 = undefined;
+    const length = std.unicode.utf8ToUtf16Le(&wide_buffer, failed.text.slice()) catch return;
+    wide_buffer[length] = 0;
+    _ = win.SetWindowTextW(compose, &wide_buffer);
+    layout(a, a.compose_client_width, a.compose_client_height);
+    focusCompose(a);
+}
+
 /// Pending bubble carrying this client_msg_id, if still displayed.
 fn pendingByClientMsgId(a: *App, client_msg_id: []const u8) ?usize {
     if (client_msg_id.len == 0) return null;
@@ -3785,7 +4010,7 @@ fn startNextMarkRead(a: *App) void {
     // Plain mark-read waits on a regular_low app-state recovery that only
     // the phone can answer, so a desynced collection hung every read and
     // kept live sync paused (openclaw/wacli#428).
-    if (a.send_child != null or a.pending_send_count > 0 or
+    if (a.send_child != null or sendReadyPending(a) or
         a.archive_child != null or a.pending_archive_count > 0 or
         avatarBusy(a) or mediaBusy(a)) return;
     stopSync(a);
@@ -3821,16 +4046,20 @@ fn startNextMarkRead(a: *App) void {
 // not wedge the app: the lock wait is capped at 70s, so 90s means it is stuck.
 const read_timeout_ms: u64 = 90_000;
 
+// A send lock wait is capped at 70s too; 90s means wacli is stuck and the
+// child is killed rather than gating every queued send forever.
+const send_timeout_ms: u64 = 90_000;
+
 fn checkMarkRead(a: *App) void {
     if (a.read_child) |*child| {
         const handle = child.id orelse return;
         var code: win.DWORD = 0;
         if (win.GetExitCodeProcess(handle, &code) == 0 or code == win.STILL_ACTIVE) {
             if (win.GetTickCount64() - a.read_started_ms <= read_timeout_ms) return;
+            // kill already reaps the child; waiting on it again trips an assert.
             _ = child.kill(a.io);
             code = 1;
-        }
-        _ = child.wait(a.io) catch {};
+        } else _ = child.wait(a.io) catch {};
         a.read_child = null;
         if (code != 0) requeueFailedRead(a) else removeFirstPendingRead(a);
         // Drain the queue back-to-back before restarting live sync, which
@@ -4479,6 +4708,9 @@ fn filetimeToUnixSeconds(ft: win.FILETIME) i64 {
 }
 
 fn startMediaDownload(a: *App, chat_jid: []const u8, message_id: []const u8) bool {
+    // A send in flight may still be relying on live sync staying paused;
+    // callers treat false as "try later" and the next tick retries.
+    if (a.send_child != null) return false;
     // Never two children for one attachment: every caller (auto scan, audio
     // chain, manual click) funnels through here.
     if (mediaDownloading(a, message_id)) return false;
@@ -4685,6 +4917,9 @@ fn checkAvatarDownload(a: *App) void {
 // (status .unavailable), and there is no TTL refresh of cached icons;
 // upgrade path: retry counter with backoff plus a weekly file-age check.
 fn requestNextAvatar(a: *App) void {
+    // Space the automatic fetches out so a long chat list cannot keep pausing
+    // live sync back-to-back; an explicit requestAvatar call is unaffected.
+    if (win.GetTickCount64() - a.last_avatar_request_ms < avatar_request_spacing_ms) return;
     for (a.chats[0..a.chat_count], 0..) |*chat, index| {
         const entry = avatarForChat(a, chat.jid.slice()) orelse continue;
         if (entry.status != .unknown or entry.path.len == 0) continue;
@@ -4708,6 +4943,7 @@ fn requestAvatar(a: *App, chat_index: usize) void {
     if (session.start(a.wacli_path, entry.jid.slice(), destination)) {
         entry.status = .loading;
         a.avatar_active_index = index;
+        a.last_avatar_request_ms = win.GetTickCount64();
     } else startSync(a);
 }
 
@@ -6093,6 +6329,20 @@ fn applyMessageData(a: *App, raw: []const u8, final: bool) void {
     // Only a fresh result marks the view current: a cached paint must keep
     // the old timestamp so a later store change still triggers a real read.
     if (final) a.displayed_timestamp.set(chat.timestamp.slice());
+    // Optimistic bubbles for queued/running sends in the open chat are wiped
+    // by the rebuild above; put them back until wacli stores the real message
+    // and a later refresh replaces them.
+    for (a.pending_sends[0..a.pending_send_count]) |*pending| {
+        if (a.message_count >= max_messages) break;
+        appendWhatsAppPending(a, pending, true);
+    }
+    // Failures remembered from earlier sends: drop the ones the store now
+    // contains, then re-append the rest for the open chat.
+    pruneFailedSends(a, chat.jid.slice());
+    for (a.failed_sends[0..a.failed_send_count]) |*failed| {
+        if (a.message_count >= max_messages) break;
+        appendWhatsAppFailed(a, failed);
+    }
     if (a.canvas) |canvas| _ = win.InvalidateRect(canvas, null, win.TRUE);
     if (final) markChatRead(a);
 }
@@ -6180,7 +6430,7 @@ fn startSync(a: *App) void {
         enqueueCacheTagProbe(a);
     }
     if (a.sync_child != null or a.read_child != null or readsPendingBlockingSync(a) or
-        mediaBusy(a) or a.send_child != null or a.pending_send_count > 0 or
+        mediaBusy(a) or (a.send_child != null and a.send_direct) or
         a.archive_child != null or a.pending_archive_count > 0 or avatarBusy(a) or
         wacliPendingGet(a, .reaction) > 0) return;
     const child = std.process.spawn(a.io, .{
@@ -6289,7 +6539,7 @@ fn checkSyncHeartbeat(a: *App) void {
 }
 
 fn checkSync(a: *App) void {
-    if (mediaBusy(a) or a.read_child != null or a.send_child != null or a.pending_send_count > 0 or a.archive_child != null or a.pending_archive_count > 0 or avatarBusy(a)) return;
+    if (mediaBusy(a) or a.read_child != null or (a.send_child != null and a.send_direct) or a.archive_child != null or a.pending_archive_count > 0 or avatarBusy(a)) return;
     // WAZI-82: while halted after repeated fast deaths, stay stopped; only
     // the auth probe answer or an explicit palette command restarts sync.
     if (a.sync_fail_count >= accounts.sync_halt_after_fast_deaths) return;
@@ -6378,16 +6628,86 @@ fn removeFirstPendingSend(a: *App) void {
     a.pending_sends[a.pending_send_count] = .{};
 }
 
+/// Record a failed attempt for the head send. Only a spawn failure or a lost
+/// store lock may be retried (`retryable`); any other nonzero exit means the
+/// message may already have been delivered, so it fails immediately. After
+/// max_send_retries, mark its bubble failed, drop it, and hand the text back
+/// to the composer. The send is never silently lost.
+fn failHeadPendingSend(a: *App, code: u32, retryable: bool) void {
+    a.pending_sends[0].retries += 1;
+    const retries = a.pending_sends[0].retries;
+    var log_buffer: [80]u8 = undefined;
+    const event = std.fmt.bufPrint(&log_buffer, "send: failed exit {d} retry {d}", .{ code, retries }) catch "send: failed";
+    appendLaunchLog(a, event);
+    if (retryable and retries < max_send_retries) {
+        a.pending_sends[0].not_before_ms = win.GetTickCount64() + send_retry_delay_ms;
+        var retry_buffer: [80]u8 = undefined;
+        const status = std.fmt.bufPrint(&retry_buffer, "Send failed, retrying ({d}/{d})", .{ retries, max_send_retries }) catch "Send failed, retrying";
+        setStatus(a, status);
+        // A direct send had paused live sync; let it run during the backoff.
+        startSync(a);
+        return;
+    }
+    const failed = a.pending_sends[0];
+    markPendingSendFailed(a, &failed);
+    rememberFailedSend(a, &failed);
+    removeFirstPendingSend(a);
+    restoreFailedSendText(a, &failed);
+    var status_buffer: [400]u8 = undefined;
+    const status = std.fmt.bufPrint(&status_buffer, "Message to {s} failed to send - text copied back to the box", .{failed.jid.slice()}) catch "Message failed to send - text copied back to the box";
+    setStatus(a, status);
+    // Do not refreshMessages here: a reload would wipe the failed bubble.
+    if (a.pending_send_count > 0) {
+        startNextSend(a);
+    } else {
+        drainMediaDownloads(a);
+        startSync(a);
+    }
+}
+
+/// True when a queued send is due now. The mark-read and archive gates wait
+/// for a ready send, but must not stall behind one biding out retry backoff.
+fn sendReadyPending(a: *const App) bool {
+    const now = win.GetTickCount64();
+    for (a.pending_sends[0..a.pending_send_count]) |*pending| {
+        if (pending.not_before_ms <= now) return true;
+    }
+    return false;
+}
+
+const send_output_max_bytes = 64 * 1024;
+
+/// Read one finished send child pipe: wacli --json prints its result on
+/// stdout and lock errors on stderr. Must run before child.wait, which closes
+/// the pipes; the child has exited, so reading to EOF cannot block. Mirrors
+/// the streaming reader syncStderrMain uses on a child pipe, but keeps the
+/// result instead of logging lines.
+fn readChildOutput(a: *App, file: ?std.Io.File) ?[]u8 {
+    const stream = file orelse return null;
+    var buffer: [4096]u8 = undefined;
+    var reader = stream.readerStreaming(a.io, &buffer);
+    return reader.interface.allocRemaining(a.allocator, .limited(send_output_max_bytes)) catch null;
+}
+
 fn startNextSend(a: *App) void {
     if (a.send_child != null or a.read_child != null or a.pending_send_count == 0) return;
-    stopSync(a);
+    // With live sync stopped by another write job, a send started now would
+    // take the store lock itself and collide with the job that later restarts
+    // sync (whose argv has no --lock-wait). Wait for that job to finish.
+    if (a.sync_child == null and (a.read_child != null or mediaBusy(a) or avatarBusy(a) or a.archive_child != null)) return;
+    // A failed send waits out its not-before stamp; checkSend retries it on
+    // the next refresh tick.
+    if (win.GetTickCount64() < a.pending_sends[0].not_before_ms) return;
     const pending = &a.pending_sends[0];
     const is_file = pending.file.len > 0;
     var args: [18][]const u8 = undefined;
     var count: usize = 0;
     args[count] = a.wacli_path;
     count += 1;
-    for ([_][]const u8{ "--json", "--lock-wait", "10s", "send", if (is_file) "file" else "text", "--to", pending.jid.slice() }) |argument| {
+    // 70s lock wait, like mark-read: a picture/media child can hold the store
+    // lock for up to 60s. Sends no longer stop live sync; wacli 0.19
+    // delegates them to the running sync process.
+    for ([_][]const u8{ "--json", "--lock-wait", "70s", "send", if (is_file) "file" else "text", "--to", pending.jid.slice() }) |argument| {
         args[count] = argument;
         count += 1;
     }
@@ -6418,19 +6738,16 @@ fn startNextSend(a: *App) void {
     const child = std.process.spawn(a.io, .{
         .argv = args[0..count],
         .stdin = .ignore,
-        .stdout = .ignore,
-        .stderr = .ignore,
+        .stdout = .pipe,
+        .stderr = .pipe,
         .create_no_window = true,
     }) catch {
-        removeFirstPendingSend(a);
-        setStatus(a, "Could not start queued send");
-        if (a.pending_send_count > 0) startNextSend(a) else {
-            drainMediaDownloads(a);
-            startSync(a);
-        }
+        failHeadPendingSend(a, 1, true);
         return;
     };
     a.send_child = child;
+    a.send_direct = a.sync_child == null;
+    a.send_started_ms = win.GetTickCount64();
     var status_buffer: [80]u8 = undefined;
     const status = std.fmt.bufPrint(&status_buffer, "Sending queued message, {d} remaining", .{a.pending_send_count}) catch "Sending queued message...";
     setStatus(a, status);
@@ -6440,20 +6757,58 @@ fn checkSend(a: *App) void {
     if (a.send_child) |*child| {
         const handle = child.id orelse return;
         var code: win.DWORD = 0;
-        if (win.GetExitCodeProcess(handle, &code) == 0 or code == win.STILL_ACTIVE) return;
-        _ = child.wait(a.io) catch {};
-        a.send_child = null;
-        removeFirstPendingSend(a);
-        if (a.pending_send_count > 0) {
-            startNextSend(a);
-        } else {
-            drainMediaDownloads(a);
-            startSync(a);
-            refreshChats(a);
-            refreshMessages(a);
-            setStatus(a, if (code == 0) "Sent" else "A queued message failed to send");
+        var timed_out = false;
+        if (win.GetExitCodeProcess(handle, &code) == 0 or code == win.STILL_ACTIVE) {
+            if (win.GetTickCount64() - a.send_started_ms <= send_timeout_ms) return;
+            // A wedged send is killed like a wedged mark-read, and fails for
+            // good: wacli may already have delivered it, so it is not retried.
+            _ = child.kill(a.io);
+            code = 1;
+            timed_out = true;
         }
+        // Read stdout and stderr before wait closes the pipes: wacli --json
+        // prints its result on stdout but a lost store lock on stderr, and
+        // only a lost store lock is retryable. Any other nonzero exit could
+        // still have delivered the message.
+        const stdout_output = readChildOutput(a, child.stdout);
+        defer if (stdout_output) |buffer| a.allocator.free(buffer);
+        const stderr_output = readChildOutput(a, child.stderr);
+        defer if (stderr_output) |buffer| a.allocator.free(buffer);
+        // kill already reaps the child; waiting on it again trips an assert.
+        if (!timed_out) _ = child.wait(a.io) catch {};
+        a.send_child = null;
+        a.send_direct = false;
+        if (code == 0) {
+            appendLaunchLog(a, "send: ok");
+            removeFirstPendingSend(a);
+            if (a.pending_send_count > 0) {
+                startNextSend(a);
+            } else {
+                drainMediaDownloads(a);
+                startSync(a);
+                refreshChats(a);
+                refreshMessages(a);
+                setStatus(a, "Sent");
+            }
+            return;
+        }
+        const retryable = !timed_out and
+            (outputHasStoreLock(stdout_output) or outputHasStoreLock(stderr_output));
+        // A store-lock failure stays queued and is retried, up to
+        // max_send_retries, with the next attempt spaced out.
+        failHeadPendingSend(a, code, retryable);
+        return;
     }
+    if (a.pending_send_count == 0) return;
+    startNextSend(a);
+}
+
+/// Does a send child's output mention the wacli store lock? wacli writes the
+/// error to stderr with either wording ("store is locked" / "store lock").
+fn outputHasStoreLock(output: ?[]const u8) bool {
+    const text = output orelse return false;
+    return std.mem.indexOf(u8, text, "store is locked") != null or
+        std.mem.indexOf(u8, text, "store lock") != null;
 }
 
 fn deleteFileUtf8(path_utf8: []const u8) void {
@@ -6779,8 +7134,14 @@ fn sendMessage(a: *App) void {
         pending.reply_to.set(a.reply_to.slice());
         pending.reply_sender.set(a.reply_sender.slice());
         clearReply(a);
+        forgetFailedSend(a, pending.jid.slice(), pending.text.slice());
+        a.send_seq += 1;
+        pending.seq = a.send_seq;
+        pending.queued_unix = nowUnixSeconds();
         a.pending_send_count += 1;
         a.user_viewed = true;
+        a.scroll_y = 0; // the user just sent: pin the view to the newest bubble
+        appendWhatsAppPending(a, pending, false);
         _ = win.SetWindowTextW(a.compose.?, lit(""));
         layout(a, a.compose_client_width, a.compose_client_height);
         if (a.hwnd) |main_hwnd| _ = win.InvalidateRect(main_hwnd, null, win.TRUE);
@@ -6867,8 +7228,14 @@ fn sendMessage(a: *App) void {
     pending.reply_sender.set(a.reply_sender.slice());
     pending.file = .{};
     clearReply(a);
+    forgetFailedSend(a, pending.jid.slice(), pending.text.slice());
+    a.send_seq += 1;
+    pending.seq = a.send_seq;
+    pending.queued_unix = nowUnixSeconds();
     a.pending_send_count += 1;
     a.user_viewed = true;
+    a.scroll_y = 0; // the user just sent: pin the view to the newest bubble
+    appendWhatsAppPending(a, pending, false);
     _ = win.SetWindowTextW(a.compose.?, lit(""));
     focusCompose(a);
     startNextSend(a);
@@ -7674,7 +8041,7 @@ fn removeFirstPendingArchive(a: *App) void {
 
 fn startNextArchive(a: *App) void {
     if (a.archive_child != null or a.read_child != null or a.pending_archive_count == 0) return;
-    if (mediaBusy(a) or a.send_child != null or a.pending_send_count > 0 or avatarBusy(a)) return;
+    if (mediaBusy(a) or a.send_child != null or sendReadyPending(a) or avatarBusy(a)) return;
     stopSync(a);
     const pending = &a.pending_archives[0];
     const child = std.process.spawn(a.io, .{
