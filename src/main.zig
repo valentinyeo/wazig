@@ -3768,12 +3768,16 @@ fn startNextMarkRead(a: *App) void {
     // 70s, longer than the longest known hold, instead of losing the write.
     // Anything still queued when the app closes persists to disk and
     // retries next launch (WAZI-74).
+    // --receipts (wacli 0.19.0+) sends read receipts on their own path.
+    // Plain mark-read waits on a regular_low app-state recovery that only
+    // the phone can answer, so a desynced collection hung every read and
+    // kept live sync paused (openclaw/wacli#428).
     if (a.send_child != null or a.pending_send_count > 0 or
         a.archive_child != null or a.pending_archive_count > 0 or
         avatarBusy(a) or mediaBusy(a)) return;
     stopSync(a);
     const child = std.process.spawn(a.io, .{
-        .argv = &.{ a.wacli_path, "--json", "--lock-wait", "70s", "chats", "mark-read", "--chat", a.pending_reads[0].slice() },
+        .argv = &.{ a.wacli_path, "--json", "--lock-wait", "70s", "chats", "mark-read", "--receipts", "--chat", a.pending_reads[0].slice() },
         .stdin = .ignore,
         .stdout = .ignore,
         .stderr = .ignore,
