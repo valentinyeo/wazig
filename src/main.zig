@@ -285,8 +285,14 @@ const StagedImage = struct {
     preview_height: i32 = 0,
 };
 
+// One span per URL word. A word too wide for a line is split into chunks but
+// keeps a single link target: the first chunk rect lives in `rect`, later
+// chunk rects go in `chunk_rects` so hit testing still finds every piece.
+const max_link_chunk_rects = 16;
 const LinkSpan = struct {
     rect: win.RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 },
+    chunk_rects: [max_link_chunk_rects]win.RECT = [_]win.RECT{.{ .left = 0, .top = 0, .right = 0, .bottom = 0 }} ** max_link_chunk_rects,
+    chunk_count: usize = 0,
     url: WideText(519) = .{},
 };
 
@@ -549,6 +555,8 @@ const App = struct {
     last_refresh_unix: i64 = 0,
     wacli_dir: Utf8Text(259) = .{},
     font_scale: i32 = 80,
+    // Physical DPI of the window's monitor; 96 until WM_CREATE reads it.
+    dpi: u32 = 96,
     brush_bg: ?win.HBRUSH = null,
     brush_panel: ?win.HBRUSH = null,
     brush_raised: ?win.HBRUSH = null,
@@ -1083,7 +1091,7 @@ fn loadComposeDragged(hwnd: win.HWND) i32 {
     const dpi: i32 = @intCast(win.GetDpiForWindow(hwnd));
     if (dpi <= 0) return 0;
     const logical: i32 = @intCast(value);
-    return std.math.clamp(@divTrunc(logical * dpi, @as(i32, @intCast(saved_dpi))), 0, 400);
+    return std.math.clamp(@divTrunc(logical * dpi, @as(i32, @intCast(saved_dpi))), 0, @divTrunc(400 * dpi, 96));
 }
 
 fn saveComposeDragged(hwnd: win.HWND, dragged: i32) void {
@@ -1127,20 +1135,31 @@ fn saveFontScale(scale: i32) void {
     _ = win.RegSetValueExW(key, lit("FontScale"), 0, win.REG_DWORD, @ptrCast(&value), @sizeOf(win.DWORD));
 }
 
-fn scaledFontHeight(base: i32, scale: i32) i32 {
-    return -@divTrunc(base * scale + 50, 100);
+/// Scales a 96-DPI logical pixel value to the window's physical pixels,
+/// rounding to nearest so repeated scale/unscale stays stable.
+fn px(a: *const App, v: i32) i32 {
+    const dpi: i32 = @intCast(a.dpi);
+    return @divTrunc(v * dpi + 48, 96);
+}
+
+fn scaledFontHeight(base: i32, scale: i32, dpi: i32) i32 {
+    // base and dpi are 96-DPI design metrics; the font height must follow
+    // both the user's zoom and the monitor scaling.
+    return -@divTrunc(base * scale * dpi + 4800, 9600);
 }
 
 fn recreateFonts(a: *App) void {
+    const dpi: i32 = @intCast(a.dpi);
     const old_font = a.font;
     const old_small = a.font_small;
     const old_bold = a.font_bold;
     const old_underline = a.font_underline;
-    a.font = win.CreateFontW(scaledFontHeight(17, a.font_scale), 0, 0, 0, win.FW_NORMAL, 0, 0, 0, win.DEFAULT_CHARSET, win.OUT_DEFAULT_PRECIS, win.CLIP_DEFAULT_PRECIS, win.CLEARTYPE_QUALITY, win.DEFAULT_PITCH, lit("IBM Plex Sans"));
-    a.font_small = win.CreateFontW(scaledFontHeight(13, a.font_scale), 0, 0, 0, win.FW_NORMAL, 0, 0, 0, win.DEFAULT_CHARSET, win.OUT_DEFAULT_PRECIS, win.CLIP_DEFAULT_PRECIS, win.CLEARTYPE_QUALITY, win.DEFAULT_PITCH, lit("IBM Plex Sans"));
-    a.font_bold = win.CreateFontW(scaledFontHeight(16, a.font_scale), 0, 0, 0, win.FW_SEMIBOLD, 0, 0, 0, win.DEFAULT_CHARSET, win.OUT_DEFAULT_PRECIS, win.CLIP_DEFAULT_PRECIS, win.CLEARTYPE_QUALITY, win.DEFAULT_PITCH, lit("IBM Plex Sans"));
-    a.font_emoji = win.CreateFontW(scaledFontHeight(16, a.font_scale), 0, 0, 0, win.FW_NORMAL, 0, 0, 0, win.DEFAULT_CHARSET, win.OUT_DEFAULT_PRECIS, win.CLIP_DEFAULT_PRECIS, win.CLEARTYPE_QUALITY, win.DEFAULT_PITCH, lit("Segoe UI Emoji"));
-    a.font_underline = win.CreateFontW(scaledFontHeight(17, a.font_scale), 0, 0, 0, win.FW_NORMAL, 0, 1, 0, win.DEFAULT_CHARSET, win.OUT_DEFAULT_PRECIS, win.CLIP_DEFAULT_PRECIS, win.CLEARTYPE_QUALITY, win.DEFAULT_PITCH, lit("IBM Plex Sans"));
+    const old_emoji = a.font_emoji;
+    a.font = win.CreateFontW(scaledFontHeight(17, a.font_scale, dpi), 0, 0, 0, win.FW_NORMAL, 0, 0, 0, win.DEFAULT_CHARSET, win.OUT_DEFAULT_PRECIS, win.CLIP_DEFAULT_PRECIS, win.CLEARTYPE_QUALITY, win.DEFAULT_PITCH, lit("IBM Plex Sans"));
+    a.font_small = win.CreateFontW(scaledFontHeight(13, a.font_scale, dpi), 0, 0, 0, win.FW_NORMAL, 0, 0, 0, win.DEFAULT_CHARSET, win.OUT_DEFAULT_PRECIS, win.CLIP_DEFAULT_PRECIS, win.CLEARTYPE_QUALITY, win.DEFAULT_PITCH, lit("IBM Plex Sans"));
+    a.font_bold = win.CreateFontW(scaledFontHeight(16, a.font_scale, dpi), 0, 0, 0, win.FW_SEMIBOLD, 0, 0, 0, win.DEFAULT_CHARSET, win.OUT_DEFAULT_PRECIS, win.CLIP_DEFAULT_PRECIS, win.CLEARTYPE_QUALITY, win.DEFAULT_PITCH, lit("IBM Plex Sans"));
+    a.font_emoji = win.CreateFontW(scaledFontHeight(16, a.font_scale, dpi), 0, 0, 0, win.FW_NORMAL, 0, 0, 0, win.DEFAULT_CHARSET, win.OUT_DEFAULT_PRECIS, win.CLIP_DEFAULT_PRECIS, win.CLEARTYPE_QUALITY, win.DEFAULT_PITCH, lit("Segoe UI Emoji"));
+    a.font_underline = win.CreateFontW(scaledFontHeight(17, a.font_scale, dpi), 0, 0, 0, win.FW_NORMAL, 0, 1, 0, win.DEFAULT_CHARSET, win.OUT_DEFAULT_PRECIS, win.CLIP_DEFAULT_PRECIS, win.CLEARTYPE_QUALITY, win.DEFAULT_PITCH, lit("IBM Plex Sans"));
     setFont(a.search, a.font);
     setFont(a.chats_hwnd, a.font);
     setFont(a.compose, a.font);
@@ -1154,6 +1173,7 @@ fn recreateFonts(a: *App) void {
     if (old_small) |font| _ = win.DeleteObject(font);
     if (old_bold) |font| _ = win.DeleteObject(font);
     if (old_underline) |font| _ = win.DeleteObject(font);
+    if (old_emoji) |font| _ = win.DeleteObject(font);
     if (a.hwnd) |hwnd| _ = win.InvalidateRect(hwnd, null, win.TRUE);
     if (a.canvas) |canvas| _ = win.InvalidateRect(canvas, null, win.TRUE);
 }
@@ -4247,8 +4267,8 @@ fn toggleAudio(a: *App, message: *Message) void {
 fn seekAudio(a: *App, x: i32, hit: win.RECT) void {
     const player = a.audio_player orelse return;
     if (a.audio_duration_ms <= 0) return;
-    const track_left = hit.left + 94;
-    const track_right = hit.right - 64;
+    const track_left = hit.left + px(a, 94);
+    const track_right = hit.right - px(a, 64);
     if (track_right <= track_left) return;
     const fraction = std.math.clamp(@as(f64, @floatFromInt(x - track_left)) / @as(f64, @floatFromInt(track_right - track_left)), 0, 1);
     const target_ms: i64 = @intFromFloat(fraction * @as(f64, @floatFromInt(a.audio_duration_ms)));
@@ -4267,11 +4287,11 @@ fn handleAudioClick(a: *App, message: *Message, x: i32) void {
         return;
     }
     const hit = message.media_hit;
-    if (x < hit.left + 48) {
+    if (x < hit.left + px(a, 48)) {
         toggleAudio(a, message);
         return;
     }
-    if (x < hit.left + 96) {
+    if (x < hit.left + px(a, 96)) {
         cycleSpeed(a);
         return;
     }
@@ -7688,19 +7708,19 @@ fn scrollToSelectedMessage(a: *App) void {
     defer _ = win.ReleaseDC(canvas, hdc);
     var client: win.RECT = undefined;
     _ = win.GetClientRect(canvas, &client);
-    const bubble_width = std.math.clamp(@divTrunc((client.right - client.left) * 7, 10), 280, 620);
-    var total_height: i32 = 18;
+    const bubble_width = std.math.clamp(@divTrunc((client.right - client.left) * 7, 10), px(a, 280), px(a, 620));
+    var total_height: i32 = px(a, 18);
     for (a.messages[0..a.message_count], 0..) |*message, index| total_height += measureMessage(hdc, a, message, bubble_width, showSenderName(a, index)) + messageGap(a, index);
     a.max_scroll = @max(0, total_height - (client.bottom - client.top));
-    var y = client.bottom - 14 + a.scroll_y;
+    var y = client.bottom - px(a, 14) + a.scroll_y;
     var index = a.message_count;
     while (index > 0) {
         index -= 1;
         const height = measureMessage(hdc, a, &a.messages[index], bubble_width, showSenderName(a, index));
         y -= height + messageGap(a, index);
         if (index != selected) continue;
-        if (y < client.top + 8) a.scroll_y += client.top + 8 - y;
-        if (y + height > client.bottom - 8) a.scroll_y -= y + height - (client.bottom - 8);
+        if (y < client.top + px(a, 8)) a.scroll_y += client.top + px(a, 8) - y;
+        if (y + height > client.bottom - px(a, 8)) a.scroll_y -= y + height - (client.bottom - px(a, 8));
         a.scroll_y = std.math.clamp(a.scroll_y, 0, a.max_scroll);
         break;
     }
@@ -7814,6 +7834,18 @@ fn hitTestWord(message: *const Message, x: i32, y: i32) ?usize {
     return best;
 }
 
+fn rectHasPoint(rect: win.RECT, x: i32, y: i32) bool {
+    return x >= rect.left and x <= rect.right and y >= rect.top and y <= rect.bottom;
+}
+
+fn linkSpanHit(span: *const LinkSpan, x: i32, y: i32) bool {
+    if (rectHasPoint(span.rect, x, y)) return true;
+    for (span.chunk_rects[0..span.chunk_count]) |rect| {
+        if (rectHasPoint(rect, x, y)) return true;
+    }
+    return false;
+}
+
 fn handleCanvasClick(a: *App, hwnd: win.HWND, x: i32, y: i32) void {
     for (a.messages[0..a.message_count], 0..) |*item, index| {
         const media = item.media_hit;
@@ -7854,7 +7886,7 @@ fn handleCanvasClick(a: *App, hwnd: win.HWND, x: i32, y: i32) void {
         }
         if (x >= bubble.left and x <= bubble.right and y >= bubble.top and y <= bubble.bottom) {
             for (item.links[0..item.link_count]) |*span| {
-                if (x >= span.rect.left and x <= span.rect.right and y >= span.rect.top and y <= span.rect.bottom) {
+                if (linkSpanHit(span, x, y)) {
                     openUrlWide(a, span.url.ptr());
                     a.selected_message = index;
                     _ = win.InvalidateRect(hwnd, null, win.TRUE);
@@ -9345,33 +9377,33 @@ fn composerContentHeight(a: *App) i32 {
 fn layout(a: *App, width: i32, height: i32) void {
     a.compose_client_width = width;
     a.compose_client_height = height;
-    const left_width = std.math.clamp(@divTrunc(width, 3), 280, 390);
+    const left_width = std.math.clamp(@divTrunc(width, 3), px(a, 280), px(a, 390));
     const header_height: i32 = 0;
-    const search_height: i32 = 48;
-    const status_height: i32 = 26;
-    var sizes = compose_layout.compute(a.compose_dragged, composerContentHeight(a), height, a.staged_image.path.len > 0);
+    const search_height: i32 = px(a, 48);
+    const status_height: i32 = px(a, 26);
+    var sizes = compose_layout.computeScaled(a.compose_dragged, composerContentHeight(a), height, a.staged_image.path.len > 0, @intCast(a.dpi));
     // The wrap count depends on the edit's width, so measure once more after
     // sizing (the themed strip keeps that width constant across heights).
     if (a.compose) |hwnd| {
-        _ = win.MoveWindow(hwnd, left_width + 14, height - 11 - sizes.edit_height, width - left_width - 258 - scrollbar_width, sizes.edit_height, win.TRUE);
-        sizes = compose_layout.compute(a.compose_dragged, composerContentHeight(a), height, a.staged_image.path.len > 0);
-        _ = win.MoveWindow(hwnd, left_width + 14, height - 11 - sizes.edit_height, width - left_width - 258 - scrollbar_width, sizes.edit_height, win.TRUE);
+        _ = win.MoveWindow(hwnd, left_width + px(a, 14), height - px(a, 11) - sizes.edit_height, width - left_width - px(a, 258) - scrollbar_width, sizes.edit_height, win.TRUE);
+        sizes = compose_layout.computeScaled(a.compose_dragged, composerContentHeight(a), height, a.staged_image.path.len > 0, @intCast(a.dpi));
+        _ = win.MoveWindow(hwnd, left_width + px(a, 14), height - px(a, 11) - sizes.edit_height, width - left_width - px(a, 258) - scrollbar_width, sizes.edit_height, win.TRUE);
     }
     a.compose_strip_top = height - sizes.strip_height;
     if (a.search) |hwnd| {
-        _ = win.MoveWindow(hwnd, 12, header_height + 8, left_width - 24, 34, win.TRUE);
+        _ = win.MoveWindow(hwnd, px(a, 12), header_height + px(a, 8), left_width - px(a, 24), px(a, 34), win.TRUE);
         // Child EDIT controls can't use DWM corner rounding, so clip to a rounded region instead.
-        if (win.CreateRoundRectRgn(0, 0, left_width - 24 + 1, 34 + 1, 12, 12)) |rgn| {
+        if (win.CreateRoundRectRgn(0, 0, left_width - px(a, 24) + 1, px(a, 34) + 1, px(a, 12), px(a, 12))) |rgn| {
             // On success the system owns the region; only free it if the call failed.
             if (win.SetWindowRgn(hwnd, rgn, win.TRUE) == 0) _ = win.DeleteObject(rgn);
         }
     }
     if (a.chats_hwnd) |hwnd| _ = win.MoveWindow(hwnd, 0, header_height + search_height, left_width - scrollbar_width, height - header_height - search_height - status_height, win.TRUE);
-    if (a.status) |hwnd| _ = win.MoveWindow(hwnd, 12, height - status_height, left_width - 24, status_height, win.TRUE);
+    if (a.status) |hwnd| _ = win.MoveWindow(hwnd, px(a, 12), height - status_height, left_width - px(a, 24), status_height, win.TRUE);
     if (a.canvas) |hwnd| _ = win.MoveWindow(hwnd, left_width + 1, header_height, width - left_width - 1, height - header_height - sizes.strip_height, win.TRUE);
-    if (a.emoji_btn) |hwnd| _ = win.MoveWindow(hwnd, width - 236, height - 55, 44, 44, win.TRUE);
-    if (a.dictate) |hwnd| _ = win.MoveWindow(hwnd, width - 176, height - 55, 84, 44, win.TRUE);
-    if (a.send) |hwnd| _ = win.MoveWindow(hwnd, width - 82, height - 55, 68, 44, win.TRUE);
+    if (a.emoji_btn) |hwnd| _ = win.MoveWindow(hwnd, width - px(a, 236), height - px(a, 55), px(a, 44), px(a, 44), win.TRUE);
+    if (a.dictate) |hwnd| _ = win.MoveWindow(hwnd, width - px(a, 176), height - px(a, 55), px(a, 84), px(a, 44), win.TRUE);
+    if (a.send) |hwnd| _ = win.MoveWindow(hwnd, width - px(a, 82), height - px(a, 55), px(a, 68), px(a, 44), win.TRUE);
     if (a.hwnd) |main_hwnd| _ = win.InvalidateRect(main_hwnd, null, win.TRUE);
 }
 
@@ -9573,6 +9605,26 @@ fn textLineHeight(hdc: win.HDC, font: win.HFONT) i32 {
     return metrics.tmHeight;
 }
 
+// Bubble chrome above the body. Measure and draw both read these so a font
+// scale change moves the sender band, header and time band together instead
+// of leaving fixed pixel bands that clip at larger fonts.
+fn senderBandHeight(hdc: win.HDC, a: *App) i32 {
+    const font = a.font_bold orelse a.font.?;
+    return textLineHeight(hdc, font);
+}
+
+fn messageHeaderHeight(hdc: win.HDC, a: *App, show_sender: bool) i32 {
+    if (!show_sender) return px(a, 12);
+    // 6px above the name, the name band, then 8px under it: the body starts
+    // at header - 6, leaving the same 6px bottom padding as the one-line case.
+    return px(a, 6) + senderBandHeight(hdc, a) + px(a, 8);
+}
+
+fn timeBandHeight(hdc: win.HDC, a: *App) i32 {
+    const font = a.font_small orelse a.font.?;
+    return textLineHeight(hdc, font);
+}
+
 fn startsWithIgnoreCaseUtf16(hay: []const u16, comptime needle: []const u8) bool {
     if (hay.len < needle.len) return false;
     for (needle, 0..) |character, index| {
@@ -9599,15 +9651,154 @@ fn containsUrlHint(text: []const u16) bool {
     return false;
 }
 
+// Width of one slice with the same run-aware measuring the manual wrapper
+// uses, so chunk decisions and the painted result agree.
+fn mixedSliceWidth(hdc: win.HDC, text_font: win.HFONT, emoji_font: win.HFONT, line_height: i32, text_ascent: i32, slice: []const u16) i32 {
+    var runs: [max_text_runs]TextRun = undefined;
+    const count = splitRuns(slice, &runs);
+    var width: i32 = 0;
+    for (runs[0..count]) |run| {
+        const part = slice[run.start..][0..run.len];
+        if (run.emoji) {
+            width += drawEmojiRun(hdc, emoji_font, text_ascent, line_height, part, 0, 0, false);
+        } else {
+            _ = win.SelectObject(hdc, @ptrCast(text_font));
+            width += runWidth(hdc, part);
+        }
+    }
+    return width;
+}
+
+// Paints one word slice at (cursor_x, line_top) and returns the new cursor x.
+// A link slice is underlined and accent-colored; the caller records the hit
+// rect against the whole word so every chunk of a broken URL stays a link.
+fn drawWordSlice(hdc: win.HDC, a: *App, text_font: win.HFONT, emoji_font: win.HFONT, line_height: i32, text_ascent: i32, slice: []const u16, cursor_x_in: i32, line_top: i32, link: bool) i32 {
+    var runs: [max_text_runs]TextRun = undefined;
+    const count = splitRuns(slice, &runs);
+    var cursor_x = cursor_x_in;
+    for (runs[0..count]) |run| {
+        const part = slice[run.start..][0..run.len];
+        if (!link and run.emoji) {
+            cursor_x += drawEmojiRun(hdc, emoji_font, text_ascent, line_height, part, cursor_x, line_top, true);
+            continue;
+        }
+        if (link) {
+            _ = win.SelectObject(hdc, @ptrCast(a.font_underline orelse text_font));
+            _ = win.SetTextColor(hdc, color_accent);
+        } else {
+            _ = win.SelectObject(hdc, @ptrCast(text_font));
+        }
+        _ = win.TextOutW(hdc, cursor_x, line_top, part.ptr, @intCast(part.len));
+        cursor_x += runWidth(hdc, part);
+    }
+    if (link) _ = win.SetTextColor(hdc, color_text);
+    return cursor_x;
+}
+
+fn containsSurrogateUnit(text: []const u16) bool {
+    for (text) |unit| if (unit >= 0xD800 and unit <= 0xDFFF) return true;
+    return false;
+}
+
+fn isHighSurrogate(unit: u16) bool {
+    return unit >= 0xD800 and unit <= 0xDBFF;
+}
+
+fn isLowSurrogate(unit: u16) bool {
+    return unit >= 0xDC00 and unit <= 0xDFFF;
+}
+
+// A joiner, variation selector or keycap binds to the character before it, so
+// a chunk must not start with one.
+fn isCombiningGlue(unit: u16) bool {
+    return unit == 0x200D or unit == 0xFE0F or unit == 0x20E3;
+}
+
+// Start index of the character ending at `index`; a lone UTF-16 unit is one,
+// a surrogate pair two.
+fn previousCharStart(word: []const u16, index: usize) usize {
+    if (index >= 2 and isLowSurrogate(word[index - 1]) and isHighSurrogate(word[index - 2])) return index - 2;
+    return if (index > 0) index - 1 else 0;
+}
+
+// Byte count of the longest prefix of `word` that fits in `max_width`.
+// Plain text with no emoji runs measures in one font, so a single
+// GetTextExtentExPointW call finds it; emoji runs need the run-aware width
+// and a binary search over prefix widths.
+fn fittingPrefixLen(hdc: win.HDC, text_font: win.HFONT, emoji_font: win.HFONT, line_height: i32, text_ascent: i32, word: []const u16, max_width: i32) usize {
+    if (word.len == 0) return 0;
+    if (!containsEmoji(word) and !containsSurrogateUnit(word)) {
+        _ = win.SelectObject(hdc, @ptrCast(text_font));
+        var fit: c_int = 0;
+        var size: win.SIZE = undefined;
+        _ = win.GetTextExtentExPointW(hdc, word.ptr, @intCast(word.len), max_width, &fit, null, &size);
+        var len: usize = if (fit > 0) @as(usize, @intCast(fit)) else 0;
+        // A unit that starts inside the extent can still overflow it; trim
+        // until the measured prefix fits, but always keep one unit so the
+        // chunk makes progress.
+        while (len > 0 and mixedSliceWidth(hdc, text_font, emoji_font, line_height, text_ascent, word[0..len]) > max_width) len -= 1;
+        return @max(1, len);
+    }
+    if (mixedSliceWidth(hdc, text_font, emoji_font, line_height, text_ascent, word[0..1]) > max_width) return 1;
+    var lo: usize = 1;
+    var hi: usize = word.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo + 1) / 2;
+        if (mixedSliceWidth(hdc, text_font, emoji_font, line_height, text_ascent, word[0..mid]) <= max_width) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    return lo;
+}
+
+// Splits an over-long word: when `fit` UTF-16 units fit on a line, break
+// after the last URL-ish delimiter inside them so a link splits at readable
+// points, else at `fit` itself. Always advances by at least one full
+// character and never splits a surrogate pair.
+fn wrapChunkLen(word: []const u16, fit: usize) usize {
+    if (word.len == 0) return 1;
+    const limit = @min(fit, word.len);
+    var last_break: usize = 0;
+    var index: usize = 0;
+    while (index < limit) : (index += 1) {
+        switch (word[index]) {
+            '/', '?', '&', '=', '-', '.', '_' => last_break = index + 1,
+            else => {},
+        }
+    }
+    return clampChunkCut(word, if (last_break > 0) last_break else @max(1, limit));
+}
+
+// Adjusts a proposed chunk length so it never cuts an emoji in half: a low
+// surrogate at the cut backs up one unit (or takes the whole pair when that
+// would leave nothing), a leading surrogate pair is the two-unit minimum,
+// and the cut never lands before a joiner, variation selector or keycap.
+fn clampChunkCut(word: []const u16, cut_in: usize) usize {
+    if (word.len == 0) return 1;
+    var cut = @min(cut_in, word.len);
+    if (cut < word.len and isLowSurrogate(word[cut])) {
+        cut = if (cut >= 2) cut - 1 else @min(2, word.len);
+    }
+    if (cut < 2 and word.len >= 2 and isHighSurrogate(word[0])) cut = 2;
+    while (cut < word.len and isCombiningGlue(word[cut])) {
+        const start = previousCharStart(word, cut);
+        if (start == 0) break;
+        cut = start;
+    }
+    return cut;
+}
+
 fn wrapMixedSink(hdc: win.HDC, a: *App, text_ptr: [*]const u16, len: c_int, max_width: i32, draw: bool, left: i32, top: i32, sink: ?*const Message) i32 {
     const text = text_ptr[0..@intCast(len)];
     if (sink == null and !containsEmoji(text) and !containsUrlHint(text)) {
         var rect = win.RECT{ .left = 0, .top = 0, .right = max_width, .bottom = 0 };
-        const flags: win.UINT = win.DT_CALCRECT | win.DT_WORDBREAK | win.DT_NOPREFIX;
+        const flags: win.UINT = win.DT_CALCRECT | win.DT_WORDBREAK | win.DT_EDITCONTROL | win.DT_NOPREFIX;
         _ = win.DrawTextW(hdc, text_ptr, len, &rect, flags);
         if (draw) {
             var target = win.RECT{ .left = left, .top = top, .right = left + max_width, .bottom = top + (rect.bottom - rect.top) + 4 };
-            _ = win.DrawTextW(hdc, text_ptr, len, &target, win.DT_WORDBREAK | win.DT_NOPREFIX);
+            _ = win.DrawTextW(hdc, text_ptr, len, &target, win.DT_WORDBREAK | win.DT_EDITCONTROL | win.DT_NOPREFIX);
         }
         return rect.bottom - rect.top;
     }
@@ -9623,73 +9814,82 @@ fn wrapMixedSink(hdc: win.HDC, a: *App, text_ptr: [*]const u16, len: c_int, max_
         const at_end = index == text.len;
         if (at_end or text[index] == ' ' or text[index] == '\n') {
             const word = text[word_start..index];
-            var word_runs: [max_text_runs]TextRun = undefined;
-            const word_run_count = splitRuns(word, &word_runs);
-            var word_width: i32 = 0;
-            for (word_runs[0..word_run_count]) |run| {
-                const slice = word[run.start..][0..run.len];
-                if (run.emoji) {
-                    word_width += drawEmojiRun(hdc, emoji_font, text_ascent, line_height, slice, 0, 0, false);
-                } else {
-                    _ = win.SelectObject(hdc, @ptrCast(text_font));
-                    word_width += runWidth(hdc, slice);
-                }
-            }
             const space_width = runWidth(hdc, &[_]u16{' '});
+            const word_width = mixedSliceWidth(hdc, text_font, emoji_font, line_height, text_ascent, word);
             if (cursor_x > left and cursor_x + word_width > left + max_width) {
                 line_top += line_height;
                 cursor_x = left;
             }
-            if (draw) {
-                const word_x_start = cursor_x;
-                const is_link = wordIsUrl(word);
-                for (word_runs[0..word_run_count]) |run| {
-                    const slice = word[run.start..][0..run.len];
-                    if (!is_link and run.emoji) {
-                        cursor_x += drawEmojiRun(hdc, emoji_font, text_ascent, line_height, slice, cursor_x, line_top, true);
-                        continue;
-                    }
-                    if (is_link) {
-                        _ = win.SelectObject(hdc, @ptrCast(a.font_underline orelse text_font));
-                        _ = win.SetTextColor(hdc, color_accent);
-                    } else {
-                        _ = win.SelectObject(hdc, @ptrCast(text_font));
-                    }
-                    _ = win.TextOutW(hdc, cursor_x, line_top, slice.ptr, @intCast(slice.len));
-                    cursor_x += runWidth(hdc, slice);
+            const is_link = wordIsUrl(word);
+            // A word wider than a whole line cannot be placed by the normal
+            // pass; split it into chunks that each fit, preferring URL
+            // punctuation. Every chunk gets its own line but keeps the same
+            // link target and word span.
+            var emitted: usize = 0;
+            while (true) {
+                const remaining = word[emitted..];
+                var chunk = remaining;
+                if (word_width > max_width and remaining.len > 0) {
+                    const fit = fittingPrefixLen(hdc, text_font, emoji_font, line_height, text_ascent, remaining, max_width);
+                    if (fit < remaining.len) chunk = remaining[0..wrapChunkLen(remaining, fit)];
                 }
-                if (is_link) {
-                    _ = win.SetTextColor(hdc, color_text);
-                    if (sink) |const_target| {
-                        const target = @constCast(const_target);
-                        if (target.link_count < target.links.len) {
-                            const span = &target.links[target.link_count];
-                            span.rect = .{ .left = word_x_start, .top = line_top, .right = cursor_x, .bottom = line_top + line_height };
-                            if (std.unicode.utf16LeToUtf8Alloc(a.allocator, word)) |utf8_word| {
-                                defer a.allocator.free(utf8_word);
-                                span.url.set(a.allocator, utf8_word);
-                                target.link_count += 1;
-                            } else |_| {}
+                const chunk_start = word_start + emitted;
+                if (draw) {
+                    const word_x_start = cursor_x;
+                    cursor_x = drawWordSlice(hdc, a, text_font, emoji_font, line_height, text_ascent, chunk, cursor_x, line_top, is_link);
+                    if (is_link) {
+                        if (sink) |const_target| {
+                            const target = @constCast(const_target);
+                            const chunk_rect = win.RECT{ .left = word_x_start, .top = line_top, .right = cursor_x, .bottom = line_top + line_height };
+                            // Chunks of one URL word share a single span: the
+                            // first makes it, later ones only add a hit rect.
+                            var extended = false;
+                            if (target.link_count > 0) {
+                                const last = &target.links[target.link_count - 1];
+                                if (std.mem.eql(u16, last.url.slice(), word)) {
+                                    if (last.chunk_count < last.chunk_rects.len) {
+                                        last.chunk_rects[last.chunk_count] = chunk_rect;
+                                        last.chunk_count += 1;
+                                    }
+                                    extended = true;
+                                }
+                            }
+                            if (!extended and target.link_count < target.links.len) {
+                                const span = &target.links[target.link_count];
+                                span.rect = chunk_rect;
+                                span.chunk_count = 0;
+                                if (std.unicode.utf16LeToUtf8Alloc(a.allocator, word)) |utf8_word| {
+                                    defer a.allocator.free(utf8_word);
+                                    span.url.set(a.allocator, utf8_word);
+                                    target.link_count += 1;
+                                } else |_| {}
+                            }
                         }
                     }
-                }
-                if (sink) |const_target| {
-                    const target = @constCast(const_target);
-                    if (text.ptr == target.text.ptr() and target.word_count < target.word_rects.len) {
-                        const span = &target.word_rects[target.word_count];
-                        span.rect = .{ .left = word_x_start, .top = line_top, .right = cursor_x, .bottom = line_top + line_height };
-                        span.start = @intCast(word_start);
-                        span.len = @intCast(index - word_start);
-                        target.word_count += 1;
+                    if (sink) |const_target| {
+                        const target = @constCast(const_target);
+                        if (text.ptr == target.text.ptr() and target.word_count < target.word_rects.len) {
+                            const span = &target.word_rects[target.word_count];
+                            span.rect = .{ .left = word_x_start, .top = line_top, .right = cursor_x, .bottom = line_top + line_height };
+                            span.start = @intCast(chunk_start);
+                            span.len = @intCast(chunk.len);
+                            target.word_count += 1;
+                        }
                     }
+                } else {
+                    cursor_x += mixedSliceWidth(hdc, text_font, emoji_font, line_height, text_ascent, chunk);
                 }
-                if (!at_end) {
+                emitted += chunk.len;
+                if (emitted >= word.len or chunk.len == 0) break;
+                line_top += line_height;
+                cursor_x = left;
+            }
+            if (!at_end) {
+                if (draw) {
                     _ = win.SelectObject(hdc, @ptrCast(text_font));
                     _ = win.TextOutW(hdc, cursor_x, line_top, &[_]u16{' '}, 1);
-                    cursor_x += space_width;
                 }
-            } else {
-                cursor_x += word_width + (if (at_end) @as(i32, 0) else space_width);
+                cursor_x += space_width;
             }
             word_start = index + 1;
             if (at_end) break;
@@ -9717,21 +9917,25 @@ fn drawChat(a: *App, item: *win.DRAWITEMSTRUCT) void {
     _ = win.FillRect(item.hDC, &item.rcItem, background);
     _ = win.SetBkMode(item.hDC, win.TRANSPARENT);
 
+    // The avatar bitmap is a fixed 42px DIB, so its offset scales but its
+    // own box stays 42 to keep the baked circle and initial centered.
+    const avatar_left = item.rcItem.left + px(a, 12);
+    const avatar_top = item.rcItem.top + px(a, 10);
     const avatar_entry = avatarForChat(a, chat.jid.slice());
     if (avatar_entry != null and avatar_entry.?.bitmap != null) {
-        drawAvatarBitmap(item.hDC, avatar_entry.?.bitmap.?, item.rcItem.left + 12, item.rcItem.top + 10);
+        drawAvatarBitmap(item.hDC, avatar_entry.?.bitmap.?, avatar_left, avatar_top);
     } else {
         // Anti-aliased circle via per-pixel alpha; GDI Ellipse has a hard edge.
         if (createAvatarCircleDib(59, 74, 84)) |circle| {
             defer _ = win.DeleteObject(circle);
-            drawAvatarBitmap(item.hDC, circle, item.rcItem.left + 12, item.rcItem.top + 10);
+            drawAvatarBitmap(item.hDC, circle, avatar_left, avatar_top);
         }
         if (chat.name.len > 0) {
             var initial_length: c_int = 1;
             if (chat.name.buf[0] >= 0xd800 and chat.name.buf[0] <= 0xdbff and chat.name.len > 1) initial_length = 2;
             _ = win.SelectObject(item.hDC, @ptrCast(a.font_bold.?));
             _ = win.SetTextColor(item.hDC, color_text);
-            var avatar_rect = win.RECT{ .left = item.rcItem.left + 12, .top = item.rcItem.top + 10, .right = item.rcItem.left + 54, .bottom = item.rcItem.top + 52 };
+            var avatar_rect = win.RECT{ .left = avatar_left, .top = avatar_top, .right = avatar_left + 42, .bottom = avatar_top + 42 };
             _ = win.DrawTextW(item.hDC, chat.name.ptr(), initial_length, &avatar_rect, win.DT_CENTER | win.DT_SINGLELINE | win.DT_VCENTER);
         }
     }
@@ -9741,31 +9945,31 @@ fn drawChat(a: *App, item: *win.DRAWITEMSTRUCT) void {
         _ = win.SelectObject(item.hDC, @ptrCast(a.font_bold.?));
         _ = win.SetTextColor(item.hDC, color_text);
         const line_h = textLineHeight(item.hDC, a.font_bold.?);
-        const name_y = item.rcItem.top + 10 + @divTrunc(24 - line_h, 2);
-        _ = drawMixedLine(item.hDC, a.font_bold.?, a.font_emoji orelse a.font_bold.?, name_text, item.rcItem.left + 66, name_y);
+        const name_y = item.rcItem.top + px(a, 10) + @divTrunc(px(a, 24) - line_h, 2);
+        _ = drawMixedLine(item.hDC, a.font_bold.?, a.font_emoji orelse a.font_bold.?, name_text, item.rcItem.left + px(a, 66), name_y);
     }
 
     _ = win.SelectObject(item.hDC, @ptrCast(a.font_bold.?));
     _ = win.SetTextColor(item.hDC, color_text);
     const pinned_chat = isChatPinned(a, chat.jid.slice());
-    var name_rect = win.RECT{ .left = item.rcItem.left + 66, .top = item.rcItem.top + 10, .right = item.rcItem.right - (if (pinned_chat) @as(i32, 78) else 54), .bottom = item.rcItem.top + 34 };
+    var name_rect = win.RECT{ .left = item.rcItem.left + px(a, 66), .top = item.rcItem.top + px(a, 10), .right = item.rcItem.right - px(a, if (pinned_chat) @as(i32, 78) else 54), .bottom = item.rcItem.top + px(a, 34) };
     _ = win.DrawTextW(item.hDC, chat.name.ptr(), @intCast(chat.name.len), &name_rect, win.DT_LEFT | win.DT_SINGLELINE | win.DT_END_ELLIPSIS | win.DT_VCENTER);
     if (pinned_chat) {
         const pin_glyph = [_]u16{ 0xD83D, 0xDCCC }; // 📌
-        _ = drawMixedLine(item.hDC, a.font_bold.?, a.font_emoji orelse a.font_bold.?, &pin_glyph, item.rcItem.right - 76, item.rcItem.top + 12);
+        _ = drawMixedLine(item.hDC, a.font_bold.?, a.font_emoji orelse a.font_bold.?, &pin_glyph, item.rcItem.right - px(a, 76), item.rcItem.top + px(a, 12));
     }
     _ = win.SelectObject(item.hDC, @ptrCast(a.font_small.?));
     _ = win.SetTextColor(item.hDC, color_muted);
-    var time_rect = win.RECT{ .left = item.rcItem.right - 52, .top = item.rcItem.top + 10, .right = item.rcItem.right - 10, .bottom = item.rcItem.top + 32 };
+    var time_rect = win.RECT{ .left = item.rcItem.right - px(a, 52), .top = item.rcItem.top + px(a, 10), .right = item.rcItem.right - px(a, 10), .bottom = item.rcItem.top + px(a, 32) };
     _ = win.DrawTextW(item.hDC, chat.time.ptr(), @intCast(chat.time.len), &time_rect, win.DT_RIGHT | win.DT_SINGLELINE | win.DT_VCENTER);
-    var kind_rect = win.RECT{ .left = item.rcItem.left + 66, .top = item.rcItem.top + 35, .right = item.rcItem.right - 42, .bottom = item.rcItem.top + 56 };
+    var kind_rect = win.RECT{ .left = item.rcItem.left + px(a, 66), .top = item.rcItem.top + px(a, 35), .right = item.rcItem.right - px(a, 42), .bottom = item.rcItem.top + px(a, 56) };
     _ = win.DrawTextW(item.hDC, chat.kind.ptr(), @intCast(chat.kind.len), &kind_rect, win.DT_LEFT | win.DT_SINGLELINE | win.DT_END_ELLIPSIS);
 
     if (chat.unread or chat.unread_count > 0) {
         const unread_brush = win.CreateSolidBrush(color_accent) orelse return;
         defer _ = win.DeleteObject(unread_brush);
         const previous = win.SelectObject(item.hDC, unread_brush);
-        _ = win.Ellipse(item.hDC, item.rcItem.right - 30, item.rcItem.top + 36, item.rcItem.right - 12, item.rcItem.top + 54);
+        _ = win.Ellipse(item.hDC, item.rcItem.right - px(a, 30), item.rcItem.top + px(a, 36), item.rcItem.right - px(a, 12), item.rcItem.top + px(a, 54));
         _ = win.SelectObject(item.hDC, previous);
     }
 }
@@ -9873,8 +10077,8 @@ const quote_vertical_pad: i32 = 6;
 const quote_after_gap: i32 = 6;
 const quote_max_lines: i32 = 2;
 
-fn quoteTextWidth(bubble_width: i32) i32 {
-    return @max(1, bubble_width - quote_inset * 2 - quote_bar_width - quote_text_gap * 2);
+fn quoteTextWidth(a: *const App, bubble_width: i32) i32 {
+    return @max(1, bubble_width - px(a, quote_inset) * 2 - px(a, quote_bar_width) - px(a, quote_text_gap) * 2);
 }
 
 fn quoteBodyHeight(hdc: win.HDC, a: *App, text: []const u16, width: i32) i32 {
@@ -9894,7 +10098,7 @@ fn quoteBlockHeight(hdc: win.HDC, a: *App, message: *const Message, width: i32) 
         const font = a.font_small orelse return 0;
         name_height = textLineHeight(hdc, font);
     }
-    return quote_vertical_pad + name_height + quoteBodyHeight(hdc, a, message.quote.slice(), quoteTextWidth(width)) + quote_after_gap;
+    return px(a, quote_vertical_pad) + name_height + quoteBodyHeight(hdc, a, message.quote.slice(), quoteTextWidth(a, width)) + px(a, quote_after_gap);
 }
 
 // Blend a bubble color 12% toward white (incoming) or black (own).
@@ -9912,24 +10116,26 @@ fn quoteBlockTint(base: win.COLORREF, toward: u8) win.COLORREF {
 
 fn measureMessage(hdc: win.HDC, a: *App, message: *const Message, width: i32, show_sender: bool) i32 {
     _ = win.SelectObject(hdc, @ptrCast(a.font.?));
-    const header_height: i32 = if (show_sender) 34 else 12;
-    var height = quoteBlockHeight(hdc, a, message, width) + wrapMixedSink(hdc, a, if (message.text.len > 0) message.text.ptr() else lit(" "), if (message.text.len > 0) @intCast(message.text.len) else 1, width - 24, false, 0, 0, message) + header_height;
+    const header_height = messageHeaderHeight(hdc, a, show_sender);
+    var height = quoteBlockHeight(hdc, a, message, width) + wrapMixedSink(hdc, a, if (message.text.len > 0) message.text.ptr() else lit(" "), if (message.text.len > 0) @intCast(message.text.len) else 1, width - px(a, 24), false, 0, 0, message) + header_height;
     // WAZI-68: a video link unfurls into a fixed-size card below the text.
     // Links are collected during the measure pass above, so classify here;
     // once classified the result is sticky for the message's lifetime.
     if (message.unfurl_provider == .none and message.link_count > 0) detectUnfurl(@constCast(message));
-    if (message.unfurl_provider != .none) height += unfurl_card_height + 6;
+    if (message.unfurl_provider != .none) height += unfurl_card_height + px(a, 6);
     if (message.bitmap_height > 0) {
-        height += message.bitmap_height + 8;
-    } else if (message.media_type.len > 0) height += 54;
-    if (message.transcript_state == .loading) height += 24;
+        height += message.bitmap_height + px(a, 8);
+    } else if (message.media_type.len > 0) height += px(a, 54);
+    if (message.transcript_state == .loading) height += px(a, 24);
     if (message.transcript.len > 0) {
         _ = win.SelectObject(hdc, @ptrCast(a.font.?));
         const shown: c_int = if (message.transcript_expanded) @intCast(message.transcript.len) else @intCast(@min(message.transcript.len, 400));
-        height += transcriptRender(hdc, a, message, shown, width - 24, false, 0, 0) + 22;
+        height += transcriptRender(hdc, a, message, shown, width - px(a, 24), false, 0, 0) + px(a, 22);
     }
-    if (message.reaction.len > 0) height += 18;
-    const min_height: i32 = if (show_sender) 48 else 30;
+    if (message.reaction.len > 0) height += px(a, 18);
+    // Reserve the timestamp band the same way the old fixed 20px was
+    // reserved: the minimum bubble must hold the header plus a time line.
+    const min_height: i32 = header_height + timeBandHeight(hdc, a) + px(a, 5);
     return @max(height, min_height);
 }
 
@@ -9979,13 +10185,13 @@ fn drawSenderAvatar(hdc: win.HDC, a: *App, x: i32, top: i32, message: *const Mes
     defer _ = win.DeleteObject(circle_brush);
     const old_brush = win.SelectObject(hdc, circle_brush);
     const old_pen = win.SelectObject(hdc, win.GetStockObject(win.NULL_PEN));
-    _ = win.Ellipse(hdc, x, top, x + 30, top + 30);
+    _ = win.Ellipse(hdc, x, top, x + px(a, 30), top + px(a, 30));
     _ = win.SelectObject(hdc, old_brush);
     _ = win.SelectObject(hdc, old_pen);
     const initial = senderInitial(message.sender.slice());
     const old_font = win.SelectObject(hdc, @ptrCast(a.font_bold.?));
     const old_color = win.SetTextColor(hdc, color_text);
-    var rect = win.RECT{ .left = x, .top = top, .right = x + 30, .bottom = top + 30 };
+    var rect = win.RECT{ .left = x, .top = top, .right = x + px(a, 30), .bottom = top + px(a, 30) };
     _ = win.DrawTextW(hdc, @ptrCast(initial.ptr), @intCast(initial.len), &rect, win.DT_CENTER | win.DT_SINGLELINE | win.DT_VCENTER);
     _ = win.SetTextColor(hdc, old_color);
     _ = win.SelectObject(hdc, old_font);
@@ -10146,12 +10352,12 @@ fn syncScrollbarStrips(a: *App) void {
 
 fn drawQuoteBlock(hdc: win.HDC, a: *App, message: *const Message, left: i32, right: i32, top: i32) i32 {
     const font = a.font_small orelse return top;
-    const block_left = left + quote_inset;
-    const block_right = right - quote_inset;
-    const body_height = quoteBodyHeight(hdc, a, message.quote.slice(), quoteTextWidth(right - left));
+    const block_left = left + px(a, quote_inset);
+    const block_right = right - px(a, quote_inset);
+    const body_height = quoteBodyHeight(hdc, a, message.quote.slice(), quoteTextWidth(a, right - left));
     var name_height: i32 = 0;
     if (message.quote_sender.len > 0) name_height = textLineHeight(hdc, font);
-    const block_bottom = top + quote_vertical_pad + name_height + body_height;
+    const block_bottom = top + px(a, quote_vertical_pad) + name_height + body_height;
 
     const tint = if (message.from_me) quoteBlockTint(color_outgoing, 0) else quoteBlockTint(color_incoming, 255);
     if (win.CreateSolidBrush(tint)) |block_brush| {
@@ -10167,15 +10373,15 @@ fn drawQuoteBlock(hdc: win.HDC, a: *App, message: *const Message, left: i32, rig
     const accent = senderColorFor(message.quote_sender_jid.slice());
     const accent_color = rgb(accent.r, accent.g, accent.b);
     if (win.CreateSolidBrush(accent_color)) |bar_brush| {
-        var bar = win.RECT{ .left = block_left, .top = top + quote_vertical_pad / 2, .right = block_left + quote_bar_width, .bottom = block_bottom - quote_vertical_pad / 2 };
+        var bar = win.RECT{ .left = block_left, .top = top + @divTrunc(px(a, quote_vertical_pad), 2), .right = block_left + px(a, quote_bar_width), .bottom = block_bottom - @divTrunc(px(a, quote_vertical_pad), 2) };
         _ = win.FillRect(hdc, &bar, bar_brush);
         _ = win.DeleteObject(bar_brush);
     }
 
     _ = win.SelectObject(hdc, @ptrCast(font));
-    const text_left = block_left + quote_bar_width + quote_text_gap;
-    const text_right = block_right - quote_text_gap;
-    var cursor = top + quote_vertical_pad / 2;
+    const text_left = block_left + px(a, quote_bar_width) + px(a, quote_text_gap);
+    const text_right = block_right - px(a, quote_text_gap);
+    var cursor = top + @divTrunc(px(a, quote_vertical_pad), 2);
     if (message.quote_sender.len > 0) {
         _ = win.SetTextColor(hdc, accent_color);
         var name_rect = win.RECT{ .left = text_left, .top = cursor, .right = text_right, .bottom = cursor + name_height };
@@ -10188,7 +10394,7 @@ fn drawQuoteBlock(hdc: win.HDC, a: *App, message: *const Message, left: i32, rig
         _ = win.DrawTextW(hdc, message.quote.ptr(), @intCast(message.quote.len), &body_rect, win.DT_LEFT | win.DT_WORDBREAK | win.DT_EDITCONTROL | win.DT_WORD_ELLIPSIS | win.DT_NOPREFIX);
     }
     _ = win.SetTextColor(hdc, color_text);
-    return block_bottom + quote_after_gap;
+    return block_bottom + px(a, quote_after_gap);
 }
 
 fn drawCanvas(hwnd: win.HWND, a: *App) void {
@@ -10220,7 +10426,7 @@ fn drawCanvas(hwnd: win.HWND, a: *App) void {
     _ = win.FillRect(hdc, &client, a.brush_bg.?);
     _ = win.SetBkMode(hdc, win.TRANSPARENT);
     const available_width = client.right - client.left;
-    const bubble_width = std.math.clamp(@divTrunc(available_width * 7, 10), 280, 620);
+    const bubble_width = std.math.clamp(@divTrunc(available_width * 7, 10), px(a, 280), px(a, 620));
     const chat_jid = if (a.displayed_jid.len > 0)
         a.displayed_jid.slice()
     else if (a.chat_count > 0 and a.selected_chat < a.chat_count)
@@ -10238,11 +10444,11 @@ fn drawCanvas(hwnd: win.HWND, a: *App) void {
             message.bitmap = null;
         }
     }
-    var total_height: i32 = 18;
+    var total_height: i32 = px(a, 18);
     for (a.messages[0..a.message_count], 0..) |*message, index| total_height += measureMessage(hdc, a, message, bubble_width, showSenderName(a, index)) + messageGap(a, index);
     a.max_scroll = @max(0, total_height - (client.bottom - client.top));
     a.scroll_y = std.math.clamp(a.scroll_y, 0, a.max_scroll);
-    var y = client.bottom - 14 + a.scroll_y;
+    var y = client.bottom - px(a, 14) + a.scroll_y;
     var index = a.message_count;
     while (index > 0) {
         index -= 1;
@@ -10264,7 +10470,7 @@ fn drawCanvas(hwnd: win.HWND, a: *App) void {
         const height = measureMessage(hdc, a, message, bubble_width, show_sender);
         y -= height - estimated_height;
         if (y > client.bottom or y + height < client.top) continue;
-        const left: i32 = if (message.from_me) client.right - bubble_width - 24 else if (in_group) 62 else 24;
+        const left: i32 = if (message.from_me) client.right - bubble_width - px(a, 24) else if (in_group) px(a, 62) else px(a, 24);
         const right = left + bubble_width;
         message.bubble_hit = .{ .left = left, .top = y, .right = right, .bottom = y + height };
         const failed = message.send_state == .failed;
@@ -10273,13 +10479,13 @@ fn drawCanvas(hwnd: win.HWND, a: *App) void {
         const selected = if (a.selected_message) |selected_index| selected_index == index else false;
         const selection_pen = if (selected) win.CreatePen(win.PS_SOLID, 2, color_accent) else null;
         const old_pen = win.SelectObject(hdc, if (selection_pen) |pen| @ptrCast(pen) else win.GetStockObject(win.NULL_PEN));
-        _ = win.RoundRect(hdc, left, y, right, y + height, 18, 18);
+        _ = win.RoundRect(hdc, left, y, right, y + height, px(a, 18), px(a, 18));
         _ = win.SelectObject(hdc, old_brush);
         _ = win.SelectObject(hdc, old_pen);
         if (selection_pen) |pen| _ = win.DeleteObject(pen);
         _ = win.DeleteObject(brush);
 
-        var text_top = y + 6;
+        var text_top = y + messageHeaderHeight(hdc, a, show_sender) - px(a, 6);
         if (show_sender) {
             _ = win.SelectObject(hdc, @ptrCast(a.font_bold.?));
             // In group chats the name uses the same stable per-person tint as
@@ -10294,21 +10500,20 @@ fn drawCanvas(hwnd: win.HWND, a: *App) void {
                 rgb(tint.r, tint.g, tint.b)
             else
                 rgb(83, 189, 235));
-            var sender_rect = win.RECT{ .left = left + 12, .top = y + 6, .right = right - 52, .bottom = y + 26 };
+            const sender_band = senderBandHeight(hdc, a);
+            var sender_rect = win.RECT{ .left = left + px(a, 12), .top = y + px(a, 6), .right = right - px(a, 52), .bottom = y + px(a, 6) + sender_band };
             const sender_text = message.sender.slice();
             if (containsEmoji(sender_text)) {
-                const line_h = textLineHeight(hdc, a.font_bold.?);
-                _ = drawMixedLine(hdc, a.font_bold.?, a.font_emoji orelse a.font_bold.?, sender_text, left + 12, y + 6 + @divTrunc(20 - line_h, 2));
+                _ = drawMixedLine(hdc, a.font_bold.?, a.font_emoji orelse a.font_bold.?, sender_text, left + px(a, 12), y + px(a, 6));
             } else {
                 _ = win.DrawTextW(hdc, message.sender.ptr(), @intCast(message.sender.len), &sender_rect, win.DT_LEFT | win.DT_SINGLELINE | win.DT_END_ELLIPSIS);
             }
-            text_top = y + 26;
         }
-        if (show_sender and in_group and !message.from_me and message.sender.len > 0) drawSenderAvatar(hdc, a, left - 38, y + 6, message);
+        if (show_sender and in_group and !message.from_me and message.sender.len > 0) drawSenderAvatar(hdc, a, left - px(a, 38), y + px(a, 6), message);
         if (message.quote.len > 0) text_top = drawQuoteBlock(hdc, a, message, left, right, text_top);
         if (message.bitmap) |bitmap| {
             const image_left = left + @divTrunc(bubble_width - message.bitmap_width, 2);
-            const image_top = text_top + 4;
+            const image_top = text_top + px(a, 4);
             const image_memory_dc = win.CreateCompatibleDC(hdc);
             if (image_memory_dc != null) {
                 const previous = win.SelectObject(image_memory_dc, @ptrCast(bitmap));
@@ -10339,16 +10544,16 @@ fn drawCanvas(hwnd: win.HWND, a: *App) void {
                     _ = win.DrawTextW(hdc, lit("▶"), -1, &play_rect, win.DT_CENTER | win.DT_SINGLELINE | win.DT_VCENTER);
                 }
             }
-            text_top += message.bitmap_height + 8;
+            text_top += message.bitmap_height + px(a, 8);
         } else if (isAudio(message)) {
-            const strip_top = text_top + 4;
-            const button_cx = left + 26;
-            const button_cy = strip_top + 18;
+            const strip_top = text_top + px(a, 4);
+            const button_cx = left + px(a, 26);
+            const button_cy = strip_top + px(a, 18);
             const active = std.mem.eql(u8, a.audio_playing_id.slice(), message.id.slice()) and a.audio_state != .empty;
             if (message.local_path.len == 0) {
                 _ = win.SelectObject(hdc, @ptrCast(a.font_small.?));
                 _ = win.SetTextColor(hdc, color_accent);
-                var media_rect = win.RECT{ .left = left + 12, .top = strip_top, .right = right - 12, .bottom = strip_top + 42 };
+                var media_rect = win.RECT{ .left = left + px(a, 12), .top = strip_top, .right = right - px(a, 12), .bottom = strip_top + px(a, 42) };
                 _ = win.DrawTextW(hdc, lit("Voice message · click to download"), -1, &media_rect, win.DT_CENTER | win.DT_SINGLELINE | win.DT_VCENTER);
             } else {
                 const playing_now = active and a.audio_state == .playing;
@@ -10359,7 +10564,7 @@ fn drawCanvas(hwnd: win.HWND, a: *App) void {
                 };
                 const previous_brush = win.SelectObject(hdc, button_brush);
                 const previous_pen = win.SelectObject(hdc, win.GetStockObject(win.NULL_PEN));
-                _ = win.Ellipse(hdc, left + 12, strip_top + 4, left + 40, strip_top + 32);
+                _ = win.Ellipse(hdc, left + px(a, 12), strip_top + px(a, 4), left + px(a, 40), strip_top + px(a, 32));
                 _ = win.SelectObject(hdc, glyph_brush);
                 if (playing_now) {
                     _ = win.Rectangle(hdc, button_cx - 7, button_cy - 8, button_cx - 2, button_cy + 8);
@@ -10382,11 +10587,11 @@ fn drawCanvas(hwnd: win.HWND, a: *App) void {
                 _ = win.SelectObject(hdc, @ptrCast(a.font_small.?));
                 const speed_active = a.audio_player != null and a.audio_player.?.speed() != 100;
                 _ = win.SetTextColor(hdc, if (speed_active) color_accent else color_muted);
-                var speed_rect = win.RECT{ .left = left + 48, .top = strip_top + 4, .right = left + 90, .bottom = strip_top + 32 };
+                var speed_rect = win.RECT{ .left = left + px(a, 48), .top = strip_top + px(a, 4), .right = left + px(a, 90), .bottom = strip_top + px(a, 32) };
                 _ = win.DrawTextW(hdc, speedLabel(a.audio_player), -1, &speed_rect, win.DT_CENTER | win.DT_SINGLELINE | win.DT_VCENTER);
 
-                const track_left = left + 94;
-                const track_right = right - 64;
+                const track_left = left + px(a, 94);
+                const track_right = right - px(a, 64);
                 const track_brush = win.CreateSolidBrush(rgb(59, 74, 84)) orelse continue;
                 var track = win.RECT{ .left = track_left, .top = button_cy - 3, .right = track_right, .bottom = button_cy + 3 };
                 _ = win.FillRect(hdc, &track, track_brush);
@@ -10404,7 +10609,7 @@ fn drawCanvas(hwnd: win.HWND, a: *App) void {
                 if (!active and a.played_set.wasPlayed(message.id.slice())) {
                     _ = win.SelectObject(hdc, @ptrCast(a.font_small.?));
                     _ = win.SetTextColor(hdc, color_muted);
-                    var played_rect = win.RECT{ .left = right - 60, .top = strip_top, .right = right - 10, .bottom = strip_top + 42 };
+                    var played_rect = win.RECT{ .left = right - px(a, 60), .top = strip_top, .right = right - px(a, 10), .bottom = strip_top + px(a, 42) };
                     _ = win.DrawTextW(hdc, lit("✓ played"), -1, &played_rect, win.DT_RIGHT | win.DT_SINGLELINE | win.DT_VCENTER);
                 }
                 if (active and a.audio_duration_ms > 0) {
@@ -10416,33 +10621,33 @@ fn drawCanvas(hwnd: win.HWND, a: *App) void {
                     time_wide.set(a.allocator, time_text);
                     _ = win.SelectObject(hdc, @ptrCast(a.font_small.?));
                     _ = win.SetTextColor(hdc, color_muted);
-                    var time_rect = win.RECT{ .left = right - 60, .top = strip_top, .right = right - 10, .bottom = strip_top + 42 };
+                    var time_rect = win.RECT{ .left = right - px(a, 60), .top = strip_top, .right = right - px(a, 10), .bottom = strip_top + px(a, 42) };
                     _ = win.DrawTextW(hdc, time_wide.ptr(), @intCast(time_wide.len), &time_rect, win.DT_RIGHT | win.DT_SINGLELINE | win.DT_VCENTER);
                 }
             }
-            message.media_hit = .{ .left = left + 8, .top = strip_top, .right = right - 8, .bottom = strip_top + 42 };
-            text_top += 54;
+            message.media_hit = .{ .left = left + px(a, 8), .top = strip_top, .right = right - px(a, 8), .bottom = strip_top + px(a, 42) };
+            text_top += px(a, 54);
             if (message.transcript_state == .loading) {
                 _ = win.SelectObject(hdc, @ptrCast(a.font_small.?));
                 _ = win.SetTextColor(hdc, color_muted);
-                var loading_rect = win.RECT{ .left = left + 12, .top = text_top, .right = right - 12, .bottom = text_top + 20 };
+                var loading_rect = win.RECT{ .left = left + px(a, 12), .top = text_top, .right = right - px(a, 12), .bottom = text_top + px(a, 20) };
                 _ = win.DrawTextW(hdc, lit("Transcribing…"), -1, &loading_rect, win.DT_LEFT | win.DT_SINGLELINE | win.DT_END_ELLIPSIS);
-                text_top += 24;
+                text_top += px(a, 24);
             } else if (message.transcript.len > 0) {
                 const shown: c_int = if (message.transcript_expanded) @intCast(message.transcript.len) else @intCast(@min(message.transcript.len, 400));
-                const transcript_height = transcriptRender(hdc, a, message, shown, right - left - 24, true, left + 12, text_top);
-                text_top += transcript_height + 2;
+                const transcript_height = transcriptRender(hdc, a, message, shown, right - left - px(a, 24), true, left + px(a, 12), text_top);
+                text_top += transcript_height + px(a, 2);
                 _ = win.SelectObject(hdc, @ptrCast(a.font_small.?));
                 _ = win.SetTextColor(hdc, color_accent);
-                var toggle_rect = win.RECT{ .left = left + 12, .top = text_top, .right = right - 12, .bottom = text_top + 18 };
+                var toggle_rect = win.RECT{ .left = left + px(a, 12), .top = text_top, .right = right - px(a, 12), .bottom = text_top + px(a, 18) };
                 _ = win.DrawTextW(hdc, if (message.transcript_expanded) lit("Show less") else lit("Show more"), -1, &toggle_rect, win.DT_LEFT | win.DT_SINGLELINE);
                 message.toggle_hit = toggle_rect;
-                text_top += 20;
+                text_top += px(a, 20);
             }
         } else if (message.media_type.len > 0) {
             _ = win.SelectObject(hdc, @ptrCast(a.font_small.?));
             _ = win.SetTextColor(hdc, color_accent);
-            var media_rect = win.RECT{ .left = left + 12, .top = text_top + 4, .right = right - 12, .bottom = text_top + 46 };
+            var media_rect = win.RECT{ .left = left + px(a, 12), .top = text_top + px(a, 4), .right = right - px(a, 12), .bottom = text_top + px(a, 46) };
             const local = message.local_path.len > 0;
             const label = if (isVideoGif(message))
                 (if (local) lit("GIF") else lit("GIF · click to download"))
@@ -10454,17 +10659,17 @@ fn drawCanvas(hwnd: win.HWND, a: *App) void {
                 (if (local) lit("Attachment · click to open") else lit("Attachment · click to download"));
             _ = win.DrawTextW(hdc, label, -1, &media_rect, win.DT_CENTER | win.DT_SINGLELINE | win.DT_VCENTER);
             message.media_hit = media_rect;
-            text_top += 54;
+            text_top += px(a, 54);
         }
         _ = win.SelectObject(hdc, @ptrCast(a.font.?));
         _ = win.SetTextColor(hdc, color_text);
         const text_len: c_int = if (message.text.len > 0) @intCast(message.text.len) else 1;
-        const text_height = wrapMixedSink(hdc, a, if (message.text.len > 0) message.text.ptr() else lit(" "), text_len, right - left - 24, true, left + 12, text_top, message);
+        const text_height = wrapMixedSink(hdc, a, if (message.text.len > 0) message.text.ptr() else lit(" "), text_len, right - left - px(a, 24), true, left + px(a, 12), text_top, message);
         // WAZI-68: the unfurled video card sits below the text; its height
         // was reserved in measureMessage, so no other block moves.
         if (message.unfurl_provider != .none) {
-            drawUnfurlCard(hdc, a, message, left + 12, text_top + text_height + 4, right - left - 24);
-            text_top += text_height + unfurl_card_height + 6;
+            drawUnfurlCard(hdc, a, message, left + px(a, 12), text_top + text_height + px(a, 4), right - left - px(a, 24));
+            text_top += text_height + unfurl_card_height + px(a, 6);
         }
         if (a.sel_message != null and a.sel_message.? == index and a.sel_anchor_word != a.sel_focus_word) {
             const lo = @min(a.sel_anchor_word, a.sel_focus_word);
@@ -10486,12 +10691,13 @@ fn drawCanvas(hwnd: win.HWND, a: *App) void {
         if (message.reaction.len > 0) {
             _ = win.SelectObject(hdc, @ptrCast(a.font.?));
             _ = win.SetTextColor(hdc, color_text);
-            var reaction_rect = win.RECT{ .left = left + 12, .top = y + height - 30, .right = left + 52, .bottom = y + height - 6 };
+            var reaction_rect = win.RECT{ .left = left + px(a, 12), .top = y + height - px(a, 30), .right = left + px(a, 52), .bottom = y + height - px(a, 6) };
             _ = win.DrawTextW(hdc, message.reaction.ptr(), @intCast(message.reaction.len), &reaction_rect, win.DT_LEFT | win.DT_SINGLELINE | win.DT_VCENTER);
         }
         _ = win.SelectObject(hdc, @ptrCast(a.font_small.?));
         _ = win.SetTextColor(hdc, color_muted);
-        var time_rect = win.RECT{ .left = right - 52, .top = y + height - 20, .right = right - 10, .bottom = y + height - 5 };
+        const time_band = timeBandHeight(hdc, a);
+        var time_rect = win.RECT{ .left = right - px(a, 52), .top = y + height - px(a, 5) - time_band, .right = right - px(a, 10), .bottom = y + height - px(a, 5) };
         _ = win.DrawTextW(hdc, message.time.ptr(), @intCast(message.time.len), &time_rect, win.DT_RIGHT | win.DT_SINGLELINE);
     }
     drawScrollbar(hdc, canvasStripRect(a), canvasScrollInfo(a), a.brush_muted.?);
@@ -10913,6 +11119,10 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
         },
         win.WM_CREATE => {
             a.hwnd = hwnd;
+            // Read the monitor DPI before any font exists so the first paint
+            // already uses physical sizes.
+            const window_dpi = win.GetDpiForWindow(hwnd);
+            a.dpi = if (window_dpi == 0) 96 else window_dpi;
             a.brush_bg = win.CreateSolidBrush(color_bg);
             a.brush_panel = win.CreateSolidBrush(color_panel);
             a.brush_raised = win.CreateSolidBrush(color_raised);
@@ -10932,7 +11142,7 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
             recreateFonts(a);
             createTooltips(a, hwnd);
             if (a.search) |search| _ = win.SendMessageW(search, win.EM_SETCUEBANNER, 1, @bitCast(@intFromPtr(lit("Search chats  Ctrl+F"))));
-            if (a.chats_hwnd) |list| _ = win.SendMessageW(list, win.LB_SETITEMHEIGHT, 0, 64);
+            if (a.chats_hwnd) |list| _ = win.SendMessageW(list, win.LB_SETITEMHEIGHT, 0, px(a, 64));
             a.compose_dragged = loadComposeDragged(hwnd);
             var rc_create: win.RECT = undefined;
             _ = win.GetClientRect(hwnd, &rc_create);
@@ -10973,13 +11183,34 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
             layout(a, @intCast(loword(@bitCast(lparam))), @intCast(hiword(@bitCast(lparam))));
             return 0;
         },
+        win.WM_DPICHANGED => {
+            // HIWORD is the new Y dpi; both axes move together in v2 awareness.
+            const new_dpi = hiword(@bitCast(wparam));
+            if (new_dpi > 0) {
+                // The dragged compose height is physical pixels: carry it to
+                // the new monitor's scale.
+                const old_dpi: i32 = @intCast(a.dpi);
+                a.compose_dragged = @divTrunc(a.compose_dragged * @as(i32, new_dpi) + @divTrunc(old_dpi, 2), old_dpi);
+                a.dpi = new_dpi;
+            }
+            recreateFonts(a);
+            if (a.chats_hwnd) |list| _ = win.SendMessageW(list, win.LB_SETITEMHEIGHT, 0, px(a, 64));
+            // Adopt the size the system suggests for the new monitor.
+            const suggested: *const win.RECT = @ptrFromInt(@as(usize, @bitCast(lparam)));
+            _ = win.SetWindowPos(hwnd, null, suggested.left, suggested.top, suggested.right - suggested.left, suggested.bottom - suggested.top, win.SWP_NOZORDER | win.SWP_NOACTIVATE);
+            var rc_dpi: win.RECT = undefined;
+            _ = win.GetClientRect(hwnd, &rc_dpi);
+            layout(a, rc_dpi.right, rc_dpi.bottom);
+            _ = win.InvalidateRect(hwnd, null, win.TRUE);
+            return 0;
+        },
         win.WM_PAINT => {
             var paint: win.PAINTSTRUCT = undefined;
             const hdc = win.BeginPaint(hwnd, &paint);
             var client: win.RECT = undefined;
             _ = win.GetClientRect(hwnd, &client);
             _ = win.FillRect(hdc, &client, a.brush_bg.?);
-            const left_width = std.math.clamp(@divTrunc(client.right, 3), 280, 390);
+            const left_width = std.math.clamp(@divTrunc(client.right, 3), px(a, 280), px(a, 390));
             var left_rect = win.RECT{ .left = 0, .top = 0, .right = left_width, .bottom = client.bottom };
             _ = win.FillRect(hdc, &left_rect, a.brush_panel.?);
             var composer_rect = win.RECT{ .left = left_width + 1, .top = a.compose_strip_top, .right = client.right, .bottom = client.bottom };
@@ -10987,17 +11218,17 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
             // Drag-handle affordance: a short grip line centered on the strip's top padding.
             if (a.compose != null) {
                 const cx = @divTrunc(left_width + 1 + client.right, 2);
-                var grip = win.RECT{ .left = cx - 22, .top = a.compose_strip_top + 4, .right = cx + 22, .bottom = a.compose_strip_top + 6 };
+                var grip = win.RECT{ .left = cx - px(a, 22), .top = a.compose_strip_top + px(a, 4), .right = cx + px(a, 22), .bottom = a.compose_strip_top + px(a, 6) };
                 _ = win.FillRect(hdc, &grip, a.brush_panel.?);
             }
             // Paste preview (WAZI-37): the staged image thumbnail sits in the
             // band the strip reserves above the edit while it waits to send.
             if (a.staged_image.preview) |preview| {
                 var preview_rect = win.RECT{
-                    .left = left_width + 13,
-                    .top = a.compose_strip_top + 10,
-                    .right = left_width + 14 + a.staged_image.preview_width,
-                    .bottom = a.compose_strip_top + 11 + a.staged_image.preview_height,
+                    .left = left_width + px(a, 13),
+                    .top = a.compose_strip_top + px(a, 10),
+                    .right = left_width + px(a, 14) + a.staged_image.preview_width,
+                    .bottom = a.compose_strip_top + px(a, 11) + a.staged_image.preview_height,
                 };
                 _ = win.FillRect(hdc, &preview_rect, a.brush_bg.?);
                 const memory_dc = win.CreateCompatibleDC(hdc);
@@ -11021,7 +11252,7 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
                 var pt: win.POINT = undefined;
                 _ = win.GetCursorPos(&pt);
                 _ = win.ScreenToClient(hwnd, &pt);
-                if (pt.y >= a.compose_strip_top and pt.y < a.compose_strip_top + 11 and pt.x > 0) {
+                if (pt.y >= a.compose_strip_top and pt.y < a.compose_strip_top + px(a, 11) and pt.x > 0) {
                     // IDC_SIZENS = MAKEINTRESOURCE(32646); the macro doesn't translate.
                     _ = win.SetCursor(win.LoadCursorW(null, @as([*:0]const u16, @ptrFromInt(32646))));
                     return 1;
@@ -11034,7 +11265,7 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
             const y: i32 = @as(i16, @bitCast(hiword(@as(usize, @bitCast(lparam)))));
             // The composer's resize band takes precedence over the scrollbar
             // strip: their top 11px overlap when the edit is at minimum height.
-            if (a.compose != null and y >= a.compose_strip_top and y < a.compose_strip_top + 11) {
+            if (a.compose != null and y >= a.compose_strip_top and y < a.compose_strip_top + px(a, 11)) {
                 a.compose_dragging = true;
                 _ = win.SetCapture(hwnd);
                 return 0;
@@ -11071,7 +11302,7 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
             }
             if (a.compose_dragging) {
                 const y: i32 = @as(i16, @bitCast(hiword(@as(usize, @bitCast(lparam)))));
-                a.compose_dragged = std.math.clamp(a.compose_client_height - 11 - y, 44, 400);
+                a.compose_dragged = std.math.clamp(a.compose_client_height - px(a, 11) - y, px(a, 44), px(a, 400));
                 layout(a, a.compose_client_width, a.compose_client_height);
                 return 0;
             }
@@ -11086,7 +11317,7 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
             if (a.compose_dragging) {
                 a.compose_dragging = false;
                 _ = win.ReleaseCapture();
-                if (a.compose_dragged > 44) saveComposeDragged(hwnd, a.compose_dragged);
+                if (a.compose_dragged > px(a, 44)) saveComposeDragged(hwnd, a.compose_dragged);
                 return 0;
             }
             return win.DefWindowProcW(hwnd, message, wparam, lparam);
@@ -13183,4 +13414,49 @@ test "launch log rotates one byte past its cap, never at or under it" {
     try std.testing.expect(!launchLogShouldRotate(0));
     try std.testing.expect(!launchLogShouldRotate(launch_log_max_bytes));
     try std.testing.expect(launchLogShouldRotate(launch_log_max_bytes + 1));
+}
+
+test "wrapChunkLen breaks long words at punctuation then characters" {
+    const Case = struct { word: []const u16, fit: usize, want: usize };
+    const cases = [_]Case{
+        // No delimiter inside the prefix: break at the last character that fits.
+        .{ .word = &[_]u16{ 'a', 'b', 'c', 'd', 'e' }, .fit = 3, .want = 3 },
+        // A fitting delimiter wins even when later characters also fit.
+        .{ .word = &[_]u16{ 'a', 'b', '/', 'c', 'd' }, .fit = 4, .want = 3 },
+        // The last fitting delimiter is used, not the first.
+        .{ .word = &[_]u16{ 'a', '/', 'b', '/', 'c' }, .fit = 5, .want = 4 },
+        .{ .word = &[_]u16{ 'h', 't', 't', 'p', 's', ':', '/', '/', 'x' }, .fit = 8, .want = 8 },
+        // A word that cannot fit a single character still advances by one.
+        .{ .word = &[_]u16{ 'x', 'y' }, .fit = 0, .want = 1 },
+        // Empty input never yields a zero-length chunk.
+        .{ .word = &[_]u16{}, .fit = 5, .want = 1 },
+    };
+    for (cases) |case| {
+        try std.testing.expectEqual(case.want, wrapChunkLen(case.word, case.fit));
+    }
+}
+
+test "wrapChunkLen keeps surrogate pairs and joiners whole" {
+    const Case = struct { word: []const u16, fit: usize, want: usize };
+    const cases = [_]Case{
+        // A cut between the halves of a pair backs up to its start.
+        .{ .word = &[_]u16{ 'a', 0xD83D, 0xDC69, 'b' }, .fit = 2, .want = 1 },
+        .{ .word = &[_]u16{ 'x', 0xD83D, 0xDC69 }, .fit = 2, .want = 1 },
+        // A leading pair is one character, so the smallest chunk is two units.
+        .{ .word = &[_]u16{ 0xD83D, 0xDC69 }, .fit = 1, .want = 2 },
+        .{ .word = &[_]u16{ 0xD83D, 0xDC69, 'a' }, .fit = 0, .want = 2 },
+        // Never cut before a ZWJ: back up to the character in front of it.
+        .{ .word = &[_]u16{ 'a', 'b', 0x200D, 0xD83D, 0xDC69 }, .fit = 2, .want = 1 },
+        // When the joiner follows the first character, keep one whole one.
+        .{ .word = &[_]u16{ 0xD83D, 0xDC69, 0x200D, 0xD83C, 0xDFA9 }, .fit = 2, .want = 2 },
+        .{ .word = &[_]u16{ '1', 0x20E3, 'x' }, .fit = 1, .want = 1 },
+        .{ .word = &[_]u16{ 'a', 0xFE0F, 'b' }, .fit = 1, .want = 1 },
+        // The whole ZWJ family survives when it all fits.
+        .{ .word = &[_]u16{ 0xD83D, 0xDC69, 0x200D, 0xD83C, 0xDFA9 }, .fit = 5, .want = 5 },
+    };
+    for (cases) |case| {
+        try std.testing.expectEqual(case.want, wrapChunkLen(case.word, case.fit));
+    }
+    // A lone high surrogate is still one unit; do not over-advance past it.
+    try std.testing.expectEqual(@as(usize, 1), wrapChunkLen(&[_]u16{0xD83D}, 1));
 }
