@@ -43,6 +43,7 @@ const timer_animation = 3;
 const timer_chat_select = 4;
 const timer_update_check = 5;
 const timer_update_restart = 6;
+const timer_update_first_check = 8;
 const timer_telegram = 7;
 // Telegram-specific commands live past the shared palette command block.
 const command_telegram_login = 2025;
@@ -57,15 +58,18 @@ const max_wacli_args = 16;
 const wacli_arg_cap = 512;
 const max_msg_cache = 8;
 const msg_cache_max_bytes = 4 * 1024 * 1024;
-// WAZI-60: check hourly (was every 4 hours) so a release is noticed within
-// the hour, plus right after the machine wakes and when the window is focused.
-const update_check_interval_ms: u32 = 60 * 60 * 1000;
+// WAZI-60: check every 15 minutes so a release is noticed quickly, plus
+// right after the machine wakes and when the window is focused.
+const update_check_interval_ms: u32 = 15 * 60 * 1000;
 // Automatic re-checks (wake, focus) are throttled to at most one per 5 minutes.
 const update_min_retry_ms: u64 = 5 * 60 * 1000;
 // A check stuck longer than this means its completion message was lost; allow
 // a new check instead of blocking the rest of the session.
 const update_check_timeout_ms: u64 = 10 * 60 * 1000;
 const update_restart_delay_ms: u32 = 10 * 1000;
+// One check shortly after launch catches a release published while the app
+// was closed, without waiting for the first periodic tick.
+const update_first_check_delay_ms: u32 = 20 * 1000;
 const scrollbar_width: i32 = 8; // 6px thumb + 1px inset on each side
 const scrollbar_min_thumb: i32 = 24;
 const SbDrag = enum { none, chats, compose, palette, canvas, emoji };
@@ -526,6 +530,15 @@ const App = struct {
     update_install_running: std.atomic.Value(bool) = .init(false),
     update_last_check_ms: u64 = 0,
     update_failures: u32 = 0,
+    // An install finished; the version number in this process is stale until
+    // the restart, so no further check may offer the same tag again.
+    update_installed: bool = false,
+    // True when the running install came from an automatic check, so its
+    // failures stay quiet unless they keep repeating.
+    update_install_auto: bool = false,
+    // True when the running check came from the Ctrl+K command, so its
+    // result installs in the foreground with its own status line.
+    update_check_manual: bool = false,
     chats: [max_chats]Chat = [_]Chat{.{}} ** max_chats,
     chat_count: usize = 0,
     telegram: ?*tg.Client = null,
@@ -8418,11 +8431,16 @@ fn runCommand(a: *App, command: u16) void {
             startSync(a);
         },
         command_update_check => {
+            if (a.update_installed) {
+                setStatus(a, "Update installed - restarting soon");
+                return;
+            }
             setStatus(a, "Checking for updates...");
             if (a.hwnd) |hwnd| startUpdateCheck(hwnd, true);
         },
         command_update_install => {
             if (a.update_pending == null) return;
+            a.update_install_auto = false;
             setStatus(a, "Downloading update...");
             if (a.hwnd) |hwnd| startUpdateInstall(hwnd);
         },
@@ -9771,39 +9789,68 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
             if (wparam == 1 or wparam >= 6) a.update_install_running.store(false, .release);
             switch (wparam) {
                 1 => {
+                    a.update_installed = true;
+                    a.update_failures = 0;
                     setStatus(a, "Update installed - restarting in 10 seconds");
                     _ = win.SetTimer(hwnd, timer_update_restart, update_restart_delay_ms, null);
                 },
                 2 => {
                     const upd: *UpdateAvailable = @ptrFromInt(@as(usize, @bitCast(lparam)));
-                    // Re-finding an update the user already declined must
-                    // not pop the modal box over whatever he is typing;
-                    // the palette command stays available instead.
-                    const known = if (a.update_pending) |old| old.tag else null;
-                    if (!update.isNewOffer(known, upd.tag)) {
-                        var ready_buf: [128]u8 = undefined;
-                        const ready = std.fmt.bufPrint(&ready_buf, "Update to {s} is ready - \"Restart now to install update\" is in the command palette", .{upd.tag}) catch "An update is ready in the command palette";
+                    // The install already succeeded; drop the late offer
+                    // instead of trying to install the same tag again.
+                    if (a.update_installed) {
                         upd.deinit(std.heap.page_allocator);
                         std.heap.page_allocator.destroy(upd);
-                        setStatus(a, ready);
                         return 0;
                     }
+                    // A re-found tag is the same failed install, not a new
+                    // offer: counting it keeps a repeating automatic failure
+                    // from staying silent forever.
+                    const known = if (a.update_pending) |old| old.tag else null;
+                    const is_new_offer = update.isNewOffer(known, upd.tag);
                     if (a.update_pending) |old| {
                         old.deinit(std.heap.page_allocator);
                         std.heap.page_allocator.destroy(old);
                     }
                     a.update_pending = upd;
-                    a.update_failures = 0;
-                    showUpdatePrompt(a);
+                    if (is_new_offer) a.update_failures = 0;
+                    // An install already in flight reaches the newest tag
+                    // itself; keep this one pending instead of stacking a
+                    // second install over it.
+                    if (a.update_install_running.load(.acquire)) return 0;
+                    a.update_install_auto = !a.update_check_manual;
+                    // Updates install without a click: every hit, new or
+                    // re-found, starts the download right away. The install
+                    // guard refuses a second concurrent run.
+                    var install_buf: [128]u8 = undefined;
+                    setStatus(a, std.fmt.bufPrint(&install_buf, "Installing update {s}...", .{upd.tag}) catch "Installing update...");
+                    var install_log_buf: [160]u8 = undefined;
+                    appendLaunchLog(a, std.fmt.bufPrint(&install_log_buf, "update: installing {s}", .{upd.tag}) catch "update: installing");
+                    startUpdateInstall(hwnd);
                 },
-                3, 8 => {
+                3 => {
                     a.update_failures = 0;
                     var none_buf: [96]u8 = undefined;
                     setStatus(a, std.fmt.bufPrint(&none_buf, "You are on v{s} - this is the newest version", .{app_version}) catch "No updates found");
                 },
                 6 => {
-                    a.update_failures = 0;
-                    setStatus(a, "Update blocked: another copy of Messages is running - close other copies and try again");
+                    if (a.update_install_auto) {
+                        a.update_failures += 1;
+                    } else {
+                        a.update_failures = 0;
+                    }
+                    if (!a.update_install_auto or a.update_failures >= 2) setStatus(a, "Update blocked: another copy of Messages is running - close other copies and try again");
+                },
+                8 => {
+                    if (a.update_install_auto) {
+                        a.update_failures += 1;
+                    } else {
+                        a.update_failures = 0;
+                    }
+                    if (!a.update_install_auto or a.update_failures >= 2) {
+                        var none_buf: [96]u8 = undefined;
+                        setStatus(a, std.fmt.bufPrint(&none_buf, "You are on v{s} - this is the newest version", .{app_version}) catch "No updates found");
+                    }
                 },
                 4, 5, 7 => {
                     const name: [*:0]const u8 = @ptrFromInt(@as(usize, @bitCast(lparam)));
@@ -9811,8 +9858,10 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
                     var fail_buf: [128]u8 = undefined;
                     const verb: []const u8 = if (wparam == 7) "install" else "check";
                     const text = std.fmt.bufPrint(&fail_buf, "Update {s} failed: {s}", .{ verb, std.mem.span(name) }) catch "Update failed";
-                    // 5 and 7 are user-initiated, so their failures always show.
-                    if (wparam != 4 or a.update_failures >= 2) setStatus(a, text);
+                    // 5 is user-initiated; an automatic 4 or 7 only speaks up
+                    // when the failure repeats.
+                    const auto = wparam == 4 or (wparam == 7 and a.update_install_auto);
+                    if (!auto or a.update_failures >= 2) setStatus(a, text);
                 },
                 else => {},
             }
@@ -10023,6 +10072,7 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
             _ = win.SetTimer(hwnd, timer_refresh, 1000, null);
             _ = win.SetTimer(hwnd, timer_animation, 120, null);
             _ = win.SetTimer(hwnd, timer_telegram, 250, null);
+            _ = win.SetTimer(hwnd, timer_update_first_check, update_first_check_delay_ms, null);
             _ = win.SetTimer(hwnd, timer_update_check, update_check_interval_ms, null);
             if (a.wacli_thread == null) {
                 a.wacli_thread = std.Thread.spawn(.{ .stack_size = 1024 * 1024 }, wacliWorkerMain, .{ a, false }) catch null;
@@ -10270,11 +10320,22 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
                 _ = win.KillTimer(hwnd, timer_chat_select);
                 a.chat_selection_pending = false;
                 refreshMessages(a);
+            } else if (wparam == timer_update_first_check) {
+                _ = win.KillTimer(hwnd, timer_update_first_check);
+                startUpdateCheck(hwnd, false);
             } else if (wparam == timer_update_check) {
                 startUpdateCheck(hwnd, false);
             } else if (wparam == timer_update_restart) {
-                _ = win.KillTimer(hwnd, timer_update_restart);
-                relaunchIntoUpdate(a);
+                // Never throw away unsent typing or a message still on its
+                // way to WhatsApp: keep pushing the restart back until the
+                // compose box is empty and every send has finished.
+                const composing = if (a.compose) |compose| win.GetWindowTextLengthW(compose) > 0 else false;
+                if (composing or a.pending_send_count > 0 or a.send_child != null) {
+                    setStatus(a, if (composing) "Update installed - restarting when you finish typing" else "Update installed - restarting after the message is sent");
+                    _ = win.SetTimer(hwnd, timer_update_restart, update_restart_delay_ms, null);
+                } else {
+                    relaunchIntoUpdate(a);
+                }
             }
             return 0;
         },
@@ -11308,10 +11369,10 @@ pub fn main(init: std.process.Init) !void {
 }
 
 // Self-update (WAZI-27, WAZI-60): checks GitHub Releases for a newer version.
-// A check only looks and reports; downloading and installing happens solely
-// after the user approves it in the update prompt or via the Ctrl+K
-// "Restart now to install update" command. All work happens on a detached
-// worker thread; the UI only hears back via wm_update_ready.
+// A check only looks and reports; a newer release then downloads and installs
+// automatically, and the Ctrl+K "Restart now to install update" command can
+// start the same install by hand. All work happens on a detached worker
+// thread; the UI only hears back via wm_update_ready.
 const UpdateContext = struct {
     io: std.Io,
     hwnd: win.HWND,
@@ -11335,9 +11396,13 @@ const UpdateAvailable = struct {
 
 fn startUpdateCheck(hwnd: win.HWND, manual: bool) void {
     const a = app_ptr orelse return;
+    // An installed update means this process is on borrowed time until its
+    // restart; do not start another check that would re-offer the same tag.
+    if (a.update_installed) return;
     const now = win.GetTickCount64();
     if (a.update_check_running and now - a.update_last_check_ms < update_check_timeout_ms) return;
     if (!manual and a.update_last_check_ms != 0 and now - a.update_last_check_ms < update_min_retry_ms) return;
+    a.update_check_manual = manual;
     const ctx = std.heap.page_allocator.create(UpdateContext) catch return;
     ctx.* = .{ .io = a.io, .hwnd = hwnd, .manual = manual, .install = false };
     const thread = std.Thread.spawn(.{}, updateThreadMain, .{ctx}) catch {
@@ -11457,42 +11522,6 @@ fn checkForUpdate(allocator: std.mem.Allocator) !?UpdateAvailable {
     errdefer allocator.free(notes);
     const tag = try allocator.dupe(u8, asset.tag);
     return .{ .tag = tag, .notes = notes };
-}
-
-/// WAZI-60: ask before installing. ponytail: the notes render in a native
-/// MessageBox, truncated; a richer in-app dialog can replace it later.
-fn showUpdatePrompt(a: *App) void {
-    const upd = a.update_pending orelse return;
-    const notes = upd.notes[0..@min(upd.notes.len, 1200)];
-    const text = std.fmt.allocPrint(a.allocator, "Version {s} is available. Install it now?\n\n{s}{s}", .{
-        upd.tag,
-        notes,
-        if (upd.notes.len > notes.len) "\n\n..." else "",
-    }) catch return;
-    defer a.allocator.free(text);
-    const text_wide = utf8ToWide(a.allocator, text) catch return;
-    defer a.allocator.free(text_wide);
-    const title_wide = utf8ToWide(a.allocator, "Messages update") catch return;
-    defer a.allocator.free(title_wide);
-    // WAZI-84: a failed swap can leave two live copies of the app running,
-    // and both used to pop this modal box at once. One prompt at a time: a
-    // copy that loses the race falls back to the status line, which names
-    // the palette command, so nothing is lost and nothing is doubled.
-    const prompt_mutex = win.CreateMutexW(null, win.FALSE, lit("Local\\MessagesUpdatePromptMutex")) orelse return;
-    defer _ = win.CloseHandle(prompt_mutex);
-    if (update.classifyMutexWait(win.WaitForSingleObject(prompt_mutex, 0)) != .acquired) {
-        var later_buf: [160]u8 = undefined;
-        setStatus(a, std.fmt.bufPrint(&later_buf, "Update to {s} is ready - choose \"Restart now to install update\" in the command palette when you want it", .{upd.tag}) catch "An update is ready in the command palette");
-        return;
-    }
-    const choice = win.MessageBoxW(a.hwnd.?, text_wide.ptr, title_wide.ptr, win.MB_YESNO | win.MB_ICONINFORMATION);
-    _ = win.ReleaseMutex(prompt_mutex);
-    if (choice == win.IDYES) {
-        if (a.hwnd) |hwnd| startUpdateInstall(hwnd);
-    } else {
-        var later_buf: [160]u8 = undefined;
-        setStatus(a, std.fmt.bufPrint(&later_buf, "Update to {s} is ready - choose \"Restart now to install update\" in the command palette when you want it", .{upd.tag}) catch "An update is ready in the command palette");
-    }
 }
 
 /// Every failed check or install gets a timestamped line in
@@ -12144,6 +12173,7 @@ fn relaunchIntoUpdate(a: *App) void {
     var startup: win.STARTUPINFOW = std.mem.zeroes(win.STARTUPINFOW);
     startup.cb = @sizeOf(win.STARTUPINFOW);
     var process: win.PROCESS_INFORMATION = std.mem.zeroes(win.PROCESS_INFORMATION);
+    appendLaunchLog(a, "update: relaunching");
     // WAZI-71: retry once before giving up; a transient failure must not
     // push the restart back onto the user.
     var launched = win.CreateProcessW(exe_buf[0..exe_len :0].ptr, null, null, null, win.FALSE, 0, null, null, &startup, &process) != 0;
