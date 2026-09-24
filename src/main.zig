@@ -640,6 +640,9 @@ const App = struct {
     // Set after repeated wacli spawn failures: stop retrying reads this
     // session, but keep the queue file so they retry next launch.
     read_queue_dead: bool = false,
+    // appendLaunchLog runs on the UI thread and on each sync child's detached
+    // stderr reader thread, so the append is serialized.
+    launch_log_mutex: std.Io.Mutex = .init,
     // The wacli worker thread shares allocator and io with the UI thread:
     // safe because start.zig provides c_allocator and std.Io.Threaded, both
     // thread-safe. wacli_pending is only touched under wacli_mutex.
@@ -687,6 +690,15 @@ const App = struct {
     sync_fail_count: u32 = 0,
     sync_started_secs: i64 = 0,
     sync_auth_probe: bool = false,
+    // Heartbeat watchdog (2026-09-22): wacli touches .wacli\HEARTBEAT on
+    // WhatsApp activity, so a quiet account leaves it frozen for a long
+    // while. A child whose socket died silently kept running with that file
+    // frozen, so checkSyncHeartbeat restarts it. See there.
+    sync_heartbeat_path: WideText(519) = .{},
+    sync_heartbeat_ticks: u32 = 0,
+    sync_heartbeat_mtime: i64 = 0,
+    sync_heartbeat_restart_secs: i64 = 0,
+    sync_heartbeat_unreadable: bool = false,
     sync_logged_out: bool = false,
     store_watch_path: WideText(519) = .{},
     last_store_write: u64 = 0,
@@ -3756,12 +3768,16 @@ fn startNextMarkRead(a: *App) void {
     // 70s, longer than the longest known hold, instead of losing the write.
     // Anything still queued when the app closes persists to disk and
     // retries next launch (WAZI-74).
+    // --receipts (wacli 0.19.0+) sends read receipts on their own path.
+    // Plain mark-read waits on a regular_low app-state recovery that only
+    // the phone can answer, so a desynced collection hung every read and
+    // kept live sync paused (openclaw/wacli#428).
     if (a.send_child != null or a.pending_send_count > 0 or
         a.archive_child != null or a.pending_archive_count > 0 or
         avatarBusy(a) or mediaBusy(a)) return;
     stopSync(a);
     const child = std.process.spawn(a.io, .{
-        .argv = &.{ a.wacli_path, "--json", "--lock-wait", "70s", "chats", "mark-read", "--chat", a.pending_reads[0].slice() },
+        .argv = &.{ a.wacli_path, "--json", "--lock-wait", "70s", "chats", "mark-read", "--receipts", "--chat", a.pending_reads[0].slice() },
         .stdin = .ignore,
         .stdout = .ignore,
         .stderr = .ignore,
@@ -4439,6 +4455,12 @@ fn fillDibFromSource(a: *App, message: *Message, source: *win.IWICBitmapSource, 
 fn nowUnixSeconds() i64 {
     var ft: win.FILETIME = undefined;
     win.GetSystemTimeAsFileTime(&ft);
+    return filetimeToUnixSeconds(ft);
+}
+
+/// FILETIME (100ns ticks since 1601) to unix seconds. The heartbeat watchdog
+/// compares the file's stamp against wall-clock time.
+fn filetimeToUnixSeconds(ft: win.FILETIME) i64 {
     const q: i64 = (@as(i64, ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
     return @divTrunc(q - 116444736000000000, 10_000_000);
 }
@@ -6092,6 +6114,44 @@ fn readsPendingBlockingSync(a: *const App) bool {
     return false;
 }
 
+// wacli's live-sync warnings used to go to .stderr = .ignore and vanish.
+// One detached thread per sync child reads the child's stderr and appends
+// every line to the launch log, capped so a chatty child cannot fill it; past
+// the cap the pipe keeps draining but nothing more is logged, because a
+// reader that stops would let the child block on a full stderr pipe.
+const sync_stderr_line_max_bytes = 400;
+const sync_stderr_line_cap = 200;
+
+fn syncStderrMain(a: *App, stderr: std.Io.File) void {
+    // The reader owns the handle: startSync took it out of the child so
+    // kill/wait cannot close it under this thread.
+    defer stderr.close(a.io);
+    var buffer: [4096]u8 = undefined;
+    var reader = stderr.readerStreaming(a.io, &buffer);
+    var logged: usize = 0;
+    while (true) {
+        const raw = reader.interface.takeDelimiter('\n') catch |err| switch (err) {
+            // A line longer than the reader buffer: drain it to the newline
+            // but log nothing from it.
+            error.StreamTooLong => {
+                while (true) {
+                    const byte = reader.interface.takeByte() catch return;
+                    if (byte == '\n') break;
+                }
+                continue;
+            },
+            error.ReadFailed => return,
+        };
+        const line = std.mem.trimEnd(u8, raw orelse return, "\r");
+        if (line.len == 0 or logged >= sync_stderr_line_cap) continue;
+        logged += 1;
+        const text = line[0..@min(line.len, sync_stderr_line_max_bytes)];
+        var event_buffer: [6 + sync_stderr_line_max_bytes]u8 = undefined;
+        const event = std.fmt.bufPrint(&event_buffer, "sync: {s}", .{text}) catch continue;
+        appendLaunchLog(a, event);
+    }
+}
+
 fn startSync(a: *App) void {
     // Hold off while any write job is pending: they pause live sync and
     // serialize on the store lock, so don't fight them. checkSync restarts
@@ -6114,7 +6174,7 @@ fn startSync(a: *App) void {
         .argv = &.{ a.wacli_path, "--events", "sync", "--follow", "--max-reconnect", "0", "--stale-threshold", "1m", "--refresh-contacts", "--refresh-groups", "--download-media" },
         .stdin = .ignore,
         .stdout = .ignore,
-        .stderr = .ignore,
+        .stderr = .pipe,
         .create_no_window = true,
     }) catch {
         setStatus(a, "Could not start live sync");
@@ -6132,14 +6192,87 @@ fn startSync(a: *App) void {
         if (child.id) |handle| _ = win.AssignProcessToJobObject(job, handle);
     }
     a.sync_child = child;
+    // The reader thread owns the stderr handle: take it out of the child so
+    // kill/wait cannot close it under the reader, which would race a
+    // recycled handle onto another file.
+    const sync_stderr = a.sync_child.?.stderr;
+    a.sync_child.?.stderr = null;
+    if (sync_stderr) |file| {
+        if (std.Thread.spawn(.{ .stack_size = 256 * 1024 }, syncStderrMain, .{ a, file })) |thread| {
+            thread.detach();
+        } else |_| {
+            // With no reader, closing the read end is all that keeps the
+            // child from blocking on a full stderr pipe.
+            file.close(a.io);
+        }
+    }
+    appendLaunchLog(a, "sync: child started");
     a.sync_started_secs = nowUnixSeconds();
+    // A fresh child gets a fresh watchdog: unknown heartbeat stamp, first
+    // check after sync_heartbeat_check_ticks, and the unreadable notice once.
+    a.sync_heartbeat_ticks = 0;
+    a.sync_heartbeat_mtime = 0;
+    a.sync_heartbeat_unreadable = false;
     a.sync_logged_out = false;
     setStatus(a, "Live sync running");
 }
 
 fn stopSync(a: *App) void {
-    if (a.sync_child) |*child| child.kill(a.io);
+    if (a.sync_child) |*child| {
+        child.kill(a.io);
+        appendLaunchLog(a, "sync: child stopped");
+    }
     a.sync_child = null;
+}
+
+// Heartbeat watchdog tuning: look once every 30 one-second refresh ticks,
+// and treat a child older than stale_secs whose heartbeat is at least as
+// old and unmoved since the previous look as stuck. The same span also
+// keeps the watchdog from firing again right after a restart. 15 minutes,
+// not 3: wacli only touches the file on WhatsApp activity, and a quiet
+// account is not a dead socket.
+const sync_heartbeat_check_ticks: u32 = 30;
+const sync_heartbeat_stale_secs: i64 = 900;
+
+/// Last-write time of the sync heartbeat file in unix seconds, or null when
+/// the lookup fails (missing, locked, unreadable). Null means "do nothing":
+/// the watchdog must never restart a child on evidence it could not read.
+fn syncHeartbeatMtime(a: *App) ?i64 {
+    if (a.sync_heartbeat_path.len == 0) return null;
+    var attributes = std.mem.zeroes(win.WIN32_FILE_ATTRIBUTE_DATA);
+    if (win.GetFileAttributesExW(a.sync_heartbeat_path.ptr(), win.GetFileExInfoStandard, &attributes) == 0) return null;
+    return filetimeToUnixSeconds(attributes.ftLastWriteTime);
+}
+
+/// Runs while the sync child is alive. A child past the stale span with a
+/// heartbeat just as old that did not advance since the previous check has a
+/// dead socket behind a live process: stop it, and checkSync respawns on the
+/// next tick. A missing or unreadable file fails closed and logs once.
+fn checkSyncHeartbeat(a: *App) void {
+    a.sync_heartbeat_ticks += 1;
+    if (a.sync_heartbeat_ticks < sync_heartbeat_check_ticks) return;
+    a.sync_heartbeat_ticks = 0;
+    const mtime = syncHeartbeatMtime(a) orelse {
+        if (!a.sync_heartbeat_unreadable) {
+            a.sync_heartbeat_unreadable = true;
+            appendLaunchLog(a, "sync: heartbeat unreadable");
+        }
+        return;
+    };
+    const previous = a.sync_heartbeat_mtime;
+    a.sync_heartbeat_mtime = mtime;
+    const now = nowUnixSeconds();
+    const age = now - mtime;
+    // "Has not advanced" needs two looks: the first only records the stamp.
+    if (previous == 0 or mtime != previous) return;
+    if (now - a.sync_started_secs <= sync_heartbeat_stale_secs) return;
+    if (age <= sync_heartbeat_stale_secs) return;
+    if (now - a.sync_heartbeat_restart_secs <= sync_heartbeat_stale_secs) return;
+    var event_buffer: [64]u8 = undefined;
+    const event = std.fmt.bufPrint(&event_buffer, "sync: heartbeat stale {d}s, restarting child", .{age}) catch return;
+    appendLaunchLog(a, event);
+    a.sync_heartbeat_restart_secs = now;
+    stopSync(a);
 }
 
 fn checkSync(a: *App) void {
@@ -6153,6 +6286,7 @@ fn checkSync(a: *App) void {
             if (win.GetExitCodeProcess(handle, &code) != 0 and code != win.STILL_ACTIVE) {
                 _ = child.wait(a.io) catch {};
                 a.sync_child = null;
+                appendLaunchLog(a, "sync: child exited");
                 const lived_secs = nowUnixSeconds() - a.sync_started_secs;
                 if (lived_secs < accounts.sync_fast_death_secs) {
                     a.sync_fail_count += 1;
@@ -6167,7 +6301,7 @@ fn checkSync(a: *App) void {
                 }
                 setStatus(a, "Live sync stopped - restarting");
                 startSync(a);
-            }
+            } else checkSyncHeartbeat(a);
         }
     } else startSync(a);
 }
@@ -10597,6 +10731,10 @@ fn launchLogShouldRotate(size: i64) bool {
 }
 
 fn appendLaunchLog(a: *App, event: []const u8) void {
+    // Called from the UI thread and from each sync child's stderr reader, so
+    // the size-read/rotate/append sequence is serialized.
+    a.launch_log_mutex.lockUncancelable(a.io);
+    defer a.launch_log_mutex.unlock(a.io);
     const path = messagesDirPath(a, "launch-log.txt") orelse return;
     defer a.allocator.free(path);
     const wide = std.unicode.utf8ToUtf16LeAllocZ(a.allocator, path) catch return;
@@ -10623,7 +10761,7 @@ fn appendLaunchLog(a: *App, event: []const u8) void {
     const handle = win.CreateFileW(wide.ptr, win.FILE_APPEND_DATA, win.FILE_SHARE_READ | win.FILE_SHARE_WRITE, null, win.OPEN_ALWAYS, win.FILE_ATTRIBUTE_NORMAL, null);
     if (handle == win.INVALID_HANDLE_VALUE or handle == null) return;
     defer _ = win.CloseHandle(handle);
-    var line_buffer: [192]u8 = undefined;
+    var line_buffer: [512]u8 = undefined;
     const line = std.fmt.bufPrint(&line_buffer, "{d} {s}\n", .{ nowUnixSeconds(), event }) catch return;
     var written: win.DWORD = 0;
     _ = win.WriteFile(handle, line.ptr, @intCast(line.len), &written, null);
@@ -10863,6 +11001,13 @@ fn createStoreWatchPath(init: std.process.Init, allocator: std.mem.Allocator) ![
     return std.fs.path.join(allocator, &.{ home, ".wacli", "wacli.db-wal" });
 }
 
+/// The heartbeat sits beside wacli.db-wal: same directory, file name
+/// HEARTBEAT. Built the same way as the store watch path.
+fn createSyncHeartbeatPath(init: std.process.Init, allocator: std.mem.Allocator) ![]u8 {
+    const home = init.environ_map.get("USERPROFILE") orelse return error.MissingUserProfile;
+    return std.fs.path.join(allocator, &.{ home, ".wacli", "HEARTBEAT" });
+}
+
 fn createSlackMediaDirectory(init: std.process.Init, allocator: std.mem.Allocator) ![]u8 {
     const local = init.environ_map.get("LOCALAPPDATA") orelse return error.MissingLocalAppData;
     const messages_dir = try std.fs.path.join(allocator, &.{ local, "Messages" });
@@ -10927,14 +11072,17 @@ pub fn main(init: std.process.Init) !void {
     installCrashFilter();
     const wacli_path = try findWacli(init, init.gpa);
     defer init.gpa.free(wacli_path);
+    // Not freed: the detached sync-stderr reader thread may still log via
+    // avatar_dir during teardown; the process reclaims it.
     const avatar_dir = try createAvatarDirectory(init, init.gpa);
-    defer init.gpa.free(avatar_dir);
     const cache_tag = try findCacheTag(init, wacli_path, std.fs.path.dirname(avatar_dir) orelse return error.MissingMessagesDir);
     defer if (cache_tag) |tag| init.gpa.free(tag);
     const slack_media_dir = try createSlackMediaDirectory(init, init.gpa);
     defer init.gpa.free(slack_media_dir);
     const store_watch_path = try createStoreWatchPath(init, init.gpa);
     defer init.gpa.free(store_watch_path);
+    const sync_heartbeat_path = try createSyncHeartbeatPath(init, init.gpa);
+    defer init.gpa.free(sync_heartbeat_path);
     // store_watch_path is <home>\.wacli\wacli.db-wal; the parent is the
     // WhatsApp data folder that account removal moves aside.
     const wacli_dir = std.fs.path.dirname(store_watch_path) orelse return error.MissingUserProfile;
@@ -10991,6 +11139,7 @@ pub fn main(init: std.process.Init) !void {
     app.read_path = hashStorePath(init, init.gpa, "pending-reads.txt");
     loadPendingReads(&app);
     app.store_watch_path.set(init.gpa, store_watch_path);
+    app.sync_heartbeat_path.set(init.gpa, sync_heartbeat_path);
     app_ptr = &app;
     defer app_ptr = null;
 
