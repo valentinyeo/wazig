@@ -39,6 +39,30 @@ pub fn withinDays(timestamp: []const u8, now_unix: i64, days: i64) bool {
     return age <= days;
 }
 
+// Unix seconds for a wacli "YYYY-MM-DD[ T]HH:MM:SS" timestamp, or null when
+// it is missing or malformed (ageDays validates the calendar date). Second
+// precision is enough for the send-dedup window that compares against it.
+pub fn unixSeconds(timestamp: []const u8) ?i64 {
+    _ = ageDays(timestamp, 0) orelse return null;
+    if (timestamp.len < 19) return null;
+    const year = std.fmt.parseInt(i64, timestamp[0..4], 10) catch return null;
+    const month = std.fmt.parseInt(i64, timestamp[5..7], 10) catch return null;
+    const day = std.fmt.parseInt(i64, timestamp[8..10], 10) catch return null;
+    const hour = std.fmt.parseInt(i64, timestamp[11..13], 10) catch return null;
+    const minute = std.fmt.parseInt(i64, timestamp[14..16], 10) catch return null;
+    const second = std.fmt.parseInt(i64, timestamp[17..19], 10) catch return null;
+    if (hour > 23 or minute > 59 or second > 60) return null;
+    return daysFromCivil(year, month, day) * 86400 + hour * 3600 + minute * 60 + second;
+}
+
+test "unixSeconds parses wacli timestamps and rejects malformed input" {
+    try std.testing.expectEqual(@as(?i64, 0), unixSeconds("1970-01-01T00:00:00"));
+    try std.testing.expectEqual(@as(?i64, 1788701679), unixSeconds("2026-09-06T13:34:39"));
+    try std.testing.expectEqual(@as(?i64, null), unixSeconds("garbage"));
+    try std.testing.expectEqual(@as(?i64, null), unixSeconds("2026-09-06T13:34"));
+    try std.testing.expectEqual(@as(?i64, null), unixSeconds("2026-02-30T00:00:00"));
+}
+
 test "ageDays handles the epoch, leap years, and malformed input" {
     try std.testing.expectEqual(@as(?i64, 0), ageDays("1970-01-01T00:00:00", 0));
     // 1970 is not a leap year, so 1971-01-01 is exactly 365 days in.
