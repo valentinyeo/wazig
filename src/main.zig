@@ -339,6 +339,9 @@ const PaletteItem = struct {
     // Chat entries are resolved by their stable id at activation time; the
     // chat list can reorder (new message, pin) while the palette is open.
     chat_jid: Utf8Text(191) = .{},
+    // Media entries resolve the message by its stable id too: the message
+    // list can reload or scroll while the palette is open.
+    message_id: Utf8Text(191) = .{},
 };
 
 // buildPaletteItems registers more items than the original cap allowed, so
@@ -8122,10 +8125,11 @@ fn appendPalette(a: *App, label: []const u8, shortcut: []const u8, command: u16)
     item.label.set(a.allocator, label);
     item.shortcut.set(a.allocator, shortcut);
     item.command = command;
-    // Link and chat items keep extra state across palette rebuilds; stale
-    // values from an earlier mode would hijack activation.
+    // Link, chat, and media items keep extra state across palette rebuilds;
+    // stale values from an earlier mode would hijack activation.
     item.url = .{};
     item.chat_jid = .{};
+    item.message_id = .{};
 }
 
 // Chat entries reuse the command palette list: the label is the chat name as
@@ -8142,6 +8146,7 @@ fn appendPaletteChat(a: *App, index: usize) void {
     item.shortcut.set(a.allocator, "");
     item.command = 0;
     item.url = .{};
+    item.message_id = .{};
     item.chat_jid.set(chat.jid.slice());
 }
 
@@ -8347,6 +8352,35 @@ fn paletteActivate(a: *App) void {
         openUrlWide(a, url_ptr);
         return;
     }
+    if (item.message_id.len > 0) {
+        // Resolve by id, not by position: a refresh can reload the messages
+        // while the palette is open.
+        var found: ?usize = null;
+        for (a.messages[0..a.message_count], 0..) |*candidate, index| {
+            if (std.mem.eql(u8, candidate.id.slice(), item.message_id.slice())) {
+                found = index;
+                break;
+            }
+        }
+        const index = found orelse {
+            setStatus(a, "That attachment is no longer on screen");
+            return;
+        };
+        const message = &a.messages[index];
+        if (message.local_path.len > 0) {
+            closePalette(a);
+            openMedia(a, message);
+            return;
+        }
+        // Not on disk yet: start the same download a media click starts and
+        // keep the palette open so a second Enter opens it when ready.
+        // Slack and Telegram fetch their own media; only WhatsApp goes
+        // through wacli. downloadMedia sets its own status.
+        if (a.selected_chat < a.chat_count and a.chats[a.selected_chat].provider == .whatsapp) {
+            downloadMedia(a, index, false);
+        } else setStatus(a, "Still downloading");
+        return;
+    }
     const command = item.command;
     closePalette(a);
     if (command == 0) return;
@@ -8374,7 +8408,7 @@ fn openLinkPalette(a: *App) void {
     buildLinkPaletteItems(a);
     if (a.palette_item_count == 0) {
         a.palette_links_mode = false;
-        setStatus(a, "No links visible on screen");
+        setStatus(a, "Nothing to open on screen");
         return;
     }
     showPaletteWindow(a);
@@ -8384,6 +8418,8 @@ fn buildLinkPaletteItems(a: *App) void {
     a.palette_item_count = 0;
     for (a.messages[0..a.message_count]) |*message| {
         if (message.bubble_hit.right <= message.bubble_hit.left) continue;
+        // Links of a message come first, then its media, so the list stays in
+        // on-screen order top to bottom.
         for (message.links[0..message.link_count]) |*span| {
             if (span.url.len == 0) continue;
             var duplicate = false;
@@ -8399,6 +8435,26 @@ fn buildLinkPaletteItems(a: *App) void {
             item.url.set(a.allocator, url_utf8);
             item.shortcut.set(a.allocator, "");
             item.command = 0;
+            item.chat_jid = .{};
+            item.message_id = .{};
+            a.palette_item_count += 1;
+        }
+        if ((isImage(message) or isVideo(message)) and message.id.len > 0) {
+            if (a.palette_item_count >= max_palette_items) return;
+            const item = &a.palette_items[a.palette_item_count];
+            const sender_utf8 = std.unicode.utf16LeToUtf8Alloc(a.allocator, message.sender.slice()) catch continue;
+            defer a.allocator.free(sender_utf8);
+            const time_utf8 = std.unicode.utf16LeToUtf8Alloc(a.allocator, message.time.slice()) catch continue;
+            defer a.allocator.free(time_utf8);
+            const kind = if (isImage(message)) "Image" else "Video";
+            const label = std.fmt.allocPrint(a.allocator, "{s} - {s} {s}", .{ kind, sender_utf8, time_utf8 }) catch continue;
+            defer a.allocator.free(label);
+            item.label.set(a.allocator, label);
+            item.shortcut.set(a.allocator, "");
+            item.command = 0;
+            item.url = .{};
+            item.chat_jid = .{};
+            item.message_id.set(message.id.slice());
             a.palette_item_count += 1;
         }
     }
@@ -10872,6 +10928,19 @@ fn handleKeyboard(a: *App, message: *const win.MSG) bool {
         if (key == win.VK_UP) {
             paletteMove(a, -1);
             return true;
+        }
+        // j/k walk the open-externally picker like Up/Down; an empty filter
+        // keeps them from colliding with the typed filter text.
+        if (a.palette_links_mode and !control and !alt) {
+            const filter_empty = if (a.palette_edit) |edit| win.GetWindowTextLengthW(edit) == 0 else true;
+            if (filter_empty and key == 'J') {
+                paletteMove(a, 1);
+                return true;
+            }
+            if (filter_empty and key == 'K') {
+                paletteMove(a, -1);
+                return true;
+            }
         }
         if (key == win.VK_RETURN) {
             paletteActivate(a);
