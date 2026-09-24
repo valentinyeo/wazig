@@ -9560,7 +9560,10 @@ fn drawEmojiRun(hdc: win.HDC, emoji_font: win.HFONT, text_ascent: i32, line_heig
     // status text and must not consume the one-shot notice.
     if (draw) {
         if (app_ptr) |app| {
-            if (emoji_draw.takeNotice()) |notice| setStatus(app, notice);
+            if (emoji_draw.takeNotice()) |notice| {
+                setStatus(app, notice);
+                appendLaunchLog(app, notice);
+            }
         }
     }
     _ = win.SelectObject(hdc, @ptrCast(emoji_font));
@@ -11589,6 +11592,37 @@ fn handleKeyboard(a: *App, message: *const win.MSG) bool {
     // The image viewer owns the keyboard too: shortcuts like Q (quit) or
     // E (archive) must not act on the chat hidden behind it.
     if (a.image_viewer_window != null) return false;
+    // Ctrl+1..9 open the chat at that position in the list.
+    if (control and !alt and key >= '1' and key <= '9') {
+        const target: i32 = @intCast(key - '1');
+        if (target < a.chat_count) {
+            selectChat(a, target - @as(i32, @intCast(a.selected_chat)), false);
+            focusCompose(a);
+        }
+        return true;
+    }
+    // Chat history from the keyboard: Page Up/Down a screen, Ctrl+Up/Down a
+    // few lines, Ctrl+End back to the newest message. Same path as the wheel,
+    // so older messages load the same way.
+    if (a.canvas != null and !alt and (key == win.VK_PRIOR or key == win.VK_NEXT or
+        (control and (key == win.VK_UP or key == win.VK_DOWN or key == win.VK_END))))
+    {
+        if (a.canvas) |canvas| {
+            var client: win.RECT = undefined;
+            _ = win.GetClientRect(canvas, &client);
+            const page = @max(px(a, 60), client.bottom - client.top - px(a, 60));
+            const step: i32 = switch (key) {
+                win.VK_PRIOR => page,
+                win.VK_NEXT => -page,
+                win.VK_UP => px(a, 90),
+                win.VK_DOWN => -px(a, 90),
+                else => -a.scroll_y,
+            };
+            a.scroll_y = std.math.clamp(a.scroll_y + step, 0, a.max_scroll);
+            _ = win.InvalidateRect(canvas, null, win.TRUE);
+        }
+        return true;
+    }
     if (control and key == 'F') {
         if (a.search) |search| {
             _ = win.SetFocus(search);
