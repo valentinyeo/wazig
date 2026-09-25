@@ -38,8 +38,15 @@ jobs:
         id: tdcache
         uses: actions/cache@v4
         with:
-          path: /tmp/tdlib-install
-          key: tdlib-${{ env.TDLIB_COMMIT }}-v2
+          # Same key and path list as the tdlib job in ci.yml, which runs on
+          # every push to main. Tag runs can only restore caches saved on
+          # their own ref or on the default branch (main), so matching this
+          # exactly lets a release build reuse the cache ci.yml just built
+          # on main instead of rebuilding TDLib from scratch every tag.
+          path: |
+            /tmp/tdlib-install
+            /tmp/tdbuild-prefix
+          key: tdlib-${{ env.TDLIB_COMMIT }}-${{ hashFiles('.github/workflows/ci.yml') }}
       - name: Build TDLib
         if: steps.tdcache.outputs.cache-hit != 'true'
         run: |
