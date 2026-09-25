@@ -36,12 +36,15 @@ jobs:
           sudo apt-get update -qq && sudo apt-get install -y -qq g++-mingw-w64-x86-64 gperf php-cli cmake ninja-build
       - name: Restore TDLib
         id: tdcache
+        # Telegram is off for now (not in use); flip back to re-enable.
+        if: false
         uses: actions/cache@v4
         with:
           path: /tmp/tdlib-install
           key: tdlib-${{ env.TDLIB_COMMIT }}-v2
       - name: Build TDLib
-        if: steps.tdcache.outputs.cache-hit != 'true'
+        # Telegram is off for now (not in use); flip back to re-enable.
+        if: false
         run: |
           P=/tmp/tdbuild-prefix
           mkdir -p "$P" /tmp/tdlib-install
@@ -85,11 +88,11 @@ jobs:
         env:
           TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
           TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
-        # Telegram support always ships. The api keys are optional baked
+        # Telegram is switched off for now (no -Dtdlib). The api keys are optional baked
         # defaults; without them the app asks for keys in the Add Telegram
         # flow, so the build must succeed with or without the secrets.
         run: |
-          args=(-Dtarget=x86_64-windows-gnu --release=small -Dversion="${GITHUB_REF_NAME#v}" -Dtdlib=/tmp/tdlib-install)
+          args=(-Dtarget=x86_64-windows-gnu --release=small -Dversion="${GITHUB_REF_NAME#v}")  # add -Dtdlib=/tmp/tdlib-install to re-enable Telegram
           if [ -n "$TELEGRAM_API_ID" ] && [ -n "$TELEGRAM_API_HASH" ]; then
             args+=(-Dtelegram-api-id="$TELEGRAM_API_ID" -Dtelegram-api-hash="$TELEGRAM_API_HASH")
           fi
@@ -151,6 +154,8 @@ jobs:
           if (-not (Test-Path "$env:LOCALAPPDATA\Programs\Messages\IBMPlexSans-Regular.ttf")) { throw "missing bundled font" }
           if (-not (Test-Path $lnk)) { throw "missing Start menu shortcut $lnk" }
       - name: Headless Telegram smoke
+        # Telegram is off for now (not in use); flip back to re-enable.
+        if: false
         shell: pwsh
         run: |
           # --tdlib-smoke starts TDLib, waits for the first authorization
