@@ -1760,7 +1760,10 @@ fn applyChats(a: *App, raw: []const u8) bool {
         a.chats[a.chat_count] = chat;
         a.chat_count += 1;
     }
-    if (!a.show_archived) appendTelegramChats(a, query_utf8);
+    if (!a.show_archived) {
+        appendTelegramChats(a, query_utf8);
+        appendSlackChats(a, query_utf8);
+    }
     var i: usize = 1;
     while (i < a.chat_count) : (i += 1) {
         var j = i;
@@ -2981,6 +2984,48 @@ fn selectedChatIsSlack(a: *App) bool {
     return a.chats[a.selected_chat].provider == .slack;
 }
 
+/// Raise a Slack chat's recency to `seconds` if that is newer. Timestamps use
+/// the same "YYYY-MM-DD HH:MM:SS" UTC form as Telegram, which sorts with the
+/// wacli `last_message_ts` strings, so Slack interleaves with WhatsApp.
+fn raiseSlackTimestamp(chat: *Chat, seconds: i64) bool {
+    if (seconds <= 0) return false;
+    var buffer: [20]u8 = undefined;
+    const text = tj.formatTimestamp(&buffer, seconds);
+    if (text.len == 0 or std.mem.order(u8, text, chat.timestamp.slice()) != .gt) return false;
+    chat.timestamp.set(text);
+    return true;
+}
+
+/// A newer message in `channel`: bump the cached Slack chat and the row in
+/// the visible list. The open chat's displayed_timestamp follows along so the
+/// bump alone does not trigger a history reload.
+fn noteSlackActivity(a: *App, channel: []const u8, seconds: i64) void {
+    if (slackChatById(a, channel)) |cached| _ = raiseSlackTimestamp(cached, seconds);
+    for (a.chats[0..a.chat_count]) |*chat| {
+        if (chat.provider != .slack or !std.mem.eql(u8, chat.jid.slice(), channel)) continue;
+        const was_displayed = std.mem.eql(u8, a.displayed_jid.slice(), channel) and
+            std.mem.eql(u8, a.displayed_timestamp.slice(), chat.timestamp.slice());
+        if (raiseSlackTimestamp(chat, seconds) and was_displayed) a.displayed_timestamp.set(chat.timestamp.slice());
+        break;
+    }
+}
+
+/// Merge the cached Slack workspace into the visible chat list (WhatsApp +
+/// Telegram); applyChats sorts everything by recency afterwards.
+fn appendSlackChats(a: *App, query_utf8: ?[]const u8) void {
+    if (!slackConfigured(a)) return;
+    for (a.slack_chats[0..a.slack_chat_count]) |cached| {
+        if (a.chat_count >= max_chats) break;
+        if (query_utf8) |query| {
+            const name_bytes = std.unicode.utf16LeToUtf8Alloc(a.allocator, cached.name.slice()) catch continue;
+            defer a.allocator.free(name_bytes);
+            if (!containsIgnoreCase(name_bytes, query) and !containsIgnoreCase(cached.jid.slice(), query)) continue;
+        }
+        a.chats[a.chat_count] = cached;
+        a.chat_count += 1;
+    }
+}
+
 /// Move the accumulated Slack workspace page into a.slack_chats / a.slack_users.
 fn applySlackWorkspace(a: *App, raw: []const u8) void {
     var parsed = std.json.parseFromSlice(std.json.Value, a.allocator, raw, .{}) catch return;
@@ -3013,13 +3058,16 @@ fn applySlackWorkspace(a: *App, raw: []const u8) void {
         const shown = if (hash_prefix) std.fmt.allocPrint(a.allocator, "#{s}", .{name}) catch a.allocator.dupe(u8, name) catch continue else a.allocator.dupe(u8, name) catch continue;
         defer a.allocator.free(shown);
         // Upsert: a later page or refresh must not duplicate a channel.
+        const seconds = slack.conversationSeconds(object);
         if (slackChatById(a, id)) |existing| {
             existing.name.set(a.allocator, shown);
+            // Never lower: a live event or history poll may know a newer one.
+            _ = raiseSlackTimestamp(existing, seconds);
             continue;
         }
         chat.name.set(a.allocator, shown);
         chat.kind.set(a.allocator, if (is_im) "Slack DM" else "Slack channel");
-        chat.timestamp.set("");
+        _ = raiseSlackTimestamp(&chat, seconds);
         if (a.slack_chat_count >= a.slack_chats.len) break;
         a.slack_chats[a.slack_chat_count] = chat;
         a.slack_chat_count += 1;
@@ -3212,9 +3260,11 @@ fn applySlackHistory(a: *App, raw: []const u8) void {
     var reply_parent_count: usize = 0;
     var item_index: usize = list.items.len;
     var count: usize = 0;
+    var newest_seconds: i64 = 0;
     while (item_index > 0 and count < max_messages) {
         item_index -= 1;
         const item = slack.readHistoryItem(list.items[item_index]) orelse continue;
+        newest_seconds = @max(newest_seconds, slack.tsSeconds(item.ts) orelse 0);
         const message = buildSlackMessage(a, item);
         a.messages[a.message_count] = message;
         a.message_count += 1;
@@ -3240,6 +3290,8 @@ fn applySlackHistory(a: *App, raw: []const u8) void {
             }
         }
     }
+    // A polled message newer than the listing moves the chat up the list.
+    noteSlackActivity(a, chat.jid.slice(), newest_seconds);
     a.displayed_jid.set(chat.jid.slice());
     a.displayed_timestamp.set(chat.timestamp.slice());
     // Threads shown inline: fetch each parent's replies once.
@@ -3757,8 +3809,8 @@ fn applySlackEvent(a: *App, event: *slack_win.Event) void {
         std.mem.eql(u8, a.chats[a.selected_chat].jid.slice(), channel) and
         a.chats[a.selected_chat].provider == .slack;
     const from_me = a.slack_user_id.len > 0 and std.mem.eql(u8, event.userSlice(), a.slack_user_id.slice());
+    noteSlackActivity(a, channel, slack.tsSeconds(event.tsSlice()) orelse 0);
     if (slackChatById(a, channel)) |chat| {
-        chat.timestamp.set(event.tsSlice());
         if (!from_me and !is_open) {
             chat.unread = true;
             chat.unread_count += 1;
@@ -4061,6 +4113,11 @@ fn markChatRead(a: *App) void {
         // conversations.mark via the socket-connected app token.
         chat.unread = false;
         chat.unread_count = 0;
+        // The list is rebuilt from the cache on every reload: clear it there too.
+        if (slackChatById(a, chat.jid.slice())) |cached| {
+            cached.unread = false;
+            cached.unread_count = 0;
+        }
         if (a.chats_hwnd) |list| _ = win.InvalidateRect(list, null, win.TRUE);
         return;
     }

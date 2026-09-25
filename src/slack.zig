@@ -156,6 +156,41 @@ pub fn objectStringField(object: std.json.ObjectMap, key: []const u8) []const u8
     return objectString(object, key) orelse "";
 }
 
+/// Whole unix seconds of a Slack ts ("1740000000.000123"), or null when the
+/// value is empty, malformed or out of range.
+pub fn tsSeconds(ts: []const u8) ?i64 {
+    const dot = std.mem.indexOfScalar(u8, ts, '.') orelse ts.len;
+    const seconds = std.fmt.parseInt(i64, ts[0..dot], 10) catch return null;
+    if (seconds <= 0 or seconds > 100_000_000_000) return null;
+    return seconds;
+}
+
+fn numberField(object: std.json.ObjectMap, key: []const u8) ?i64 {
+    return switch (object.get(key) orelse return null) {
+        .integer => |value| value,
+        .float => |value| if (value >= 0 and value < 1e15) @intFromFloat(value) else null,
+        .number_string, .string => |text| std.fmt.parseInt(i64, text, 10) catch null,
+        else => null,
+    };
+}
+
+/// Best recency for a conversations.list entry, in unix seconds: the newest
+/// message (`latest.ts`) when the listing carries it, else `updated` (ms),
+/// else `created` (seconds). 0 when none is usable.
+pub fn conversationSeconds(object: std.json.ObjectMap) i64 {
+    if (object.get("latest")) |latest| switch (latest) {
+        .object => |latest_object| if (tsSeconds(objectStringField(latest_object, "ts"))) |seconds| return seconds,
+        else => {},
+    };
+    if (numberField(object, "updated")) |updated| {
+        // Slack sends `updated` in milliseconds; tolerate a seconds value.
+        const seconds = if (updated > 100_000_000_000) @divTrunc(updated, 1000) else updated;
+        if (seconds > 0) return seconds;
+    }
+    if (numberField(object, "created")) |created| if (created > 0) return created;
+    return 0;
+}
+
 /// One conversations.history item (already filtered to real messages).
 pub const HistoryItem = struct {
     ts: []const u8 = "",
@@ -686,4 +721,25 @@ test "bridgeFilePath percent-encodes the original url" {
     const path = try bridgeFilePath(allocator, "https://files.slack.com/x?y=1");
     defer allocator.free(path);
     try std.testing.expectEqualStrings("/file?url=https%3A%2F%2Ffiles.slack.com%2Fx%3Fy%3D1", path);
+}
+
+test "conversationSeconds prefers latest.ts, then updated ms, then created" {
+    const cases = [_]struct { json: []const u8, want: i64 }{
+        .{ .json = "{\"latest\":{\"ts\":\"1740000500.000100\"},\"updated\":1740000000123,\"created\":1600000000}", .want = 1740000500 },
+        .{ .json = "{\"updated\":1740000000123,\"created\":1600000000}", .want = 1740000000 },
+        .{ .json = "{\"latest\":null,\"created\":1600000000}", .want = 1600000000 },
+        .{ .json = "{\"updated\":1740000000}", .want = 1740000000 },
+        .{ .json = "{\"id\":\"D1\"}", .want = 0 },
+    };
+    for (cases) |case| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, case.json, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(case.want, conversationSeconds(parsed.value.object));
+    }
+}
+
+test "tsSeconds rejects empty and malformed ts" {
+    try std.testing.expectEqual(@as(?i64, 1740000000), tsSeconds("1740000000.000123"));
+    try std.testing.expectEqual(@as(?i64, null), tsSeconds(""));
+    try std.testing.expectEqual(@as(?i64, null), tsSeconds("abc.1"));
 }
