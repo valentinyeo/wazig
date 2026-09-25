@@ -396,7 +396,7 @@ pub fn downloadTo(allocator: std.mem.Allocator, token: []const u8, url: []const 
         connect_host = bh;
         connect_path = rewritten;
     } else {
-        if (!std.mem.endsWith(u8, host, "slack.com")) return error.UntrustedUrl;
+        if (!slack.isSlackFileHost(host)) return error.UntrustedUrl;
         const scheme_end = std.mem.indexOf(u8, url, "://").?;
         const host_start = scheme_end + 3;
         const path_start = std.mem.indexOfScalarPos(u8, url, host_start, '/') orelse return error.UntrustedUrl;
