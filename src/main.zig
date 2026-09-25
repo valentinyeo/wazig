@@ -36,10 +36,22 @@ const max_groups = 1024;
 const max_messages = 100;
 const max_pending_sends = 32;
 const max_pending_reads = 8;
-// A send that fails is retried instead of dropped: at most 3 retries, each
-// started 5s after the previous result so a transient store-lock loss clears.
-const max_send_retries: u8 = 3;
-const send_retry_delay_ms: u64 = 5_000;
+// A send that fails is retried instead of dropped: any failure (nonzero
+// exit, timeout, or a lost store lock) retries up to 3 times, backing off
+// longer each time so a transient problem (lock contention, a slow phone)
+// has room to clear.
+const max_send_retries: u8 = 4;
+
+/// Backoff before retry number `retries` (1st, 2nd, 3rd); null once
+/// max_send_retries is exhausted and the send gives up for good.
+fn sendRetryDelayMs(retries: u8) ?u64 {
+    return switch (retries) {
+        1 => 3_000,
+        2 => 10_000,
+        3 => 30_000,
+        else => null,
+    };
+}
 // One profile-picture fetch per sync pause, spaced so a long chat list does
 // not keep live sync off for minutes.
 const avatar_request_spacing_ms: u64 = 20_000;
@@ -144,6 +156,7 @@ const command_update_check = 2052;
 const command_update_install = 2053;
 const command_emoji_diag = 2054;
 const command_open_image_external = 2055;
+const command_resend = 2056;
 const reaction_like = 3001;
 const reaction_love = 3002;
 const reaction_laugh = 3003;
@@ -260,6 +273,10 @@ const PendingSend = struct {
     retries: u8 = 0,
     not_before_ms: u64 = 0,
     queued_unix: i64 = 0,
+    // True when the last attempt's failure (a timeout, or a nonzero exit
+    // that wasn't a store lock) leaves it unclear whether wacli actually
+    // delivered the message. Gates the pre-retry duplicate check.
+    ambiguous: bool = false,
 };
 
 // A permanently failed send kept for the next reload: the composer got the
@@ -3311,6 +3328,20 @@ fn localSendId(buffer: []u8, seq: u64) []const u8 {
     return std.fmt.bufPrint(buffer, "local-{d}", .{seq}) catch "local";
 }
 
+// The placeholder text a file send's bubble shows instead of its caption;
+// also used to recognize (and refuse to auto-resend) a failed file send,
+// since its local paste file is deleted once the send finishes with it.
+const file_send_placeholder = "Sending file...";
+
+/// Bubble text for a queued send that has failed at least once and is
+/// waiting out its backoff: still reads as in-progress, not "not sent".
+/// Built fresh from `pending.text` each time rather than accumulated, so it
+/// never stacks across retries.
+fn retryingBubbleText(buffer: []u8, text: []const u8, retries: u8) []const u8 {
+    if (retries == 0 or text.len == 0) return text;
+    return std.fmt.bufPrint(buffer, "{s} (retrying {d}/{d})", .{ text, retries, max_send_retries - 1 }) catch text;
+}
+
 /// Optimistic bubble for a queued WhatsApp send (mirrors appendSlackPending):
 /// the message shows the moment the composer clears, and applyMessageData
 /// re-appends it after every reload until wacli stores the real message. On a
@@ -3335,9 +3366,10 @@ fn appendWhatsAppPending(a: *App, pending: *const PendingSend, from_reload: bool
     message.from_me = true;
     message.sender.set(a.allocator, "You");
     if (pending.file.len > 0 and pending.text.len == 0) {
-        message.text.set(a.allocator, "Sending file...");
+        message.text.set(a.allocator, file_send_placeholder);
     } else {
-        message.text.set(a.allocator, pending.text.slice());
+        var retry_buffer: [4095]u8 = undefined;
+        message.text.set(a.allocator, retryingBubbleText(&retry_buffer, pending.text.slice(), pending.retries));
     }
     var id_buffer: [32]u8 = undefined;
     message.id.set(localSendId(&id_buffer, pending.seq));
@@ -3362,13 +3394,33 @@ fn markPendingSendFailed(a: *App, pending: *const PendingSend) void {
         if (!message.from_me or message.send_state != .pending or
             !std.mem.eql(u8, message.id.slice(), id)) continue;
         message.send_state = .failed;
-        const old = std.unicode.utf16LeToUtf8Alloc(a.allocator, message.text.slice()) catch return;
-        defer a.allocator.free(old);
+        // Built from pending.text (the canonical, unmarked text), not the
+        // displayed bubble: a retried send's bubble carries a "(retrying
+        // N/3)" label that must not end up stacked onto "(not sent)".
+        const old = pending.text.slice();
         if (old.len + " (not sent)".len < 4095) {
             const marked = std.fmt.allocPrint(a.allocator, "{s} (not sent)", .{old}) catch return;
             defer a.allocator.free(marked);
             message.text.set(a.allocator, marked);
+        } else {
+            message.text.set(a.allocator, old);
         }
+        if (a.canvas) |canvas| _ = win.InvalidateRect(canvas, null, win.TRUE);
+        return;
+    }
+}
+
+/// Update a queued send's bubble to show it's about to retry, not that it
+/// failed for good. File sends keep their "Sending file..." placeholder.
+fn markPendingSendRetrying(a: *App, pending: *const PendingSend) void {
+    if (pending.text.len == 0) return;
+    var id_buffer: [32]u8 = undefined;
+    const id = localSendId(&id_buffer, pending.seq);
+    for (a.messages[0..a.message_count]) |*message| {
+        if (!message.from_me or message.send_state != .pending or
+            !std.mem.eql(u8, message.id.slice(), id)) continue;
+        var retry_buffer: [4095]u8 = undefined;
+        message.text.set(a.allocator, retryingBubbleText(&retry_buffer, pending.text.slice(), pending.retries));
         if (a.canvas) |canvas| _ = win.InvalidateRect(canvas, null, win.TRUE);
         return;
     }
@@ -3483,6 +3535,65 @@ fn restoreFailedSendText(a: *App, failed: *const PendingSend) void {
     _ = win.SetWindowTextW(compose, &wide_buffer);
     layout(a, a.compose_client_width, a.compose_client_height);
     focusCompose(a);
+}
+
+/// Manual resend of a permanently failed bubble: requeues its text with a
+/// fresh retry counter. Reachable by clicking the failed bubble, selecting it
+/// and pressing Enter/R, or the "Resend failed message" palette command. A
+/// failed file send can't be resent this way: its paste file is deleted once
+/// the send finishes with it (removeFirstPendingSend), so only the caption
+/// would go out.
+fn resendFailedMessage(a: *App, index: usize) void {
+    if (index >= a.message_count) return;
+    const message = &a.messages[index];
+    if (!message.from_me or message.send_state != .failed) return;
+    if (a.chat_count == 0 or a.selected_chat >= a.chat_count) return;
+    if (a.pending_send_count >= max_pending_sends) {
+        setStatus(a, "Send queue is full");
+        return;
+    }
+    const bubble_text = std.unicode.utf16LeToUtf8Alloc(a.allocator, message.text.slice()) catch return;
+    defer a.allocator.free(bubble_text);
+    if (std.mem.startsWith(u8, bubble_text, file_send_placeholder)) {
+        setStatus(a, "Can't resend a file automatically - attach it again");
+        return;
+    }
+    const suffix = " (not sent)";
+    const original = if (std.mem.endsWith(u8, bubble_text, suffix)) bubble_text[0 .. bubble_text.len - suffix.len] else bubble_text;
+    if (original.len == 0) {
+        setStatus(a, "Nothing to resend");
+        return;
+    }
+    const jid = a.chats[a.selected_chat].jid.slice();
+    forgetFailedSend(a, jid, original);
+    const pending = &a.pending_sends[a.pending_send_count];
+    pending.* = .{};
+    pending.jid.set(jid);
+    pending.text.set(original);
+    a.send_seq += 1;
+    pending.seq = a.send_seq;
+    pending.queued_unix = nowUnixSeconds();
+    a.pending_send_count += 1;
+    message.send_state = .pending;
+    message.text.set(a.allocator, original);
+    var id_buffer: [32]u8 = undefined;
+    message.id.set(localSendId(&id_buffer, pending.seq));
+    // A failed send may have copied its text back into the composer
+    // (restoreFailedSendText); clear it so resending doesn't leave a
+    // duplicate ready to send again.
+    if (a.compose) |compose| {
+        var wide_buffer: [4096]u16 = undefined;
+        const length: usize = @intCast(win.GetWindowTextW(compose, &wide_buffer, wide_buffer.len));
+        if (length > 0) {
+            if (std.unicode.utf16LeToUtf8Alloc(a.allocator, wide_buffer[0..length])) |compose_text| {
+                defer a.allocator.free(compose_text);
+                if (std.mem.eql(u8, compose_text, original)) _ = win.SetWindowTextW(compose, lit(""));
+            } else |_| {}
+        }
+    }
+    setStatus(a, "Resending...");
+    if (a.canvas) |canvas| _ = win.InvalidateRect(canvas, null, win.TRUE);
+    startNextSend(a);
 }
 
 /// Pending bubble carrying this client_msg_id, if still displayed.
@@ -6975,22 +7086,27 @@ fn removeFirstPendingSend(a: *App) void {
     a.pending_sends[a.pending_send_count] = .{};
 }
 
-/// Record a failed attempt for the head send. Only a spawn failure or a lost
-/// store lock may be retried (`retryable`); any other nonzero exit means the
-/// message may already have been delivered, so it fails immediately. After
-/// max_send_retries, mark its bubble failed, drop it, and hand the text back
-/// to the composer. The send is never silently lost.
-fn failHeadPendingSend(a: *App, code: u32, retryable: bool) void {
+/// Record a failed attempt for the head send. Every failure (a nonzero exit,
+/// a timeout, or a lost store lock) is retried, up to max_send_retries, with
+/// a longer backoff each time (see sendRetryDelayMs). `ambiguous` marks a
+/// failure that doesn't rule out the message having gone out anyway (a
+/// timeout, or any nonzero exit that wasn't a store lock); startNextSend
+/// checks for a duplicate before spawning that retry. After max_send_retries,
+/// mark its bubble failed, drop it, and hand the text back to the composer.
+/// The send is never silently lost.
+fn failHeadPendingSend(a: *App, code: u32, ambiguous: bool, detail: []const u8) void {
     a.pending_sends[0].retries += 1;
+    a.pending_sends[0].ambiguous = ambiguous;
     const retries = a.pending_sends[0].retries;
-    var log_buffer: [80]u8 = undefined;
-    const event = std.fmt.bufPrint(&log_buffer, "send: failed exit {d} retry {d}", .{ code, retries }) catch "send: failed";
+    var log_buffer: [320]u8 = undefined;
+    const event = std.fmt.bufPrint(&log_buffer, "send: failed exit {d} retry {d}: {s}", .{ code, retries, detail }) catch "send: failed";
     appendLaunchLog(a, event);
-    if (retryable and retries < max_send_retries) {
-        a.pending_sends[0].not_before_ms = win.GetTickCount64() + send_retry_delay_ms;
+    if (sendRetryDelayMs(retries)) |delay_ms| {
+        a.pending_sends[0].not_before_ms = win.GetTickCount64() + delay_ms;
         var retry_buffer: [80]u8 = undefined;
-        const status = std.fmt.bufPrint(&retry_buffer, "Send failed, retrying ({d}/{d})", .{ retries, max_send_retries }) catch "Send failed, retrying";
+        const status = std.fmt.bufPrint(&retry_buffer, "Sending, retry {d} of {d}", .{ retries, max_send_retries - 1 }) catch "Sending, retrying";
         setStatus(a, status);
+        markPendingSendRetrying(a, &a.pending_sends[0]);
         // A direct send had paused live sync; let it run during the backoff.
         startSync(a);
         return;
@@ -7024,6 +7140,47 @@ fn sendReadyPending(a: *const App) bool {
 
 const send_output_max_bytes = 64 * 1024;
 
+/// One line of a send child's stdout/stderr, trimmed to send_log_snippet_len
+/// bytes at a UTF-8 boundary, for the launch log: the next failure's cause
+/// should be visible without dumping the whole (possibly multi-line) output.
+const send_log_snippet_len = 200;
+fn oneLineSnippet(buffer: []u8, text: []const u8) []const u8 {
+    var length: usize = 0;
+    for (text) |byte| {
+        if (length >= buffer.len) break;
+        buffer[length] = if (byte == '\n' or byte == '\r') ' ' else byte;
+        length += 1;
+    }
+    while (length > 0 and (buffer[length - 1] & 0xC0) == 0x80) length -= 1;
+    return std.mem.trim(u8, buffer[0..length], " ");
+}
+
+/// True when a stored timestamp is compatible with having been recorded no
+/// earlier than `queued_unix`, allowing the same 5s clock-skew slack
+/// appendWhatsAppPending and pruneFailedSends use.
+fn storedAfterQueued(stored_unix: i64, queued_unix: i64) bool {
+    return stored_unix >= queued_unix - 5;
+}
+
+/// A timeout or an ambiguous nonzero exit may still have delivered the
+/// message; before retrying, check whether it already shows up as a recent
+/// outgoing message in the open chat, the same way a reload recognizes a
+/// pending send that already landed (appendWhatsAppPending, pruneFailedSends).
+/// Only the currently open chat has messages loaded to check against.
+fn sentMessageExists(a: *App, jid: []const u8, text: []const u8, queued_unix: i64) bool {
+    if (a.chat_count == 0 or a.selected_chat >= a.chat_count) return false;
+    if (!std.mem.eql(u8, a.chats[a.selected_chat].jid.slice(), jid)) return false;
+    for (a.messages[0..a.message_count]) |*message| {
+        if (!message.from_me or message.send_state != .none) continue;
+        const stored = std.unicode.utf16LeToUtf8Alloc(a.allocator, message.text.slice()) catch continue;
+        defer a.allocator.free(stored);
+        if (!std.mem.eql(u8, stored, text)) continue;
+        const stored_unix = media_age.unixSeconds(message.timestamp.slice()) orelse continue;
+        if (storedAfterQueued(stored_unix, queued_unix)) return true;
+    }
+    return false;
+}
+
 /// Read one finished send child pipe: wacli --json prints its result on
 /// stdout and lock errors on stderr. Must run before child.wait, which closes
 /// the pipes; the child has exited, so reading to EOF cannot block. Mirrors
@@ -7045,6 +7202,25 @@ fn startNextSend(a: *App) void {
     // A failed send waits out its not-before stamp; checkSend retries it on
     // the next refresh tick.
     if (win.GetTickCount64() < a.pending_sends[0].not_before_ms) return;
+    // A retry after an ambiguous failure (timeout, or a nonzero exit that
+    // wasn't a store lock) might be sending a message a second time: if the
+    // open chat already shows it as delivered, count it sent instead.
+    if (a.pending_sends[0].retries > 0 and a.pending_sends[0].ambiguous and
+        sentMessageExists(a, a.pending_sends[0].jid.slice(), a.pending_sends[0].text.slice(), a.pending_sends[0].queued_unix))
+    {
+        appendLaunchLog(a, "send: matched an already-delivered message, not resending");
+        removeFirstPendingSend(a);
+        if (a.pending_send_count > 0) {
+            startNextSend(a);
+        } else {
+            drainMediaDownloads(a);
+            startSync(a);
+            refreshChats(a);
+            refreshMessages(a);
+            setStatus(a, "Sent");
+        }
+        return;
+    }
     const pending = &a.pending_sends[0];
     const is_file = pending.file.len > 0;
     var args: [18][]const u8 = undefined;
@@ -7089,7 +7265,7 @@ fn startNextSend(a: *App) void {
         .stderr = .pipe,
         .create_no_window = true,
     }) catch {
-        failHeadPendingSend(a, 1, true);
+        failHeadPendingSend(a, 1, false, "spawn failed");
         return;
     };
     a.send_child = child;
@@ -7114,9 +7290,7 @@ fn checkSend(a: *App) void {
             timed_out = true;
         }
         // Read stdout and stderr before wait closes the pipes: wacli --json
-        // prints its result on stdout but a lost store lock on stderr, and
-        // only a lost store lock is retryable. Any other nonzero exit could
-        // still have delivered the message.
+        // prints its result on stdout but a lost store lock on stderr.
         const stdout_output = readChildOutput(a, child.stdout);
         defer if (stdout_output) |buffer| a.allocator.free(buffer);
         const stderr_output = readChildOutput(a, child.stderr);
@@ -7139,11 +7313,21 @@ fn checkSend(a: *App) void {
             }
             return;
         }
-        const retryable = !timed_out and
-            (outputHasStoreLock(stdout_output) or outputHasStoreLock(stderr_output));
-        // A store-lock failure stays queued and is retried, up to
-        // max_send_retries, with the next attempt spaced out.
-        failHeadPendingSend(a, code, retryable);
+        const has_lock = outputHasStoreLock(stdout_output) or outputHasStoreLock(stderr_output);
+        // A store-lock failure never left the machine, so it isn't ambiguous.
+        // A timeout, or any other nonzero exit, might have delivered anyway.
+        const ambiguous = timed_out or !has_lock;
+        var snippet_buffer: [send_log_snippet_len]u8 = undefined;
+        const source = if (stderr_output != null and stderr_output.?.len > 0) stderr_output else stdout_output;
+        const detail = if (timed_out)
+            "timed out"
+        else if (source) |text|
+            oneLineSnippet(&snippet_buffer, text)
+        else
+            "no output";
+        // Every failure (lock, timeout, or otherwise) stays queued and is
+        // retried, up to max_send_retries, with the next attempt spaced out.
+        failHeadPendingSend(a, code, ambiguous, detail);
         return;
     }
     if (a.pending_send_count == 0) return;
@@ -7880,6 +8064,13 @@ fn handleCanvasClick(a: *App, hwnd: win.HWND, x: i32, y: i32) void {
     for (a.messages[0..a.message_count], 0..) |*item, index| {
         const media = item.media_hit;
         const bubble = item.bubble_hit;
+        // A failed bubble resends on a plain click rather than selecting
+        // text or media inside it: there's nothing else useful to click.
+        if (item.send_state == .failed and x >= bubble.left and x <= bubble.right and y >= bubble.top and y <= bubble.bottom) {
+            resendFailedMessage(a, index);
+            _ = win.InvalidateRect(hwnd, null, win.TRUE);
+            return;
+        }
         if (x >= media.left and x <= media.right and y >= media.top and y <= media.bottom) {
             a.selected_message = index;
             if (item.local_path.len == 0) {
@@ -8554,6 +8745,7 @@ fn buildPaletteItems(a: *App) void {
     appendPalette(a, if (a.show_archived) "Show inbox chats" else "Show archived chats", "", command_archived);
     appendPalette(a, if (a.show_archived) "Unarchive selected chat" else "Archive selected chat", "Ctrl+E", command_archive);
     appendPalette(a, "Reply to selected message", "Ctrl+Shift+R", command_reply);
+    appendPalette(a, "Resend failed message", "", command_resend);
     appendPalette(a, "React to selected message", "Ctrl+R", command_react_menu);
     appendPalette(a, "Copy message text", "Ctrl+C", command_copy_text);
     appendPalette(a, "Copy message link", "", command_copy_link);
@@ -9187,6 +9379,17 @@ fn runCommand(a: *App, command: u16) void {
         command_archive => archiveSelectedChat(a),
         command_pin => togglePinSelected(a),
         command_reply => startReply(a),
+        command_resend => {
+            const selected = a.selected_message orelse {
+                setStatus(a, "Select a failed message first");
+                return;
+            };
+            if (selected >= a.message_count or a.messages[selected].send_state != .failed) {
+                setStatus(a, "Select a failed message first");
+                return;
+            }
+            resendFailedMessage(a, selected);
+        },
         command_archived => {
             a.show_archived = !a.show_archived;
             refreshChats(a);
@@ -11759,6 +11962,20 @@ fn handleKeyboard(a: *App, message: *const win.MSG) bool {
         }
         return false;
     }
+    // Enter or R resends the selected failed message, unless the composer
+    // is focused with text in it (then they type/send as usual).
+    if (!control and !alt and (key == win.VK_RETURN or key == 'R')) {
+        if (a.selected_message) |selected| {
+            if (selected < a.message_count and a.messages[selected].from_me and a.messages[selected].send_state == .failed) {
+                const compose_focused = if (a.compose) |compose| win.GetFocus() == compose else false;
+                const compose_empty = if (a.compose) |compose| win.GetWindowTextLengthW(compose) == 0 else true;
+                if (!compose_focused or compose_empty) {
+                    resendFailedMessage(a, selected);
+                    return true;
+                }
+            }
+        }
+    }
     if (key == win.VK_ESCAPE) {
         const focused = win.GetFocus();
         if (focused != null) {
@@ -13426,6 +13643,37 @@ test "a read that exhausts its retries backs off and restarts the counter" {
     try std.testing.expectEqual(@as(u8, 1), nextReadRetry(0));
     try std.testing.expectEqual(@as(u8, 2), nextReadRetry(1));
     try std.testing.expectEqual(@as(u8, 0), nextReadRetry(2));
+}
+
+test "a send retries 3 times with a longer backoff each time, then gives up" {
+    try std.testing.expectEqual(@as(?u64, 3_000), sendRetryDelayMs(1));
+    try std.testing.expectEqual(@as(?u64, 10_000), sendRetryDelayMs(2));
+    try std.testing.expectEqual(@as(?u64, 30_000), sendRetryDelayMs(3));
+    try std.testing.expectEqual(@as(?u64, null), sendRetryDelayMs(4));
+}
+
+test "a stored message only counts as delivering a queued send at or after it was queued" {
+    // The 5s slack absorbs clock skew between the queue time and wacli's
+    // stored timestamp; anything older is a coincidence, not this send.
+    try std.testing.expect(storedAfterQueued(100, 100));
+    try std.testing.expect(storedAfterQueued(96, 100));
+    try std.testing.expect(!storedAfterQueued(94, 100));
+}
+
+test "a retry bubble shows a fresh retry count instead of stacking suffixes" {
+    var buffer: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("hi", retryingBubbleText(&buffer, "hi", 0));
+    try std.testing.expectEqualStrings("hi (retrying 1/3)", retryingBubbleText(&buffer, "hi", 1));
+    try std.testing.expectEqualStrings("hi (retrying 2/3)", retryingBubbleText(&buffer, "hi", 2));
+}
+
+test "a send-failure snippet collapses newlines and stays on one UTF-8 boundary" {
+    var buffer: [send_log_snippet_len]u8 = undefined;
+    try std.testing.expectEqualStrings("line one line two", oneLineSnippet(&buffer, "line one\nline two"));
+    var small_buffer: [4]u8 = undefined;
+    // "café" is c-a-f-é where é is 2 bytes (0xC3 0xA9); cutting after 4 bytes
+    // lands mid-character, so the trim must drop the truncated byte.
+    try std.testing.expectEqualStrings("caf", oneLineSnippet(small_buffer[0..4], "café"));
 }
 
 test "sender name shows only at the start of a same-sender run" {
