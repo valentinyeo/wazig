@@ -32,6 +32,11 @@ pub const Tokens = struct {
     app: []u8,
 };
 
+pub const Bridge = struct {
+    host: []u8,
+    key: []u8,
+};
+
 pub const max_download_bytes: u64 = 100 * 1024 * 1024;
 
 pub fn isUserToken(token: []const u8) bool {
@@ -83,6 +88,16 @@ fn regSetBinary(name: [*:0]const u16, blob: []const u8) bool {
     return win.RegSetValueExW(key, name, 0, win.REG_BINARY, @ptrCast(@constCast(blob.ptr)), @intCast(blob.len)) == win.ERROR_SUCCESS;
 }
 
+fn regSetString(name: [*:0]const u16, text: []const u8) bool {
+    const wide = std.unicode.utf8ToUtf16LeAllocZ(std.heap.page_allocator, text) catch return false;
+    defer std.heap.page_allocator.free(wide);
+    var key: win.HKEY = null;
+    if (win.RegCreateKeyExW(winHandleHkey(0x80000001), wideLiteral("Software\\Messages"), 0, null, 0, win.KEY_SET_VALUE, null, &key, null) != win.ERROR_SUCCESS) return false;
+    defer _ = win.RegCloseKey(key);
+    const bytes: win.DWORD = @intCast((wide.len + 1) * 2);
+    return win.RegSetValueExW(key, name, 0, win.REG_SZ, @ptrCast(@constCast(wide.ptr)), bytes) == win.ERROR_SUCCESS;
+}
+
 fn regGetBinary(allocator: std.mem.Allocator, name: [*:0]const u16) ?[]u8 {
     var size: win.DWORD = 0;
     if (win.RegGetValueW(winHandleHkey(0x80000001), wideLiteral("Software\\Messages"), name, win.RRF_RT_REG_BINARY, null, null, &size) != win.ERROR_SUCCESS or size == 0 or size > 64 * 1024) return null;
@@ -94,6 +109,20 @@ fn regGetBinary(allocator: std.mem.Allocator, name: [*:0]const u16) ?[]u8 {
     }
     const shrunk = allocator.realloc(blob, real_size) catch return blob[0..real_size];
     return shrunk;
+}
+
+fn regGetString(allocator: std.mem.Allocator, name: [*:0]const u16) ?[]u8 {
+    var size: win.DWORD = 0;
+    if (win.RegGetValueW(winHandleHkey(0x80000001), wideLiteral("Software\\Messages"), name, win.RRF_RT_REG_SZ, null, null, &size) != win.ERROR_SUCCESS or size == 0 or size > 64 * 1024) return null;
+    const wide = allocator.alloc(u16, (size + 1) / 2) catch return null;
+    defer allocator.free(wide);
+    var real_size = size;
+    if (win.RegGetValueW(winHandleHkey(0x80000001), wideLiteral("Software\\Messages"), name, win.RRF_RT_REG_SZ, null, wide.ptr, &real_size) != win.ERROR_SUCCESS) return null;
+    var text = std.unicode.utf16LeToUtf8Alloc(allocator, wide[0 .. real_size / 2]) catch return null;
+    if (text.len > 0 and text[text.len - 1] == 0) {
+        text = allocator.realloc(text, text.len - 1) catch text[0 .. text.len - 1];
+    }
+    return text;
 }
 
 fn regDelete(name: [*:0]const u16) void {
@@ -138,6 +167,44 @@ pub fn loadTokens(allocator: std.mem.Allocator) ?Tokens {
         return null;
     }
     return .{ .user = user, .app = app };
+}
+
+/// BridgeHost and BridgeKey are set from PowerShell using
+/// System.Security.Cryptography.ProtectedData with CurrentUser scope and null
+/// entropy, matching this file's protect(). That is how a user with no Slack
+/// app tokens (xoxp/xapp) points Messages at a bridge server instead; the
+/// exact snippet lives in the PR description.
+pub fn saveBridge(host: []const u8, key: []const u8) bool {
+    if (!slack.isValidBridgeHost(host) or !slack.isValidBridgeKey(key)) return false;
+    const allocator = std.heap.page_allocator;
+    const key_blob = protect(allocator, key) orelse return false;
+    defer allocator.free(key_blob);
+    return regSetString(wideLiteral("BridgeHost"), host) and regSetBinary(wideLiteral("BridgeKey"), key_blob);
+}
+
+pub fn clearBridge() void {
+    regDelete(wideLiteral("BridgeHost"));
+    regDelete(wideLiteral("BridgeKey"));
+}
+
+pub fn loadBridge(allocator: std.mem.Allocator) ?Bridge {
+    if (!enabled) return null;
+    const host = regGetString(allocator, wideLiteral("BridgeHost")) orelse return null;
+    const key_blob = regGetBinary(allocator, wideLiteral("BridgeKey")) orelse {
+        allocator.free(host);
+        return null;
+    };
+    defer allocator.free(key_blob);
+    const key = unprotect(allocator, key_blob) orelse {
+        allocator.free(host);
+        return null;
+    };
+    if (!slack.isValidBridgeHost(host) or !slack.isValidBridgeKey(key)) {
+        allocator.free(host);
+        allocator.free(key);
+        return null;
+    }
+    return .{ .host = host, .key = key };
 }
 
 // --- WinHTTP REST ---
