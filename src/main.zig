@@ -736,6 +736,11 @@ const App = struct {
     wacli_quit: bool = false,
     wacli_pending: [wacli_kind_count]u32 = [_]u32{0} ** wacli_kind_count,
     slack_tokens: ?slack_win.Tokens = null,
+    slack_bridge: ?slack_win.Bridge = null,
+    slack_poll_ticks: u32 = 0,
+    // Hash of the last applied bridge history answer; 0 after anything else
+    // may have repainted the message list.
+    slack_history_hash: u64 = 0,
     slack_stop: std.atomic.Value(bool) = .init(false),
     slack_connected: std.atomic.Value(bool) = .init(false),
     slack_event_pending: std.atomic.Value(usize) = .init(0),
@@ -2930,11 +2935,12 @@ fn unfurlSmoke(init: std.process.Init) u8 {
 // --- Slack provider (WAZI-55) ---
 
 fn slackConfigured(a: *App) bool {
-    return a.slack_tokens != null;
+    return a.slack_tokens != null or a.slack_bridge != null;
 }
 
 fn slackContext(a: *App) slack_win.JobContext {
-    return .{ .user_token = if (a.slack_tokens) |t| t.user else "", .media_dir = a.slack_media_dir, .io = a.io };
+    if (a.slack_bridge) |bridge| return .{ .user_token = bridge.key, .host = bridge.host, .is_bridge = true, .media_dir = a.slack_media_dir, .io = a.io };
+    return .{ .user_token = if (a.slack_tokens) |t| t.user else "", .host = "slack.com", .is_bridge = false, .media_dir = a.slack_media_dir, .io = a.io };
 }
 
 fn slackUserName(a: *App, user_id: []const u8) ?[]const u8 {
@@ -3057,11 +3063,22 @@ fn refreshSlackWorkspace(a: *App) void {
 fn refreshSlackHistory(a: *App) void {
     if (!selectedChatIsSlack(a)) return;
     const chat = &a.chats[a.selected_chat];
-    a.messages_gen += 1;
+    // Only the bridge poll calls this. The first fetch after a chat change
+    // bumps the generation so a stale wacli read cannot paint over it; later
+    // polls reuse it so replies queued by the previous apply still land.
+    if (a.slack_history_hash == 0) a.messages_gen += 1;
     var job = WacliJob{ .kind = .slack_history, .gen = a.messages_gen };
     job.jid.set(chat.jid.slice());
     wacliJobArgs(&job, &.{chat.jid.slice()});
     wacliEnqueue(a, job, true);
+}
+
+fn pollSlackBridge(a: *App) void {
+    if (a.slack_bridge == null) return;
+    if (a.hwnd) |hwnd| if (win.IsIconic(hwnd) != 0) return;
+    a.slack_poll_ticks += 1;
+    if (a.slack_poll_ticks % 5 == 0 and wacliPendingGet(a, .slack_history) == 0) refreshSlackHistory(a);
+    if (a.slack_poll_ticks % 60 == 0 and wacliPendingGet(a, .slack_workspace) == 0) refreshSlackWorkspace(a);
 }
 
 fn slackMediaKind(mime: []const u8) []const u8 {
@@ -3653,8 +3670,13 @@ fn loadSlackTokens(a: *App) void {
         a.allocator.free(tokens.app);
         a.slack_tokens = null;
     }
+    // ponytail: worker threads read the bridge strings through slackContext
+    // while a job runs, so they are leaked (like the socket's token bytes)
+    // instead of freed here.
+    a.slack_bridge = null;
     a.slack_tokens = slack_win.loadTokens(a.allocator);
-    if (a.slack_tokens == null) return;
+    a.slack_bridge = slack_win.loadBridge(a.allocator);
+    if (a.slack_tokens == null and a.slack_bridge == null) return;
     const job = WacliJob{ .kind = .slack_auth };
     wacliEnqueue(a, job, false);
 }
@@ -3862,6 +3884,7 @@ fn openSlackSetup(a: *App) void {
 /// Start (or restart after token entry) the Socket Mode session.
 fn startSlackSocket(a: *App) void {
     if (!slackConfigured(a) or a.slack_socket_thread != null) return;
+    if (a.slack_bridge != null) return; // Bridge mode has no Socket Mode; polling covers live updates.
     const tokens = a.slack_tokens.?;
     a.slack_stop.store(false, .release);
     const config = slack_win.SocketConfig{
@@ -6478,6 +6501,7 @@ fn refreshMessages(a: *App) void {
         return;
     }
     const chat = &a.chats[a.selected_chat];
+    a.slack_history_hash = 0;
     if (chat.provider == .telegram) return refreshTelegramMessages(a);
     const chat_changed = !std.mem.eql(u8, a.displayed_jid.slice(), chat.jid.slice());
     if (chat_changed) stopAudio(a);
@@ -7503,6 +7527,12 @@ fn sendMessage(a: *App) void {
             a.slack_attach.set(a.allocator, "");
             a.slack_attach_jid.set("");
         } else if (staged_file.len > 0) {
+            // Bridge mode has no uploads: keep the image and text staged
+            // instead of losing the caption to a failed upload job.
+            if (a.slack_bridge != null) {
+                setStatus(a, "File upload not available over the Slack bridge");
+                return;
+            }
             attach = staged_file;
             releaseStagedImage(a);
         }
@@ -9243,6 +9273,7 @@ fn runCommand(a: *App, command: u16) void {
         },
         command_slack_disconnect => {
             slack_win.clearTokens();
+            slack_win.clearBridge();
             a.slack_stop.store(true, .release);
             // ponytail: the socket thread cannot be joined while it blocks in
             // a receive, so it is detached and the token bytes it still
@@ -9251,6 +9282,8 @@ fn runCommand(a: *App, command: u16) void {
             if (a.slack_socket_thread) |thread| thread.detach();
             a.slack_socket_thread = null;
             a.slack_tokens = null;
+            // Leaked, not freed: an in-flight worker job may still borrow them.
+            a.slack_bridge = null;
             a.slack_user_id.set("");
             a.slack_chat_count = 0;
             a.slack_user_count = 0;
@@ -9258,6 +9291,10 @@ fn runCommand(a: *App, command: u16) void {
             setStatus(a, "Slack disconnected");
         },
         command_slack_attach => {
+            if (a.slack_bridge != null) {
+                setStatus(a, "File upload not available over the Slack bridge");
+                return;
+            }
             if (!selectedChatIsSlack(a)) {
                 setStatus(a, "Open a Slack chat first");
                 return;
@@ -11052,7 +11089,16 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
                     } else if (result.gen == a.messages_gen and selectedChatIsSlack(a) and
                         std.mem.eql(u8, a.chats[a.selected_chat].jid.slice(), result.jid.slice()))
                     {
-                        applySlackHistory(a, result.data);
+                        // Bridge poll: an unchanged answer for the chat already
+                        // on screen is skipped, so images, thread replies and
+                        // scroll are not torn down and refetched every 5 s.
+                        const hash = std.hash.Wyhash.hash(0, result.data);
+                        const unchanged = a.slack_bridge != null and hash == a.slack_history_hash and
+                            std.mem.eql(u8, a.displayed_jid.slice(), result.jid.slice());
+                        if (!unchanged) {
+                            applySlackHistory(a, result.data);
+                            a.slack_history_hash = hash;
+                        }
                     }
                 },
                 .slack_replies => {
@@ -11382,6 +11428,7 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
                     refreshGroups(a);
                     a.group_refresh_ticks = 0;
                 }
+                pollSlackBridge(a);
                 const changed = storeChanged(a);
                 // WAZI-67: bounded retry for a chats read that failed: one
                 // further read two ticks after each failure, three rounds.

@@ -412,6 +412,47 @@ pub fn percentEncode(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
     return out.toOwnedSlice(allocator);
 }
 
+/// True when the host is slack.com itself or a subdomain of slack.com or
+/// slack-edge.com. The leading dot is required, so "evilslack.com" fails.
+pub fn isSlackFileHost(host: []const u8) bool {
+    if (std.mem.eql(u8, host, "slack.com")) return true;
+    if (std.mem.endsWith(u8, host, ".slack.com")) return true;
+    if (std.mem.endsWith(u8, host, ".slack-edge.com")) return true;
+    return false;
+}
+
+/// A bridge host is a bare lowercase hostname: letters, digits, dots and
+/// hyphens only. No scheme, path, port, credentials or spaces.
+pub fn isValidBridgeHost(host: []const u8) bool {
+    if (host.len == 0) return false;
+    for (host) |character| {
+        const valid = (character >= 'a' and character <= 'z') or
+            (character >= '0' and character <= '9') or
+            character == '.' or character == '-';
+        if (!valid) return false;
+    }
+    return true;
+}
+
+/// A bridge key is copied straight into an Authorization header, so it must be
+/// printable ASCII with no space, CR or LF that could smuggle in new headers.
+pub fn isValidBridgeKey(key: []const u8) bool {
+    if (key.len == 0) return false;
+    for (key) |character| {
+        if (character < 0x20 or character > 0x7E) return false;
+        if (character == ' ') return false;
+    }
+    return true;
+}
+
+/// Build the local bridge file path ("/file?url=<encoded>") for an original
+/// Slack file URL, percent-encoding the URL as a query value.
+pub fn bridgeFilePath(allocator: std.mem.Allocator, original_url: []const u8) ![]u8 {
+    const encoded = try percentEncode(allocator, original_url);
+    defer allocator.free(encoded);
+    return std.fmt.allocPrint(allocator, "/file?url={s}", .{encoded});
+}
+
 /// Read {"url_private_download": ...} straight off a message file object.
 pub fn fileDownloadUrl(file: std.json.ObjectMap) []const u8 {
     return objectString(file, "url_private_download") orelse objectString(file, "url_private") orelse "";
@@ -613,4 +654,36 @@ test "postMessage body carries client_msg_id when set" {
     const with_id = try buildPostMessageBody(allocator, .{ .channel_id = "C1", .text = "hi", .thread_ts = "", .client_msg_id = "wz1-2" });
     defer allocator.free(with_id);
     try std.testing.expectEqualStrings("{\"channel\":\"C1\",\"text\":\"hi\",\"client_msg_id\":\"wz1-2\"}", with_id);
+}
+
+test "isSlackFileHost matches only slack file hosts" {
+    try std.testing.expect(isSlackFileHost("slack.com"));
+    try std.testing.expect(isSlackFileHost("files.slack.com"));
+    try std.testing.expect(isSlackFileHost("cdn.slack-edge.com"));
+    try std.testing.expect(!isSlackFileHost("evilslack.com"));
+    try std.testing.expect(!isSlackFileHost("slack.com.evil.com"));
+    try std.testing.expect(!isSlackFileHost(""));
+}
+
+test "isValidBridgeHost accepts bare hostnames only" {
+    try std.testing.expect(isValidBridgeHost("slack-bridge.crolab.org"));
+    try std.testing.expect(!isValidBridgeHost("https://x.com"));
+    try std.testing.expect(!isValidBridgeHost("a b"));
+    try std.testing.expect(!isValidBridgeHost("a:1"));
+    try std.testing.expect(!isValidBridgeHost("a/b"));
+    try std.testing.expect(!isValidBridgeHost(""));
+}
+
+test "isValidBridgeKey rejects header injection" {
+    try std.testing.expect(isValidBridgeKey("xoxb-1234567890-abcDEF"));
+    try std.testing.expect(!isValidBridgeKey("token\ninjected"));
+    try std.testing.expect(!isValidBridgeKey("token value"));
+    try std.testing.expect(!isValidBridgeKey(""));
+}
+
+test "bridgeFilePath percent-encodes the original url" {
+    const allocator = std.testing.allocator;
+    const path = try bridgeFilePath(allocator, "https://files.slack.com/x?y=1");
+    defer allocator.free(path);
+    try std.testing.expectEqualStrings("/file?url=https%3A%2F%2Ffiles.slack.com%2Fx%3Fy%3D1", path);
 }
