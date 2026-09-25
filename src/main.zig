@@ -289,6 +289,8 @@ const FailedSend = struct {
     // older than this, so an old same-text message is not mistaken for this
     // failed (then delivered) send.
     queued_unix: i64 = 0,
+    // A file send: its paste file is gone, so a manual resend is refused.
+    is_file: bool = false,
 };
 
 // An image staged from the clipboard (WAZI-37): a PNG copy written to the
@@ -3328,9 +3330,7 @@ fn localSendId(buffer: []u8, seq: u64) []const u8 {
     return std.fmt.bufPrint(buffer, "local-{d}", .{seq}) catch "local";
 }
 
-// The placeholder text a file send's bubble shows instead of its caption;
-// also used to recognize (and refuse to auto-resend) a failed file send,
-// since its local paste file is deleted once the send finishes with it.
+// The placeholder text a file send's bubble shows instead of its caption.
 const file_send_placeholder = "Sending file...";
 
 /// Bubble text for a queued send that has failed at least once and is
@@ -3470,6 +3470,7 @@ fn rememberFailedSend(a: *App, pending: *const PendingSend) void {
     a.failed_sends[a.failed_send_count].jid.set(pending.jid.slice());
     a.failed_sends[a.failed_send_count].text.set(pending.text.slice());
     a.failed_sends[a.failed_send_count].queued_unix = pending.queued_unix;
+    a.failed_sends[a.failed_send_count].is_file = pending.file.len > 0;
     a.failed_send_count += 1;
 }
 
@@ -3543,28 +3544,53 @@ fn restoreFailedSendText(a: *App, failed: *const PendingSend) void {
 /// failed file send can't be resent this way: its paste file is deleted once
 /// the send finishes with it (removeFirstPendingSend), so only the caption
 /// would go out.
-fn resendFailedMessage(a: *App, index: usize) void {
-    if (index >= a.message_count) return;
+/// Returns true when the bubble was a WhatsApp failed send it acted on
+/// (resent, refused with a status, or found already delivered).
+fn resendFailedMessage(a: *App, index: usize) bool {
+    if (index >= a.message_count) return false;
     const message = &a.messages[index];
-    if (!message.from_me or message.send_state != .failed) return;
-    if (a.chat_count == 0 or a.selected_chat >= a.chat_count) return;
+    if (!message.from_me or message.send_state != .failed) return false;
+    if (a.chat_count == 0 or a.selected_chat >= a.chat_count) return false;
+    // Slack marks its own failed bubbles; those never go through wacli.
+    if (selectedChatIsSlack(a) or selectedChatIsTelegram(a)) return false;
     if (a.pending_send_count >= max_pending_sends) {
         setStatus(a, "Send queue is full");
-        return;
+        return true;
     }
-    const bubble_text = std.unicode.utf16LeToUtf8Alloc(a.allocator, message.text.slice()) catch return;
+    const bubble_text = std.unicode.utf16LeToUtf8Alloc(a.allocator, message.text.slice()) catch return true;
     defer a.allocator.free(bubble_text);
-    if (std.mem.startsWith(u8, bubble_text, file_send_placeholder)) {
-        setStatus(a, "Can't resend a file automatically - attach it again");
-        return;
-    }
     const suffix = " (not sent)";
     const original = if (std.mem.endsWith(u8, bubble_text, suffix)) bubble_text[0 .. bubble_text.len - suffix.len] else bubble_text;
+    const jid = a.chats[a.selected_chat].jid.slice();
+    // The remembered failure, not the bubble, is the source of truth: it
+    // says whether this was a file send and when it was first queued.
+    var entry: ?*const FailedSend = null;
+    for (a.failed_sends[0..a.failed_send_count]) |*candidate| {
+        if (std.mem.eql(u8, candidate.jid.slice(), jid) and std.mem.eql(u8, candidate.text.slice(), original)) {
+            entry = candidate;
+            break;
+        }
+    }
+    const failed = entry orelse {
+        setStatus(a, "Can't resend this message - type it again");
+        return true;
+    };
+    if (failed.is_file) {
+        setStatus(a, "Can't resend a file automatically - attach it again");
+        return true;
+    }
     if (original.len == 0) {
         setStatus(a, "Nothing to resend");
-        return;
+        return true;
     }
-    const jid = a.chats[a.selected_chat].jid.slice();
+    // The last attempt may have gone out after all (a timeout): if the open
+    // chat already shows it, don't send it twice.
+    if (sentMessageExists(a, jid, original, failed.queued_unix)) {
+        forgetFailedSend(a, jid, original);
+        setStatus(a, "Already sent");
+        refreshMessages(a);
+        return true;
+    }
     forgetFailedSend(a, jid, original);
     const pending = &a.pending_sends[a.pending_send_count];
     pending.* = .{};
@@ -3594,6 +3620,7 @@ fn resendFailedMessage(a: *App, index: usize) void {
     setStatus(a, "Resending...");
     if (a.canvas) |canvas| _ = win.InvalidateRect(canvas, null, win.TRUE);
     startNextSend(a);
+    return true;
 }
 
 /// Pending bubble carrying this client_msg_id, if still displayed.
@@ -7131,11 +7158,9 @@ fn failHeadPendingSend(a: *App, code: u32, ambiguous: bool, detail: []const u8) 
 /// True when a queued send is due now. The mark-read and archive gates wait
 /// for a ready send, but must not stall behind one biding out retry backoff.
 fn sendReadyPending(a: *const App) bool {
-    const now = win.GetTickCount64();
-    for (a.pending_sends[0..a.pending_send_count]) |*pending| {
-        if (pending.not_before_ms <= now) return true;
-    }
-    return false;
+    // Only the head can start (FIFO), so a later entry must not count as
+    // ready while the head waits out its backoff.
+    return a.pending_send_count > 0 and a.pending_sends[0].not_before_ms <= win.GetTickCount64();
 }
 
 const send_output_max_bytes = 64 * 1024;
@@ -7283,8 +7308,8 @@ fn checkSend(a: *App) void {
         var timed_out = false;
         if (win.GetExitCodeProcess(handle, &code) == 0 or code == win.STILL_ACTIVE) {
             if (win.GetTickCount64() - a.send_started_ms <= send_timeout_ms) return;
-            // A wedged send is killed like a wedged mark-read, and fails for
-            // good: wacli may already have delivered it, so it is not retried.
+            // A wedged send is killed like a wedged mark-read. wacli may
+            // already have delivered it, so the retry checks for it first.
             _ = child.kill(a.io);
             code = 1;
             timed_out = true;
@@ -7318,13 +7343,20 @@ fn checkSend(a: *App) void {
         // A timeout, or any other nonzero exit, might have delivered anyway.
         const ambiguous = timed_out or !has_lock;
         var snippet_buffer: [send_log_snippet_len]u8 = undefined;
-        const source = if (stderr_output != null and stderr_output.?.len > 0) stderr_output else stdout_output;
+        // Log only wacli's error output (stderr), never stdout (its --json
+        // result), and never anything that echoes the message text.
+        const message_text = a.pending_sends[0].text.slice();
         const detail = if (timed_out)
             "timed out"
-        else if (source) |text|
-            oneLineSnippet(&snippet_buffer, text)
+        else if (stderr_output) |text|
+            (if (text.len == 0)
+                "no error output"
+            else if (message_text.len > 0 and std.mem.indexOf(u8, text, message_text) != null)
+                "error output withheld (contains message text)"
+            else
+                oneLineSnippet(&snippet_buffer, text))
         else
-            "no output";
+            "no error output";
         // Every failure (lock, timeout, or otherwise) stays queued and is
         // retried, up to max_send_retries, with the next attempt spaced out.
         failHeadPendingSend(a, code, ambiguous, detail);
@@ -8066,8 +8098,9 @@ fn handleCanvasClick(a: *App, hwnd: win.HWND, x: i32, y: i32) void {
         const bubble = item.bubble_hit;
         // A failed bubble resends on a plain click rather than selecting
         // text or media inside it: there's nothing else useful to click.
-        if (item.send_state == .failed and x >= bubble.left and x <= bubble.right and y >= bubble.top and y <= bubble.bottom) {
-            resendFailedMessage(a, index);
+        if (item.send_state == .failed and x >= bubble.left and x <= bubble.right and y >= bubble.top and y <= bubble.bottom and
+            resendFailedMessage(a, index))
+        {
             _ = win.InvalidateRect(hwnd, null, win.TRUE);
             return;
         }
@@ -9388,7 +9421,7 @@ fn runCommand(a: *App, command: u16) void {
                 setStatus(a, "Select a failed message first");
                 return;
             }
-            resendFailedMessage(a, selected);
+            if (!resendFailedMessage(a, selected)) setStatus(a, "Only a failed WhatsApp message can be resent");
         },
         command_archived => {
             a.show_archived = !a.show_archived;
@@ -11962,17 +11995,14 @@ fn handleKeyboard(a: *App, message: *const win.MSG) bool {
         }
         return false;
     }
-    // Enter or R resends the selected failed message, unless the composer
-    // is focused with text in it (then they type/send as usual).
+    // Enter or R resends the selected failed message, only while the
+    // composer is empty and the search box isn't taking the keystroke.
     if (!control and !alt and (key == win.VK_RETURN or key == 'R')) {
         if (a.selected_message) |selected| {
             if (selected < a.message_count and a.messages[selected].from_me and a.messages[selected].send_state == .failed) {
-                const compose_focused = if (a.compose) |compose| win.GetFocus() == compose else false;
                 const compose_empty = if (a.compose) |compose| win.GetWindowTextLengthW(compose) == 0 else true;
-                if (!compose_focused or compose_empty) {
-                    resendFailedMessage(a, selected);
-                    return true;
-                }
+                const in_search = if (a.search) |search| focus == search else false;
+                if (compose_empty and !in_search and resendFailedMessage(a, selected)) return true;
             }
         }
     }
