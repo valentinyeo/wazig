@@ -30,6 +30,7 @@ const update = @import("update.zig");
 const tg = if (build_info.td_enabled) @import("telegram.zig") else @import("telegram_stub.zig");
 const tj = @import("telegram_json.zig");
 const transport = @import("transport.zig");
+const messenger_view = @import("messenger_view.zig");
 
 const max_chats = 256;
 const max_groups = 1024;
@@ -157,6 +158,9 @@ const command_update_install = 2053;
 const command_emoji_diag = 2054;
 const command_open_image_external = 2055;
 const command_resend = 2056;
+const command_show_whatsapp = 2057;
+const command_show_slack = 2058;
+const command_show_telegram = 2059;
 const reaction_like = 3001;
 const reaction_love = 3002;
 const reaction_laugh = 3003;
@@ -770,6 +774,11 @@ const App = struct {
     slack_setup_window: ?win.HWND = null,
     slack_chats: [max_chats]Chat = [_]Chat{.{}} ** max_chats,
     slack_chat_count: usize = 0,
+    // One messenger at a time in the sidebar (Alt+1/2/3). The last selected
+    // chat per messenger is kept by id so switching back restores it.
+    chat_view: transport.Provider = .whatsapp,
+    view_selected: [3]Utf8Text(191) = [_]Utf8Text(191){.{}} ** 3,
+    chat_view_switched: bool = false,
     slack_users: [512]SlackUser = [_]SlackUser{.{}} ** 512,
     slack_user_count: usize = 0,
     slack_attach: WideText(519) = .{},
@@ -1101,6 +1110,23 @@ fn saveDictationLanguage(language: dictation.Language) void {
     defer _ = win.RegCloseKey(key);
     const value: win.DWORD = @intFromEnum(language);
     _ = win.RegSetValueExW(key, lit("DictationLanguage"), 0, win.REG_DWORD, @ptrCast(&value), @sizeOf(win.DWORD));
+}
+
+fn loadChatView() transport.Provider {
+    var value: win.DWORD = 0;
+    var size: win.DWORD = @sizeOf(win.DWORD);
+    const result = win.RegGetValueW(winHandle(win.HKEY, 0x80000001), lit("Software\\Messages"), lit("Messenger"), win.RRF_RT_REG_DWORD, null, &value, &size);
+    if (result != win.ERROR_SUCCESS or value > 2) return .whatsapp;
+    return @enumFromInt(value);
+}
+
+fn saveChatView(view: transport.Provider) void {
+    var key: win.HKEY = null;
+    var disposition: win.DWORD = 0;
+    if (win.RegCreateKeyExW(winHandle(win.HKEY, 0x80000001), lit("Software\\Messages"), 0, null, 0, win.KEY_SET_VALUE, null, &key, &disposition) != win.ERROR_SUCCESS) return;
+    defer _ = win.RegCloseKey(key);
+    const value: win.DWORD = @intFromEnum(view);
+    _ = win.RegSetValueExW(key, lit("Messenger"), 0, win.REG_DWORD, @ptrCast(&value), @sizeOf(win.DWORD));
 }
 
 /// Dragged composer height is persisted in 96-DPI logical pixels and rescaled
@@ -1694,7 +1720,9 @@ fn applyChats(a: *App, raw: []const u8) bool {
         .array => |items| items,
         else => return false,
     };
-    if (!a.pins_loaded) {
+    // A Slack or Telegram view rebuilds with an empty WhatsApp payload; the
+    // first-launch pin import must wait for a real WhatsApp list.
+    if (!a.pins_loaded and data.items.len > 0) {
         a.pins_loaded = true;
         if (!loadPins(a)) {
             // First launch: import the pins the user already made inside
@@ -1710,11 +1738,17 @@ fn applyChats(a: *App, raw: []const u8) bool {
             _ = savePins(a);
         }
     }
+    const view = activeChatView(a);
     var selected_jid: [192]u8 = [_]u8{0} ** 192;
     var selected_len: usize = 0;
-    if (a.selected_chat < a.chat_count) {
+    if (a.selected_chat < a.chat_count and a.chats[a.selected_chat].provider == view) {
         selected_len = a.chats[a.selected_chat].jid.len;
         @memcpy(selected_jid[0..selected_len], a.chats[a.selected_chat].jid.slice());
+    } else {
+        // The list is switching messenger: restore that messenger's last chat.
+        const remembered = &a.view_selected[@intFromEnum(view)];
+        selected_len = remembered.len;
+        @memcpy(selected_jid[0..selected_len], remembered.slice());
     }
 
     // Remember the top visible row by jid so the rebuild below can anchor the
@@ -1722,7 +1756,10 @@ fn applyChats(a: *App, raw: []const u8) bool {
     var anchor_jid: [192]u8 = [_]u8{0} ** 192;
     var anchor_len: usize = 0;
     var top_index: i32 = -1;
-    if (a.chats_hwnd) |list| {
+    if (a.chat_view_switched) {
+        // A different messenger's rows: the old scroll position means nothing.
+        a.chat_view_switched = false;
+    } else if (a.chats_hwnd) |list| {
         const current_top = win.SendMessageW(list, win.LB_GETTOPINDEX, 0, 0);
         if (current_top >= 0 and @as(usize, @intCast(current_top)) < a.chat_count) {
             const top_chat = &a.chats[@intCast(current_top)];
@@ -1736,6 +1773,7 @@ fn applyChats(a: *App, raw: []const u8) bool {
     a.chat_count = 0;
     a.last_refresh_unix = nowUnixSeconds();
     for (data.items) |item| {
+        if (view != .whatsapp) break;
         if (a.chat_count >= max_chats) break;
         const object = switch (item) {
             .object => |o| o,
@@ -1760,10 +1798,11 @@ fn applyChats(a: *App, raw: []const u8) bool {
         a.chats[a.chat_count] = chat;
         a.chat_count += 1;
     }
-    if (!a.show_archived) {
-        appendTelegramChats(a, query_utf8);
-        appendSlackChats(a, query_utf8);
-    }
+    if (!a.show_archived) switch (view) {
+        .whatsapp => {},
+        .telegram => appendTelegramChats(a, query_utf8),
+        .slack => appendSlackChats(a, query_utf8),
+    };
     var i: usize = 1;
     while (i < a.chat_count) : (i += 1) {
         var j = i;
@@ -1806,6 +1845,8 @@ fn applyChats(a: *App, raw: []const u8) bool {
             }
         }
     }
+    if (a.selected_chat < a.chat_count) a.view_selected[@intFromEnum(view)].set(a.chats[a.selected_chat].jid.slice());
+    updateSearchCue(a, view);
     if (a.chats_hwnd) |list| {
         _ = win.SendMessageW(list, win.WM_SETREDRAW, 0, 0);
         _ = win.SendMessageW(list, win.LB_RESETCONTENT, 0, 0);
@@ -3010,12 +3051,69 @@ fn noteSlackActivity(a: *App, channel: []const u8, seconds: i64) void {
     }
 }
 
-/// Merge the cached Slack workspace into the visible chat list (WhatsApp +
-/// Telegram); applyChats sorts everything by recency afterwards.
+fn telegramReady(a: *App) bool {
+    return a.telegram != null and a.tg_auth == .ready;
+}
+
+/// The messenger the sidebar shows right now. A remembered Slack or Telegram
+/// view that is not set up (yet) shows WhatsApp instead.
+fn activeChatView(a: *App) transport.Provider {
+    return messenger_view.effective(a.chat_view, slackConfigured(a), telegramReady(a));
+}
+
+/// The search box's placeholder names the messenger on screen, so the
+/// active view is visible without a new control.
+fn updateSearchCue(a: *App, view: transport.Provider) void {
+    const search = a.search orelse return;
+    var buffer: [64]u8 = undefined;
+    const text = std.fmt.bufPrint(&buffer, "Search {s}  Ctrl+F", .{messenger_view.label(view)}) catch return;
+    var wide: [64]u16 = undefined;
+    const len = std.unicode.utf8ToUtf16Le(wide[0 .. wide.len - 1], text) catch return;
+    wide[len] = 0;
+    _ = win.SendMessageW(search, win.EM_SETCUEBANNER, 1, @bitCast(@intFromPtr(&wide)));
+}
+
+/// Rebuild the sidebar for the active view. Slack and Telegram lists come
+/// from local caches, so they rebuild at once without a wacli read.
+fn refreshVisibleChats(a: *App) void {
+    if (activeChatView(a) == .whatsapp) return refreshChats(a);
+    _ = applyChats(a, "{\"data\":[]}");
+}
+
+/// Alt+N: show one messenger's chats. Keeps each messenger's last chat.
+fn switchChatView(a: *App, view: transport.Provider) void {
+    const current = activeChatView(a);
+    if (messenger_view.effective(view, slackConfigured(a), telegramReady(a)) != view) {
+        setStatus(a, if (view == .slack) "Slack is not set up" else "Telegram is not signed in");
+        return;
+    }
+    if (a.selected_chat < a.chat_count and a.chats[a.selected_chat].provider == current) {
+        a.view_selected[@intFromEnum(current)].set(a.chats[a.selected_chat].jid.slice());
+    }
+    a.chat_view = view;
+    saveChatView(view);
+    if (view == current) return;
+    a.chat_view_switched = true;
+    clearReply(a);
+    discardStagedImage(a);
+    if (view == .whatsapp) {
+        // Paint the last WhatsApp list at once; the fresh read follows.
+        _ = applyChats(a, "{\"data\":[]}");
+        loadChatsCache(a);
+        refreshChats(a);
+    } else refreshVisibleChats(a);
+    refreshMessages(a);
+    var buffer: [48]u8 = undefined;
+    setStatus(a, std.fmt.bufPrint(&buffer, "Showing {s}", .{messenger_view.label(view)}) catch "");
+}
+
+/// Fill the Slack view from the cached workspace; applyChats sorts it by
+/// recency afterwards.
 fn appendSlackChats(a: *App, query_utf8: ?[]const u8) void {
     if (!slackConfigured(a)) return;
     for (a.slack_chats[0..a.slack_chat_count]) |cached| {
         if (a.chat_count >= max_chats) break;
+        if (a.unread_only and !cached.unread) continue;
         if (query_utf8) |query| {
             const name_bytes = std.unicode.utf16LeToUtf8Alloc(a.allocator, cached.name.slice()) catch continue;
             defer a.allocator.free(name_bytes);
@@ -3850,7 +3948,7 @@ fn applySlackEvent(a: *App, event: *slack_win.Event) void {
         if (item.file_url.len > 0) requestSlackDownload(a, channel, item);
         if (a.canvas) |canvas| _ = win.InvalidateRect(canvas, null, win.TRUE);
     } else {
-        refreshChats(a);
+        refreshVisibleChats(a);
     }
 }
 
@@ -8831,6 +8929,12 @@ fn buildPaletteItems(a: *App) void {
     appendPalette(a, "Make text larger", "Ctrl++", command_font_larger);
     appendPalette(a, "Reset text size", "Ctrl+0", command_font_reset);
     appendPalette(a, "Toggle unread chats", "U", command_unread);
+    inline for (.{ .{ transport.Provider.whatsapp, "Show WhatsApp", command_show_whatsapp }, .{ transport.Provider.slack, "Show Slack", command_show_slack }, .{ transport.Provider.telegram, "Show Telegram", command_show_telegram } }) |entry| {
+        if (messenger_view.numberFor(entry[0], slackConfigured(a), telegramReady(a))) |number| {
+            var shortcut: [8]u8 = undefined;
+            appendPalette(a, entry[1], std.fmt.bufPrint(&shortcut, "Alt+{d}", .{number}) catch "", entry[2]);
+        }
+    }
     appendPalette(a, if (a.selected_chat < a.chat_count and isChatPinned(a, a.chats[a.selected_chat].jid.slice())) "Unpin selected chat" else "Pin chat to top", "", command_pin);
     appendPalette(a, if (a.show_archived) "Show inbox chats" else "Show archived chats", "", command_archived);
     appendPalette(a, if (a.show_archived) "Unarchive selected chat" else "Archive selected chat", "Ctrl+E", command_archive);
@@ -9480,6 +9584,9 @@ fn runCommand(a: *App, command: u16) void {
             }
             if (!resendFailedMessage(a, selected)) setStatus(a, "Only a failed WhatsApp message can be resent");
         },
+        command_show_whatsapp => switchChatView(a, .whatsapp),
+        command_show_slack => switchChatView(a, .slack),
+        command_show_telegram => switchChatView(a, .telegram),
         command_archived => {
             a.show_archived = !a.show_archived;
             refreshChats(a);
@@ -11356,11 +11463,11 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
                 },
                 .slack_workspace => if (result.ok) {
                     applySlackWorkspace(a, result.data);
-                    refreshChats(a);
+                    refreshVisibleChats(a);
                 } else if (slackConfigured(a)) setStatus(a, "Unable to read Slack channels"),
                 .slack_users => if (result.ok) {
                     applySlackUsers(a, result.data);
-                    refreshChats(a);
+                    refreshVisibleChats(a);
                 },
                 .slack_auth => if (result.ok) {
                     var parsed = std.json.parseFromSlice(std.json.Value, a.allocator, result.data, .{}) catch return 0;
@@ -11483,7 +11590,7 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
             createTooltips(a, hwnd);
             recreateFonts(a);
             createTooltips(a, hwnd);
-            if (a.search) |search| _ = win.SendMessageW(search, win.EM_SETCUEBANNER, 1, @bitCast(@intFromPtr(lit("Search chats  Ctrl+F"))));
+            updateSearchCue(a, activeChatView(a));
             if (a.chats_hwnd) |list| _ = win.SendMessageW(list, win.LB_SETITEMHEIGHT, 0, px(a, 64));
             a.compose_dragged = loadComposeDragged(hwnd);
             var rc_create: win.RECT = undefined;
@@ -11950,6 +12057,11 @@ fn handleKeyboard(a: *App, message: *const win.MSG) bool {
                 return true;
             }
         }
+    }
+    // Alt+1..9 show one messenger: WhatsApp, then Slack and Telegram when set up.
+    if (alt and !control and !shift and key >= '1' and key <= '9') {
+        if (messenger_view.forNumber(key - '0', slackConfigured(a), telegramReady(a))) |view| switchChatView(a, view);
+        return true;
     }
     // Ctrl+1..9 open the chat at that position in the list.
     if (control and !alt and key >= '1' and key <= '9') {
@@ -12681,7 +12793,7 @@ pub fn main(init: std.process.Init) !void {
         }
     }
     if (openrouter_model.len == 0) openrouter_model = "openai/gpt-5.6-luna";
-    var app = App{ .allocator = init.gpa, .io = init.io, .instance = instance, .wacli_path = wacli_path, .avatar_dir = avatar_dir, .slack_media_dir = slack_media_dir, .deepgram_configured = deepgram_key.len > 0, .deepgram_key = deepgram_key, .openrouter_key = openrouter_key, .openrouter_model = openrouter_model, .openrouter_configured = openrouter_key.len > 0, .dictation_language = loadDictationLanguage(), .font_scale = loadFontScale() };
+    var app = App{ .allocator = init.gpa, .io = init.io, .instance = instance, .wacli_path = wacli_path, .avatar_dir = avatar_dir, .slack_media_dir = slack_media_dir, .deepgram_configured = deepgram_key.len > 0, .deepgram_key = deepgram_key, .openrouter_key = openrouter_key, .openrouter_model = openrouter_model, .openrouter_configured = openrouter_key.len > 0, .dictation_language = loadDictationLanguage(), .font_scale = loadFontScale(), .chat_view = loadChatView() };
     app.wacli_dir.set(wacli_dir);
     if (cache_tag) |tag| {
         app.cache_tag.set(tag);
