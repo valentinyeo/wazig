@@ -373,17 +373,31 @@ pub fn putFile(allocator: std.mem.Allocator, url: []const u8, bytes: []const u8)
 /// Download a Slack file (bearer-authenticated) to dest_path. Only HTTPS
 /// hosts under slack.com receive the Authorization header, and the size is
 /// capped so a runaway file cannot fill the disk.
-pub fn downloadTo(allocator: std.mem.Allocator, token: []const u8, url: []const u8, dest_path: []const u8) !void {
+pub fn downloadTo(allocator: std.mem.Allocator, token: []const u8, url: []const u8, dest_path: []const u8, bridge_host: ?[]const u8) !void {
     if (!enabled) return error.Unsupported;
     if (!std.mem.startsWith(u8, url, "https://")) return error.UntrustedUrl;
     const host = urlHost(url);
-    if (!std.mem.endsWith(u8, host, "slack.com")) return error.UntrustedUrl;
-    const scheme_end = std.mem.indexOf(u8, url, "://").?;
-    const host_start = scheme_end + 3;
-    const path_start = std.mem.indexOfScalarPos(u8, url, host_start, '/') orelse return error.UntrustedUrl;
-    const wide_host = try toWide(allocator, url[host_start..path_start]);
+    var connect_host: []const u8 = host;
+    var connect_path: []const u8 = url;
+    var owned_path: ?[]u8 = null;
+    defer if (owned_path) |p| allocator.free(p);
+    if (bridge_host) |bh| {
+        if (!slack.isSlackFileHost(host)) return error.UntrustedUrl;
+        const rewritten = try slack.bridgeFilePath(allocator, url);
+        owned_path = rewritten;
+        connect_host = bh;
+        connect_path = rewritten;
+    } else {
+        if (!std.mem.endsWith(u8, host, "slack.com")) return error.UntrustedUrl;
+        const scheme_end = std.mem.indexOf(u8, url, "://").?;
+        const host_start = scheme_end + 3;
+        const path_start = std.mem.indexOfScalarPos(u8, url, host_start, '/') orelse return error.UntrustedUrl;
+        connect_host = url[host_start..path_start];
+        connect_path = url[path_start..];
+    }
+    const wide_host = try toWide(allocator, connect_host);
     defer allocator.free(wide_host);
-    const wide_path = try toWide(allocator, url[path_start..]);
+    const wide_path = try toWide(allocator, connect_path);
     defer allocator.free(wide_path);
     const wide_dest = try toWide(allocator, dest_path);
     defer allocator.free(wide_dest);
@@ -681,6 +695,7 @@ pub const JobKind = enum(u8) {
 pub const JobContext = struct {
     user_token: []const u8,
     host: []const u8,
+    is_bridge: bool,
     media_dir: []const u8,
     io: std.Io,
 };
@@ -754,6 +769,7 @@ pub fn runJob(allocator: std.mem.Allocator, ctx: JobContext, kind: JobKind, args
             return response.body;
         },
         .send_image => {
+            if (ctx.is_bridge) return error.UploadNotSupported;
             if (args.len < 4) return error.BadArguments;
             return uploadImage(allocator, ctx, args[0], args[1], args[2], args[3]);
         },
@@ -788,7 +804,7 @@ pub fn runJob(allocator: std.mem.Allocator, ctx: JobContext, kind: JobKind, args
                 try dest.append(allocator, '-');
                 try dest.appendSlice(allocator, safe_name);
             }
-            try downloadTo(allocator, ctx.user_token, args[0], dest.items);
+            try downloadTo(allocator, ctx.user_token, args[0], dest.items, if (ctx.is_bridge) ctx.host else null);
             return allocator.dupe(u8, dest.items);
         },
     }
