@@ -391,10 +391,11 @@ const palette_width: i32 = 540;
 const palette_row_height: i32 = 40;
 const palette_edit_zone: i32 = 64;
 const palette_max_rows = 10;
-const emoji_picker_width: i32 = emoji_picker.cell_size * @as(i32, @intCast(emoji_picker.grid_columns)) + 12 + scrollbar_width;
-const emoji_edit_zone: i32 = 64;
+// Picker geometry at 96 DPI; emojiCell/emojiPickerWidth/emojiEditZone scale it.
+const emoji_edit_zone_base: i32 = 64;
 const emoji_max_rows: i32 = @intCast(emoji_picker.grid_rows);
-const max_emoji_matches = emoji_picker.catalog.len;
+// The whole catalog plus the "frequently used" row shown above it.
+const max_emoji_matches = emoji_picker.count + emoji_picker.grid_columns;
 
 const Message = struct {
     id: Utf8Text(191) = .{},
@@ -419,6 +420,8 @@ const Message = struct {
     // WAZI-61: optimistic Slack sends render before Slack confirms; .failed
     // bubbles keep their text with a "(not sent)" marker.
     send_state: enum { none, pending, failed } = .none,
+    // The reaction was just made here and wacli has not confirmed it yet.
+    reaction_pending: bool = false,
     bitmap: ?win.HBITMAP = null,
     bitmap_width: i32 = 0,
     bitmap_height: i32 = 0,
@@ -449,6 +452,21 @@ const Message = struct {
 // posts a WacliResult pointer back with wm_wacli_done; the UI thread parses
 // and applies it. Jobs carry a generation token so a stale answer can never
 // overwrite a newer view.
+// A reaction made in the app that wacli has not confirmed yet (optimistic UI).
+const max_pending_reactions = 8;
+const PendingReaction = struct {
+    jid: Utf8Text(191) = .{},
+    msg_id: Utf8Text(191) = .{},
+    // Group chats only: the author of the message reacted to.
+    sender: Utf8Text(191) = .{},
+    emoji: Utf8Text(63) = .{},
+    // What the bubble showed before; restored when every retry fails.
+    previous: WideText(31) = .{},
+    retries: u8 = 0,
+    // Nonzero while waiting out a retry backoff; the refresh timer re-sends.
+    retry_at_ms: u64 = 0,
+};
+
 const WacliJobKind = enum(u8) { chats, groups, messages, reaction, slack_workspace, slack_users, slack_history, slack_replies, slack_send, slack_attach, slack_download, slack_auth, cache_tag };
 const wacli_kind_count = @typeInfo(WacliJobKind).@"enum".fields.len;
 
@@ -567,6 +585,13 @@ const App = struct {
     emoji_match_count: usize = 0,
     emoji_selected: usize = 0,
     emoji_ever_active: bool = false,
+    // Ctrl+R opens the picker in react mode for one message, named by chat
+    // jid and message id because indices shift when the chat reloads.
+    emoji_react: bool = false,
+    emoji_react_jid: Utf8Text(191) = .{},
+    emoji_react_id: Utf8Text(191) = .{},
+    pending_reactions: [max_pending_reactions]PendingReaction = [_]PendingReaction{.{}} ** max_pending_reactions,
+    pending_reaction_count: usize = 0,
     emoji_recents: [emoji_picker.max_recents]u16 = [_]u16{0} ** emoji_picker.max_recents,
     emoji_recents_count: usize = 0,
     sb_emoji_top: i32 = -1,
@@ -1203,9 +1228,10 @@ fn loadEmojiRecents(a: *App) void {
 }
 
 fn saveEmojiRecents(a: *App) void {
-    var buffer: [64]u8 = undefined;
+    // Recents are stored as emoji text: up to 8 emoji of at most ~30 bytes.
+    var buffer: [320]u8 = undefined;
     const text = emoji_picker.formatRecents(&buffer, a.emoji_recents[0..a.emoji_recents_count]);
-    var wide = WideText(31){};
+    var wide = WideText(255){};
     wide.set(a.allocator, text);
     if (wide.len == 0) return;
     var key: win.HKEY = null;
@@ -1357,6 +1383,8 @@ fn wacliPendingSub(a: *App, kind: WacliJobKind) void {
 
 fn wacliEnqueue(a: *App, job: WacliJob, urgent: bool) void {
     var dropped_reaction = false;
+    var dropped_msg_id = Utf8Text(191){};
+    var dropped_emoji = Utf8Text(63){};
     a.wacli_mutex.lockUncancelable(a.io);
     if (a.wacli_queue_len >= a.wacli_queue.len) {
         // Superseded refreshes are droppable; reactions are dropped only as a
@@ -1374,6 +1402,10 @@ fn wacliEnqueue(a: *App, job: WacliJob, urgent: bool) void {
             }
         }
         dropped_reaction = a.wacli_queue[victim].kind == .reaction;
+        if (dropped_reaction) {
+            dropped_msg_id.set(a.wacli_queue[victim].msg_id.slice());
+            dropped_emoji.set(a.wacli_queue[victim].extra.slice());
+        }
         a.wacli_pending[@intFromEnum(a.wacli_queue[victim].kind)] -= 1;
         var shift = victim;
         while (shift + 1 < a.wacli_queue_len) : (shift += 1) a.wacli_queue[shift] = a.wacli_queue[shift + 1];
@@ -1382,10 +1414,11 @@ fn wacliEnqueue(a: *App, job: WacliJob, urgent: bool) void {
     if (urgent) {
         // WAZI-61: sends must keep the order they were typed in, so an urgent
         // send slots in after any already-queued sends instead of jumping
-        // ahead of them (plain head-insert would reverse A and B).
+        // ahead of them (plain head-insert would reverse A and B). Reactions
+        // are user writes too: an add then a remove must stay in order.
         var insert: usize = 0;
         while (insert < a.wacli_queue_len and
-            (a.wacli_queue[insert].kind == .slack_send or a.wacli_queue[insert].kind == .slack_attach)) insert += 1;
+            (a.wacli_queue[insert].kind == .slack_send or a.wacli_queue[insert].kind == .slack_attach or a.wacli_queue[insert].kind == .reaction)) insert += 1;
         var shift = a.wacli_queue_len;
         while (shift > insert) : (shift -= 1) a.wacli_queue[shift] = a.wacli_queue[shift - 1];
         a.wacli_queue[insert] = job;
@@ -1397,7 +1430,14 @@ fn wacliEnqueue(a: *App, job: WacliJob, urgent: bool) void {
     // Two worker lanes (wacli and Slack) scan the same queue: wake both.
     a.wacli_cond.broadcast(a.io);
     a.wacli_mutex.unlock(a.io);
-    if (dropped_reaction) setStatus(a, "Reaction queue is full; try again");
+    if (dropped_reaction) {
+        // The optimistic bubble stays; its retry timer sends it again.
+        if (findPendingReaction(a, dropped_msg_id.slice())) |entry| {
+            if (std.mem.eql(u8, entry.emoji.slice(), dropped_emoji.slice()) and entry.retry_at_ms == 0)
+                entry.retry_at_ms = win.GetTickCount64() + 3_000;
+        }
+        setStatus(a, "Reaction queue is full; retrying");
+    }
     if (a.wacli_thread == null or (jobIsSlack(job.kind) and a.wacli_slack_thread == null)) wacliPumpSync(a);
 }
 
@@ -7079,6 +7119,7 @@ fn applyMessageData(a: *App, raw: []const u8, final: bool) void {
         while (shift + 1 < a.message_count) : (shift += 1) a.messages[shift] = a.messages[shift + 1];
         a.message_count -= 1;
     }
+    reapplyPendingReactions(a, chat.jid.slice());
     if (selected_id.len > 0) {
         for (a.messages[0..a.message_count], 0..) |*message, index| {
             if (std.mem.eql(u8, selected_id.slice(), message.id.slice())) {
@@ -8533,48 +8574,152 @@ fn reactToSelected(a: *App, command: u16) void {
         return;
     };
     if (selected >= a.message_count or a.selected_chat >= a.chat_count) return;
-    const message = &a.messages[selected];
+    reactToMessage(a, a.chats[a.selected_chat].jid.slice(), a.messages[selected].id.slice(), emoji);
+}
+
+fn findPendingReaction(a: *App, msg_id: []const u8) ?*PendingReaction {
+    for (a.pending_reactions[0..a.pending_reaction_count]) |*entry| {
+        if (std.mem.eql(u8, entry.msg_id.slice(), msg_id)) return entry;
+    }
+    return null;
+}
+
+fn removePendingReaction(a: *App, entry: *PendingReaction) void {
+    const index = (@intFromPtr(entry) - @intFromPtr(&a.pending_reactions[0])) / @sizeOf(PendingReaction);
+    var shift = index;
+    while (shift + 1 < a.pending_reaction_count) : (shift += 1) a.pending_reactions[shift] = a.pending_reactions[shift + 1];
+    a.pending_reaction_count -= 1;
+}
+
+fn findLoadedMessage(a: *App, msg_id: []const u8) ?*Message {
+    for (a.messages[0..a.message_count]) |*message| {
+        if (std.mem.eql(u8, message.id.slice(), msg_id)) return message;
+    }
+    return null;
+}
+
+/// React optimistically: the emoji shows on the bubble at once, muted until
+/// wacli confirms, and is taken off again if every retry fails. An empty
+/// emoji removes the reaction.
+fn reactToMessage(a: *App, jid: []const u8, msg_id: []const u8, emoji: []const u8) void {
+    if (a.selected_chat >= a.chat_count or !std.mem.eql(u8, a.chats[a.selected_chat].jid.slice(), jid)) {
+        setStatus(a, "The chat changed; reaction not sent");
+        return;
+    }
     const chat = &a.chats[a.selected_chat];
+    if (chat.provider != .whatsapp) {
+        setStatus(a, "Reactions work in WhatsApp chats only for now");
+        return;
+    }
+    const message = findLoadedMessage(a, msg_id) orelse {
+        setStatus(a, "That message is no longer loaded");
+        return;
+    };
+    const entry = findPendingReaction(a, msg_id) orelse blk: {
+        if (a.pending_reaction_count == max_pending_reactions) {
+            setStatus(a, "Too many reactions still sending; try again");
+            return;
+        }
+        const fresh = &a.pending_reactions[a.pending_reaction_count];
+        a.pending_reaction_count += 1;
+        fresh.* = .{ .previous = message.reaction };
+        fresh.jid.set(jid);
+        fresh.msg_id.set(msg_id);
+        if (std.mem.endsWith(u8, jid, "@g.us")) fresh.sender.set(message.sender_jid.slice());
+        break :blk fresh;
+    };
+    entry.emoji.set(emoji);
+    entry.retries = 0;
+    entry.retry_at_ms = 0;
+    message.reaction.set(a.allocator, emoji);
+    message.reaction_pending = true;
+    if (a.canvas) |canvas| _ = win.InvalidateRect(canvas, null, win.FALSE);
+    if (emoji.len > 0) {
+        if (emoji_picker.indexOf(emoji)) |index| {
+            emoji_picker.pushRecent(&a.emoji_recents, &a.emoji_recents_count, index);
+            saveEmojiRecents(a);
+        }
+    }
+    enqueueReactionJob(a, entry);
+    setStatus(a, if (emoji.len == 0) "Removing reaction..." else "Reacting...");
+}
+
+/// Queue `wacli send react` without stopping live sync. Since wacli 0.19 a
+/// send that finds the store locked hands itself to the running sync process
+/// over .send.sock, so the reaction rides sync's open connection instead of a
+/// cold connect. --lock-wait delays that handoff by its full length, so it is
+/// 0s while sync runs; with sync down the reaction takes the lock itself.
+fn enqueueReactionJob(a: *App, entry: *const PendingReaction) void {
     var args: [16][]const u8 = undefined;
     var count: usize = 0;
-    for ([_][]const u8{ a.wacli_path, "--json", "--lock-wait", "10s", "send", "react", "--to", chat.jid.slice(), "--id", message.id.slice(), "--reaction", emoji }) |argument| {
+    const lock_wait = if (a.sync_child != null) "0s" else "10s";
+    for ([_][]const u8{ a.wacli_path, "--json", "--lock-wait", lock_wait, "send", "react", "--to", entry.jid.slice(), "--id", entry.msg_id.slice(), "--reaction", entry.emoji.slice() }) |argument| {
         args[count] = argument;
         count += 1;
     }
-    if (std.mem.endsWith(u8, chat.jid.slice(), "@g.us") and message.sender_jid.len > 0) {
+    if (entry.sender.len > 0) {
         args[count] = "--sender";
-        count += 1;
-        args[count] = message.sender_jid.slice();
-        count += 1;
+        args[count + 1] = entry.sender.slice();
+        count += 2;
     }
-    setStatus(a, if (emoji.len == 0) "Removing reaction..." else "Adding reaction...");
-    // Pause live sync on the UI thread before the worker spawns the write;
-    // the worker cannot touch the sync child itself.
-    stopSync(a);
     var job = WacliJob{ .kind = .reaction };
-    job.jid.set(chat.jid.slice());
-    job.msg_id.set(message.id.slice());
-    job.extra.set(emoji);
+    job.jid.set(entry.jid.slice());
+    job.msg_id.set(entry.msg_id.slice());
+    job.extra.set(entry.emoji.slice());
     wacliJobArgs(&job, args[0..count]);
-    // FIFO, not urgent: two quick reactions (add then remove) must reach the
-    // server in the order the user made them.
-    wacliEnqueue(a, job, false);
+    // Urgent: ahead of chat and message refreshes, but behind reactions
+    // already queued so an add then remove reach the server in that order.
+    wacliEnqueue(a, job, true);
 }
 
 fn applyReaction(a: *App, result: *WacliResult) void {
     defer if (!mediaBusy(a)) startSync(a);
-    if (!result.ok) {
-        setStatus(a, "Reaction failed");
-        return;
-    }
-    for (a.messages[0..a.message_count]) |*message| {
-        if (std.mem.eql(u8, message.id.slice(), result.msg_id.slice())) {
-            message.reaction.set(a.allocator, result.extra.slice());
-            break;
+    const entry = findPendingReaction(a, result.msg_id.slice()) orelse return;
+    // A newer reaction to the same message is queued behind this one; its
+    // result decides what the bubble shows.
+    if (!std.mem.eql(u8, entry.emoji.slice(), result.extra.slice())) return;
+    const message = findLoadedMessage(a, result.msg_id.slice());
+    if (result.ok) {
+        if (message) |target| target.reaction_pending = false;
+        removePendingReaction(a, entry);
+        setStatus(a, if (result.extra.len == 0) "Reaction removed" else "Reaction sent");
+    } else {
+        entry.retries += 1;
+        if (sendRetryDelayMs(entry.retries)) |delay| {
+            // Reactions are idempotent, so any failure is safe to retry.
+            entry.retry_at_ms = win.GetTickCount64() + delay;
+            setStatus(a, "Reaction not sent yet; retrying");
+            return;
         }
+        if (message) |target| {
+            target.reaction = entry.previous;
+            target.reaction_pending = false;
+        }
+        removePendingReaction(a, entry);
+        setStatus(a, "Reaction failed and was taken off");
     }
-    if (a.canvas) |canvas| _ = win.InvalidateRect(canvas, null, win.TRUE);
-    setStatus(a, if (result.extra.len == 0) "Reaction removed" else "Reaction sent");
+    if (a.canvas) |canvas| _ = win.InvalidateRect(canvas, null, win.FALSE);
+}
+
+/// Refresh-timer hook: re-queue reactions whose retry backoff has passed.
+fn retryPendingReactions(a: *App) void {
+    const now = win.GetTickCount64();
+    for (a.pending_reactions[0..a.pending_reaction_count]) |*entry| {
+        if (entry.retry_at_ms == 0 or entry.retry_at_ms > now) continue;
+        entry.retry_at_ms = 0;
+        enqueueReactionJob(a, entry);
+    }
+}
+
+/// A reload rebuilds reactions from the store, which may not have a pending
+/// one yet: put pending reactions back on their bubbles.
+fn reapplyPendingReactions(a: *App, jid: []const u8) void {
+    for (a.pending_reactions[0..a.pending_reaction_count]) |*entry| {
+        if (!std.mem.eql(u8, entry.jid.slice(), jid)) continue;
+        const message = findLoadedMessage(a, entry.msg_id.slice()) orelse continue;
+        message.reaction.set(a.allocator, entry.emoji.slice());
+        message.reaction_pending = true;
+    }
 }
 
 fn insertEmoji(a: *App, emoji: []const u8) void {
@@ -8599,61 +8744,84 @@ fn openEmojiPicker(a: *App) void {
         closeEmojiPicker(a);
         return;
     }
+    a.emoji_react = false;
     showEmojiPickerWindow(a);
 }
 
-/// Fills the match list: recent emojis first when the query is empty, else
-/// every catalog entry whose name contains the query.
+/// Ctrl+R: the composer's emoji picker, but Enter reacts to the highlighted
+/// message (or the newest incoming one) instead of inserting the emoji.
+fn openReactionPicker(a: *App) void {
+    if (a.emoji_wnd) |picker| _ = win.DestroyWindow(picker);
+    if (a.selected_chat >= a.chat_count or a.message_count == 0) return;
+    const chat = &a.chats[a.selected_chat];
+    if (chat.provider != .whatsapp) {
+        setStatus(a, "Reactions work in WhatsApp chats only for now");
+        return;
+    }
+    if (a.selected_message == null or a.selected_message.? >= a.message_count) {
+        var index = a.message_count;
+        while (index > 0) {
+            index -= 1;
+            if (!a.messages[index].from_me) {
+                a.selected_message = index;
+                break;
+            }
+        }
+    }
+    const selected = a.selected_message orelse {
+        setStatus(a, "No incoming message to react to");
+        return;
+    };
+    scrollToSelectedMessage(a);
+    if (a.canvas) |canvas| _ = win.InvalidateRect(canvas, null, win.FALSE);
+    a.emoji_react = true;
+    a.emoji_react_jid.set(chat.jid.slice());
+    a.emoji_react_id.set(a.messages[selected].id.slice());
+    showEmojiPickerWindow(a);
+}
+
+fn emojiCell(a: *const App) i32 {
+    return px(a, emoji_picker.cell_size);
+}
+
+fn emojiEditZone(a: *const App) i32 {
+    return px(a, emoji_edit_zone_base);
+}
+
+fn emojiPickerWidth(a: *const App) i32 {
+    return emojiCell(a) * @as(i32, @intCast(emoji_picker.grid_columns)) + px(a, 12) + scrollbar_width;
+}
+
+/// Fills the match list. An empty query shows the "frequently used" row
+/// (recent reactions and picks, topped up with common reactions) and then the
+/// whole catalog; otherwise the matches, best first.
 fn buildEmojiMatches(a: *App) void {
     a.emoji_match_count = 0;
     var query_buf: [64]u16 = [_]u16{0} ** 64;
     const query_len: usize = if (a.emoji_edit) |edit| @intCast(win.GetWindowTextW(edit, &query_buf, query_buf.len)) else 0;
-    if (query_len == 0) {
-        for (a.emoji_recents[0..a.emoji_recents_count]) |recent| {
-            a.emoji_matches[a.emoji_match_count] = recent;
-            a.emoji_match_count += 1;
-        }
-        for (0..emoji_picker.catalog.len) |index| {
-            var recent = false;
-            for (a.emoji_matches[0..a.emoji_match_count]) |match| {
-                if (match == index) recent = true;
-            }
-            if (recent) continue;
-            a.emoji_matches[a.emoji_match_count] = @intCast(index);
-            a.emoji_match_count += 1;
-        }
-        return;
+    var utf8_buf: [192]u8 = undefined;
+    const utf8_len = std.unicode.utf16LeToUtf8(&utf8_buf, query_buf[0..query_len]) catch 0;
+    const query = std.mem.trim(u8, utf8_buf[0..utf8_len], " ");
+    for (@constCast(query)) |*character| character.* = std.ascii.toLower(character.*);
+    if (query.len == 0) {
+        var row: [emoji_picker.grid_columns]u16 = undefined;
+        const frequent = emoji_picker.frequentRow(a.emoji_recents[0..a.emoji_recents_count], &row);
+        @memcpy(a.emoji_matches[0..frequent], row[0..frequent]);
+        a.emoji_match_count = frequent;
     }
-    const utf8_query = std.unicode.utf16LeToUtf8Alloc(a.allocator, query_buf[0..query_len]) catch {
-        // On conversion failure show the unfiltered catalog rather than none.
-        buildEmojiMatchesEmptyQuery(a);
-        return;
-    };
-    defer a.allocator.free(utf8_query);
-    for (utf8_query) |*character| character.* = std.ascii.toLower(character.*);
-    for (emoji_picker.catalog, 0..) |entry, index| {
-        if (!emoji_picker.nameMatches(entry.name, utf8_query)) continue;
-        a.emoji_matches[a.emoji_match_count] = @intCast(index);
-        a.emoji_match_count += 1;
-    }
-}
-
-fn buildEmojiMatchesEmptyQuery(a: *App) void {
-    a.emoji_match_count = 0;
-    for (0..emoji_picker.catalog.len) |index| {
-        a.emoji_matches[a.emoji_match_count] = @intCast(index);
-        a.emoji_match_count += 1;
-    }
+    a.emoji_match_count += emoji_picker.search(query, a.emoji_matches[a.emoji_match_count..]);
 }
 
 fn emojiLayout(a: *App) void {
     const picker = a.emoji_wnd orelse return;
-    const match_rows: i32 = @intCast(@divTrunc(a.emoji_match_count + emoji_picker.grid_columns - 1, emoji_picker.grid_columns));
+    const columns = emoji_picker.grid_columns;
+    const match_rows: i32 = @intCast(@divTrunc(a.emoji_match_count + columns - 1, columns));
     const rows = @max(1, @min(match_rows, emoji_max_rows));
-    const height = emoji_edit_zone + rows * emoji_picker.grid_row_height + 12;
-    _ = win.SetWindowPos(picker, null, 0, 0, emoji_picker_width, height, win.SWP_NOMOVE | win.SWP_NOZORDER | win.SWP_NOACTIVATE);
+    const width = emojiPickerWidth(a);
+    const height = emojiEditZone(a) + rows * emojiCell(a) + px(a, 12);
+    _ = win.SetWindowPos(picker, null, 0, 0, width, height, win.SWP_NOMOVE | win.SWP_NOZORDER | win.SWP_NOACTIVATE);
     if (a.emoji_list) |list| {
-        _ = win.MoveWindow(list, 1, emoji_edit_zone, emoji_picker_width - 2 - scrollbar_width, height - emoji_edit_zone - 1, win.TRUE);
+        _ = win.MoveWindow(list, 1, emojiEditZone(a), width - 2 - scrollbar_width, height - emojiEditZone(a) - 1, win.TRUE);
     }
 }
 
@@ -8690,15 +8858,21 @@ fn emojiMove(a: *App, delta_columns: i32, delta_rows: i32) void {
 fn emojiActivate(a: *App) void {
     if (a.emoji_selected >= a.emoji_match_count) return;
     const catalog_index = a.emoji_matches[a.emoji_selected];
-    const emoji = emoji_picker.catalog[catalog_index].emoji;
+    const emoji = emoji_picker.emoji(catalog_index);
+    const react = a.emoji_react;
+    closeEmojiPicker(a);
+    if (react) {
+        // reactToMessage records the pick in the recents itself.
+        reactToMessage(a, a.emoji_react_jid.slice(), a.emoji_react_id.slice(), emoji);
+        return;
+    }
     emoji_picker.pushRecent(&a.emoji_recents, &a.emoji_recents_count, catalog_index);
     saveEmojiRecents(a);
-    closeEmojiPicker(a);
     insertEmoji(a, emoji);
 }
 
 fn emojiCellClicked(a: *App, x: i32, item_index: i32) void {
-    const column = emoji_picker.cellFromHit(x) orelse return;
+    const column = emoji_picker.cellFromHit(x, emojiCell(a)) orelse return;
     const index = @as(i32, @intCast(item_index)) * @as(i32, @intCast(emoji_picker.grid_columns)) + @as(i32, @intCast(column));
     if (index < 0 or index >= @as(i32, @intCast(a.emoji_match_count))) return;
     a.emoji_selected = @intCast(index);
@@ -8712,14 +8886,15 @@ fn drawEmojiCell(a: *App, item: *win.DRAWITEMSTRUCT) void {
     _ = win.SetBkMode(item.hDC, win.TRANSPARENT);
     const row: i32 = @intCast(item.itemID);
     const columns: i32 = @intCast(emoji_picker.grid_columns);
+    const cell_size = emojiCell(a);
     for (0..emoji_picker.grid_columns) |column| {
         const index = row * columns + @as(i32, @intCast(column));
         if (index < 0 or index >= @as(i32, @intCast(a.emoji_match_count))) break;
         const catalog_index = a.emoji_matches[@intCast(index)];
         var cell = win.RECT{
-            .left = item.rcItem.left + @as(i32, @intCast(column)) * emoji_picker.cell_size,
+            .left = item.rcItem.left + @as(i32, @intCast(column)) * cell_size,
             .top = item.rcItem.top,
-            .right = item.rcItem.left + @as(i32, @intCast(column)) * emoji_picker.cell_size + emoji_picker.cell_size,
+            .right = item.rcItem.left + @as(i32, @intCast(column)) * cell_size + cell_size,
             .bottom = item.rcItem.bottom,
         };
         if (index == @as(i32, @intCast(a.emoji_selected))) {
@@ -8728,11 +8903,11 @@ fn drawEmojiCell(a: *App, item: *win.DRAWITEMSTRUCT) void {
             _ = win.FillRect(item.hDC, &cell, selected_brush);
         }
         var wide = WideText(31){};
-        wide.set(a.allocator, emoji_picker.catalog[catalog_index].emoji);
+        wide.set(a.allocator, emoji_picker.emoji(catalog_index));
         if (wide.len == 0) continue;
-        const em: i32 = 28;
-        const offset_x = cell.left + @divTrunc(emoji_picker.cell_size - em, 2);
-        const offset_y = cell.top + @divTrunc(emoji_picker.cell_size - em, 2);
+        const em: i32 = px(a, 28);
+        const offset_x = cell.left + @divTrunc(cell_size - em, 2);
+        const offset_y = cell.top + @divTrunc(cell_size - em, 2);
         if (emoji_draw.draw(item.hDC, wide.slice(), offset_x, offset_y, em, em) == null) {
             const fallback_font = (if (a.font_emoji != null) a.font_emoji else a.font) orelse return;
             _ = win.SelectObject(item.hDC, @ptrCast(fallback_font));
@@ -8745,17 +8920,20 @@ fn showEmojiPickerWindow(a: *App) void {
     const owner = a.hwnd orelse return;
     var owner_rect: win.RECT = undefined;
     _ = win.GetWindowRect(owner, &owner_rect);
-    const x = owner_rect.right - emoji_picker_width - 16;
-    const y = owner_rect.bottom - emoji_edit_zone - emoji_max_rows * emoji_picker.grid_row_height - 120;
+    const width = emojiPickerWidth(a);
+    const edit_zone = emojiEditZone(a);
+    const grid_height = emoji_max_rows * emojiCell(a) + px(a, 12);
+    const x = owner_rect.right - width - px(a, 16);
+    const y = owner_rect.bottom - edit_zone - grid_height - px(a, 120);
     const picker = win.CreateWindowExW(
         win.WS_EX_TOOLWINDOW,
         lit("MessagesEmojiPicker"),
         null,
         win.WS_POPUP,
-        @max(owner_rect.left + 8, x),
-        @max(owner_rect.top + 60, y),
-        emoji_picker_width,
-        emoji_edit_zone + emoji_max_rows * emoji_picker.grid_row_height + 12,
+        @max(owner_rect.left + px(a, 8), x),
+        @max(owner_rect.top + px(a, 60), y),
+        width,
+        edit_zone + grid_height,
         owner,
         null,
         a.instance,
@@ -8767,14 +8945,16 @@ fn showEmojiPickerWindow(a: *App) void {
     _ = win.DwmSetWindowAttribute(picker, 33, &corner, @sizeOf(win.DWORD));
     var margins = win.MARGINS{ .cxLeftWidth = 0, .cxRightWidth = 0, .cyTopHeight = 0, .cyBottomHeight = 1 };
     _ = win.DwmExtendFrameIntoClientArea(picker, &margins);
-    a.emoji_edit = win.CreateWindowExW(0, lit("EDIT"), null, win.WS_CHILD | win.WS_VISIBLE | win.WS_TABSTOP | win.ES_AUTOHSCROLL, 16, 13, emoji_picker_width - 32, 36, picker, controlId(id_emoji_edit), a.instance, null);
-    a.emoji_list = win.CreateWindowExW(0, lit("LISTBOX"), null, win.WS_CHILD | win.WS_VISIBLE | win.LBS_NOTIFY | win.LBS_OWNERDRAWFIXED | win.LBS_NOINTEGRALHEIGHT, 1, emoji_edit_zone, emoji_picker_width - 2 - scrollbar_width, emoji_max_rows * emoji_picker.grid_row_height + 12, picker, controlId(id_emoji_list), a.instance, null);
+    const edit_height = px(a, 36);
+    a.emoji_edit = win.CreateWindowExW(0, lit("EDIT"), null, win.WS_CHILD | win.WS_VISIBLE | win.WS_TABSTOP | win.ES_AUTOHSCROLL, px(a, 16), @divTrunc(edit_zone - edit_height, 2), width - px(a, 32), edit_height, picker, controlId(id_emoji_edit), a.instance, null);
+    a.emoji_list = win.CreateWindowExW(0, lit("LISTBOX"), null, win.WS_CHILD | win.WS_VISIBLE | win.LBS_NOTIFY | win.LBS_OWNERDRAWFIXED | win.LBS_NOINTEGRALHEIGHT, 1, edit_zone, width - 2 - scrollbar_width, grid_height, picker, controlId(id_emoji_list), a.instance, null);
     setFont(a.emoji_edit, a.font);
     setFont(a.emoji_list, a.font);
     if (a.emoji_edit) |edit| {
-        _ = win.SendMessageW(edit, win.EM_SETCUEBANNER, 1, @bitCast(@intFromPtr(lit("Search emoji"))));
+        const cue = if (a.emoji_react) lit("React: search emoji (thumbs, heart, laugh...)") else lit("Search emoji");
+        _ = win.SendMessageW(edit, win.EM_SETCUEBANNER, 1, @bitCast(@intFromPtr(cue)));
     }
-    if (a.emoji_list) |list| _ = win.SendMessageW(list, win.LB_SETITEMHEIGHT, 0, emoji_picker.grid_row_height);
+    if (a.emoji_list) |list| _ = win.SendMessageW(list, win.LB_SETITEMHEIGHT, 0, emojiCell(a));
     emojiFilter(a);
     _ = win.ShowWindow(picker, win.SW_SHOW);
     if (a.emoji_edit) |edit| _ = win.SetFocus(edit);
@@ -8814,12 +8994,13 @@ fn emojiProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.
             var client: win.RECT = undefined;
             _ = win.GetClientRect(hwnd, &client);
             _ = win.FillRect(hdc, &client, a.brush_panel.?);
-            var separator = win.RECT{ .left = 0, .top = emoji_edit_zone - 2, .right = client.right, .bottom = emoji_edit_zone - 1 };
+            const edit_zone = emojiEditZone(a);
+            var separator = win.RECT{ .left = 0, .top = edit_zone - 2, .right = client.right, .bottom = edit_zone - 1 };
             _ = win.FillRect(hdc, &separator, a.brush_raised.?);
             if (a.emoji_match_count == 0) {
                 _ = win.SetTextColor(hdc, color_muted);
                 _ = win.SelectObject(hdc, @ptrCast(a.font.?));
-                var empty_rect = win.RECT{ .left = 20, .top = emoji_edit_zone + 4, .right = client.right - 20, .bottom = emoji_edit_zone + 36 };
+                var empty_rect = win.RECT{ .left = px(a, 20), .top = edit_zone + px(a, 4), .right = client.right - px(a, 20), .bottom = edit_zone + px(a, 36) };
                 _ = win.DrawTextW(hdc, lit("No matching emoji"), -1, &empty_rect, win.DT_LEFT | win.DT_SINGLELINE | win.DT_VCENTER);
             }
             if (a.emoji_list) |list| drawScrollbar(hdc, stripRightOf(list, hwnd), listboxScrollInfo(list), a.brush_muted.?);
@@ -8921,21 +9102,6 @@ fn openReactionMenu(a: *App, x: i32, y: i32) void {
     addReactionItems(menu);
     const choice = win.TrackPopupMenu(menu, win.TPM_RETURNCMD | win.TPM_NONOTIFY, x, y, 0, a.hwnd.?, null);
     if (choice == command_reply) startReply(a) else reactToSelected(a, @intCast(choice));
-}
-
-fn openReactionMenuForSelected(a: *App) void {
-    const canvas = a.canvas orelse return;
-    if (a.message_count == 0) return;
-    if (a.selected_message == null) a.selected_message = a.message_count - 1;
-    scrollToSelectedMessage(a);
-    _ = win.InvalidateRect(canvas, null, win.FALSE);
-    _ = win.UpdateWindow(canvas);
-    const message = &a.messages[a.selected_message.?];
-    const bubble = message.bubble_hit;
-    if (bubble.right <= bubble.left) return;
-    var point = win.POINT{ .x = @divTrunc(bubble.left + bubble.right, 2), .y = bubble.bottom };
-    _ = win.ClientToScreen(canvas, &point);
-    openReactionMenu(a, point.x, point.y);
 }
 
 /// Queue an unarchive for a chat the inbox list does not show (WAZI-62).
@@ -10103,7 +10269,7 @@ fn runCommand(a: *App, command: u16) void {
         command_quit => {
             if (a.hwnd) |hwnd| _ = win.PostMessageW(hwnd, win.WM_CLOSE, 0, 0);
         },
-        command_react_menu => openReactionMenuForSelected(a),
+        command_react_menu => openReactionPicker(a),
         command_copy_text => copySelectedText(a),
         command_copy_link => copySelectedLink(a),
         command_play_audio => playSelectedAudio(a),
@@ -11524,7 +11690,8 @@ fn drawCanvas(hwnd: win.HWND, a: *App) void {
         }
         if (message.reaction.len > 0) {
             _ = win.SelectObject(hdc, @ptrCast(a.font.?));
-            _ = win.SetTextColor(hdc, color_text);
+            // Muted until wacli confirms an optimistic reaction.
+            _ = win.SetTextColor(hdc, if (message.reaction_pending) color_muted else color_text);
             var reaction_rect = win.RECT{ .left = left + px(a, 12), .top = y + height - px(a, 30), .right = left + px(a, 52), .bottom = y + height - px(a, 6) };
             _ = win.DrawTextW(hdc, message.reaction.ptr(), @intCast(message.reaction.len), &reaction_rect, win.DT_LEFT | win.DT_SINGLELINE | win.DT_VCENTER);
         }
@@ -12249,6 +12416,7 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
             if (wparam == timer_refresh) {
                 checkMediaDownload(a);
                 checkSend(a);
+                retryPendingReactions(a);
                 checkMarkRead(a);
                 checkAvatarDownload(a);
                 checkArchive(a);
@@ -12703,7 +12871,7 @@ fn handleKeyboard(a: *App, message: *const win.MSG) bool {
         return true;
     }
     if (control and key == 'R') {
-        openReactionMenuForSelected(a);
+        openReactionPicker(a);
         return true;
     }
     if (control and key == 'P') {
