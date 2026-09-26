@@ -19,6 +19,4 @@ pub const c = @cImport({
     @cInclude("mfreadwrite.h");
     @cInclude("mfplay.h");
     @cInclude("winhttp.h");
-    @cInclude("d2d1.h");
-    @cInclude("dwrite.h");
 });
