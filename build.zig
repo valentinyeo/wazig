@@ -81,6 +81,9 @@ pub fn build(b: *std.Build) void {
     exe.root_module.link_libc = true;
     for ([_][]const u8{
         "user32",
+        // Before gdi32: newer gdi32 import libs also list the Script* calls,
+        // and usp10.dll is the export every supported Windows has.
+        "usp10",
         "gdi32",
         "kernel32",
         "comctl32",
@@ -97,8 +100,6 @@ pub fn build(b: *std.Build) void {
         "comdlg32",
         "urlmon",
         "msimg32",
-        "d2d1",
-        "dwrite",
     }) |library| {
         exe.root_module.linkSystemLibrary(library, .{});
     }
@@ -159,7 +160,7 @@ pub fn build(b: *std.Build) void {
 
     // Tests live in Windows-free modules so they run on any host.
     const test_step = b.step("test", "Run unit tests");
-    for ([_][]const u8{ "src/chat_order.zig", "src/emoji_picker.zig", "src/played.zig", "src/pending_reads.zig", "src/update.zig", "src/avatar_mask.zig", "src/compose_layout.zig", "src/scrollbar.zig", "src/message_scroll.zig", "src/media_age.zig", "src/paste_image.zig", "src/telegram_json.zig", "src/accounts.zig", "src/slack.zig", "src/message_filter.zig", "src/chat_cache.zig", "src/unfurl.zig", "src/auth_status.zig", "src/messenger_view.zig", "src/shortcuts.zig", "src/sidebar_nav.zig", "src/sync_gate.zig", "src/control.zig" }) |test_root| {
+    for ([_][]const u8{ "src/chat_order.zig", "src/emoji_picker.zig", "src/played.zig", "src/pending_reads.zig", "src/update.zig", "src/avatar_mask.zig", "src/compose_layout.zig", "src/scrollbar.zig", "src/message_scroll.zig", "src/media_age.zig", "src/paste_image.zig", "src/telegram_json.zig", "src/accounts.zig", "src/slack.zig", "src/message_filter.zig", "src/chat_cache.zig", "src/unfurl.zig", "src/auth_status.zig", "src/messenger_view.zig", "src/shortcuts.zig", "src/sidebar_nav.zig", "src/sync_gate.zig", "src/control.zig", "src/colr.zig" }) |test_root| {
         const tests = b.addTest(.{
             .root_module = b.createModule(.{
                 .root_source_file = b.path(test_root),

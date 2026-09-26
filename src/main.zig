@@ -11360,13 +11360,13 @@ fn runWidth(hdc: win.HDC, text: []const u16) i32 {
     return size.cx;
 }
 
-/// Draws one emoji run with DirectWrite color glyphs when available, else the
+/// Draws one emoji run with the COLR colour layers (emoji_draw.zig) when available, else the
 /// monochrome GDI font. Returns the run width in pixels; measuring and
 /// painting always use the same source so wrapping stays consistent.
 fn drawEmojiRun(hdc: win.HDC, emoji_font: win.HFONT, text_ascent: i32, line_height: i32, slice: []const u16, cursor: i32, y: i32, draw: bool) i32 {
     const em = line_height;
-    // A paint pass measures and paints from the one layout draw() builds;
-    // a measuring pass only needs the width and must not build a target.
+    // A paint pass measures and paints from the one shaping call draw()
+    // makes; a measuring pass only needs the width and renders nothing.
     if (draw) {
         if (emoji_draw.draw(hdc, slice, cursor, y, text_ascent, em)) |run_metrics| return run_metrics.width;
     } else if (emoji_draw.metrics(slice, em)) |run_metrics| {

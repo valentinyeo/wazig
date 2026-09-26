@@ -1,74 +1,111 @@
-//! Color emoji rendering via Direct2D + DirectWrite color fonts (Windows 10
-//! floor). The rasterizer binds the caller's destination DC with an
-//! ID2D1DCRenderTarget and draws emoji runs in place, so wrapping and painting
-//! share one measurement and no bitmap cache is kept (grayscale AA, no GDI
-//! bitmap management). Every failure returns false and the caller falls back
-//! to the existing GDI monochrome path; the reason is recorded (failureNotice)
-//! so the app can say why, and transient failures retry instead of latching
-//! colour off for the session (WAZI-65).
+//! Colour emoji with plain GDI: Segoe UI Emoji's COLRv0 layers (colr.zig)
+//! drawn one by one with ExtTextOutW(ETO_GLYPH_INDEX). No Direct2D or
+//! DirectWrite, so d2d1.dll, dwrite.dll and the D3D10Warp software rasterizer
+//! never load (the app's premise is a small memory footprint).
+//!
+//! Uniscribe (usp10) shapes each run so ZWJ families, skin tones and keycaps
+//! become the font's single composed glyph. Every layer is rendered as a
+//! grayscale-antialiased coverage mask, tinted with its CPAL colour, composed
+//! into a premultiplied bitmap and AlphaBlended onto the caller's DC, so the
+//! emoji sits correctly on any bubble colour. Composed bitmaps are cached per
+//! (glyph, size, text colour). Measuring and drawing share one shaping call,
+//! so wrapping always matches what is painted.
+//!
+//! Every failure returns null and the caller falls back to the GDI monochrome
+//! path; the reason is recorded (failureNotice) and logged to emoji.log.
 const std = @import("std");
 const build_info = @import("build_info");
+const colr = @import("colr.zig");
 const win = @import("win32.zig").c;
-
-// mingw headers do not export these IIDs as linkable symbols, so define them
-// here (from the public interface docs).
-const iid_id2d1_factory = win.GUID{
-    .Data1 = 0x06152247,
-    .Data2 = 0x6f50,
-    .Data3 = 0x465a,
-    .Data4 = .{ 0x92, 0x45, 0x11, 0x8b, 0xfd, 0x3b, 0x60, 0x07 },
-};
-const iid_idwrite_factory = win.GUID{
-    .Data1 = 0xb859ee5a,
-    .Data2 = 0xd838,
-    .Data3 = 0x4b5b,
-    .Data4 = .{ 0xa2, 0xe8, 0x1a, 0xdc, 0x7d, 0x93, 0xdb, 0x48 },
-};
 
 pub const Metrics = struct { width: i32, baseline: i32 };
 
 const max_sequence_units = 32;
-const format_cache_size = 8;
+// Uniscribe's documented worst case for the glyph buffer is 1.5n + 16.
+const max_glyphs = max_sequence_units * 3 / 2 + 16;
+const font_cache_size = 8;
+const bitmap_cache_size = 128;
 
-const FormatEntry = struct { em: i32, format: ?*win.IDWriteTextFormat = null };
+const tag_colr: win.DWORD = 0x524C4F43; // 'COLR' as GetFontData wants it
+const tag_cpal: win.DWORD = 0x4C415043; // 'CPAL'
+const gdi_error: win.DWORD = 0xFFFFFFFF;
+const usp_e_script_not_in_font: win.HRESULT = @bitCast(@as(u32, 0x80040200));
+
+// usp10.h's SCRIPT_ANALYSIS and SCRIPT_VISATTR are bitfield structs that
+// translate-c cannot express, so declare the ABI-equal shapes here.
+const ScriptAnalysis = extern struct { bits: u16 = 0, state: u16 = 0 };
+const ScriptItem = extern struct { char_pos: c_int, analysis: ScriptAnalysis };
+const ScriptVisAttr = extern struct { bits: u16 };
+const GOffset = extern struct { du: i32, dv: i32 };
+const ScriptCache = ?*anyopaque;
+
+extern "usp10" fn ScriptItemize(chars: [*]const u16, char_count: c_int, max_items: c_int, control: ?*const anyopaque, script_state: ?*const anyopaque, items: [*]ScriptItem, item_count: *c_int) callconv(.c) win.HRESULT;
+extern "usp10" fn ScriptShape(hdc: win.HDC, cache: *ScriptCache, chars: [*]const u16, char_count: c_int, max_glyph_count: c_int, analysis: *ScriptAnalysis, glyphs: [*]u16, clusters: [*]u16, attributes: [*]ScriptVisAttr, glyph_count: *c_int) callconv(.c) win.HRESULT;
+extern "usp10" fn ScriptPlace(hdc: win.HDC, cache: *ScriptCache, glyphs: [*]const u16, glyph_count: c_int, attributes: [*]const ScriptVisAttr, analysis: *ScriptAnalysis, advances: [*]c_int, offsets: [*]GOffset, abc: ?*win.ABC) callconv(.c) win.HRESULT;
+extern "usp10" fn ScriptFreeCache(cache: *ScriptCache) callconv(.c) win.HRESULT;
 
 /// Stages where the colour path can bail, in call order. Each maps to a
 /// plain-language reason the status bar and Ctrl+K palette can show (WAZI-65).
-/// render_target_create and render_target_brush are separate stages so the
-/// log names the exact Direct2D call that failed (WAZI-65 evidence).
-const ErrorStage = enum { d2d_factory, dwrite_factory, render_target_create, render_target_brush, bind, format, layout, draw };
+const ErrorStage = enum { surface, font, colour_tables, colour_parse, shape, bitmap };
+
+const FontEntry = struct {
+    em: i32 = 0,
+    font: ?win.HFONT = null,
+    cache: ScriptCache = null,
+    ascent: i32 = 0,
+    height: i32 = 0,
+};
+
+const BitmapEntry = struct {
+    glyph: u16 = 0,
+    em: i32 = 0,
+    foreground: win.COLORREF = 0,
+    width: i32 = 0,
+    height: i32 = 0,
+    pixels: []u8 = &.{},
+    last_used: u64 = 0,
+};
+
+const ColourLoad = enum { pending, ready, failed };
 
 const State = struct {
-    factory: ?*win.ID2D1Factory = null,
-    dwrite: ?*win.IDWriteFactory = null,
-    target: ?*win.ID2D1DCRenderTarget = null,
-    brush: ?*win.ID2D1SolidColorBrush = null,
-    bound_hdc: ?win.HDC = null,
-    formats: [format_cache_size]FormatEntry = [_]FormatEntry{.{ .em = 0 }} ** format_cache_size,
-    format_count: usize = 0,
+    // One memory DC for shaping, measuring and layer rendering; metrics()
+    // has no caller DC, and the scratch bitmap lives here too.
+    dc: ?win.HDC = null,
+    scratch: ?win.HBITMAP = null,
+    scratch_bits: ?[*]u8 = null,
+    scratch_width: i32 = 0,
+    scratch_height: i32 = 0,
+    selected_em: i32 = 0,
+    fonts: [font_cache_size]FontEntry = [_]FontEntry{.{}} ** font_cache_size,
+    // Only the COLR v0 arrays and CPAL palette 0 are kept (one allocation);
+    // the table's v1 paint data is never read.
+    colour: ColourLoad = .pending,
+    table: colr.Colr = .{ .base = &.{}, .layers = &.{}, .palette = &.{} },
+    bitmaps: [bitmap_cache_size]BitmapEntry = [_]BitmapEntry{.{}} ** bitmap_cache_size,
+    clock: u64 = 0,
     last_error: ?ErrorStage = null,
-    last_hr: win.HRESULT = 0,
+    last_code: u32 = 0,
     // One-shot announcement: the status bar shows each new reason once.
     announced: bool = false,
     notice_buf: [128]u8 = undefined,
 };
 var state: State = .{};
 
-fn fail(stage: ErrorStage, hr: win.HRESULT) bool {
-    if (state.last_error == null or state.last_error.? != stage or state.last_hr != hr) {
+fn fail(stage: ErrorStage, code: u32) void {
+    if (state.last_error == null or state.last_error.? != stage or state.last_code != code) {
         state.last_error = stage;
-        state.last_hr = hr;
+        state.last_code = code;
         state.announced = false;
-        logStage(stage, hr);
+        logStage(stage, code);
     }
-    return false;
 }
 
 /// Every new failure stage gets a timestamped line with the failing call's
-/// HRESULT in %LOCALAPPDATA%\Wazig\emoji.log (WAZI-65): the diagnosis must not
+/// code in %LOCALAPPDATA%\Wazig\emoji.log (WAZI-65): the diagnosis must not
 /// depend on anyone running the "Why are emoji black and white?" palette
 /// command, and the stage alone cannot tell two failing calls apart.
-fn logStage(stage: ErrorStage, hr: win.HRESULT) void {
+fn logStage(stage: ErrorStage, code: u32) void {
     var path: [280]u16 = undefined;
     const local_label = std.unicode.utf8ToUtf16LeStringLiteral("LOCALAPPDATA");
     const local_len: usize = @intCast(win.GetEnvironmentVariableW(local_label, &path, path.len - 40));
@@ -87,8 +124,8 @@ fn logStage(stage: ErrorStage, hr: win.HRESULT) void {
     var clock = std.mem.zeroes(win.SYSTEMTIME);
     win.GetLocalTime(&clock);
     var line_buf: [256]u8 = undefined;
-    const line = std.fmt.bufPrint(&line_buf, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2} v{s} colour emoji fell back at stage {s} (hr 0x{X:0>8}): {s}\r\n", .{
-        clock.wYear, clock.wMonth, clock.wDay, clock.wHour, clock.wMinute, clock.wSecond, build_info.version, @tagName(stage), @as(u32, @bitCast(hr)), stageText(stage),
+    const line = std.fmt.bufPrint(&line_buf, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2} v{s} colour emoji fell back at stage {s} (code 0x{X:0>8}): {s}\r\n", .{
+        clock.wYear, clock.wMonth, clock.wDay, clock.wHour, clock.wMinute, clock.wSecond, build_info.version, @tagName(stage), code, stageText(stage),
     }) catch return;
     const handle = win.CreateFileW(path[0..total :0].ptr, win.FILE_APPEND_DATA, win.FILE_SHARE_READ | win.FILE_SHARE_WRITE, null, win.OPEN_ALWAYS, win.FILE_ATTRIBUTE_NORMAL, null);
     if (handle == win.INVALID_HANDLE_VALUE or handle == null) return;
@@ -104,14 +141,12 @@ fn clearError() void {
 
 fn stageText(stage: ErrorStage) []const u8 {
     return switch (stage) {
-        .d2d_factory => "the Windows graphics engine (Direct2D) failed to start",
-        .dwrite_factory => "the Windows text engine (DirectWrite) failed to start",
-        .render_target_create => "the drawing surface could not be created",
-        .render_target_brush => "the drawing surface could not be created",
-        .bind => "the drawing surface could not attach to the window",
-        .format => "the emoji font (Segoe UI Emoji) could not be loaded",
-        .layout => "the emoji layout could not be measured",
-        .draw => "the colour drawing call failed",
+        .surface => "the drawing surface could not be created",
+        .font => "the emoji font (Segoe UI Emoji) could not be loaded",
+        .colour_tables => "the emoji font has no colour information",
+        .colour_parse => "the emoji font's colour information could not be read",
+        .shape => "the emoji could not be matched to the font",
+        .bitmap => "the emoji drawing surface could not be created",
     };
 }
 
@@ -134,130 +169,6 @@ pub fn takeNotice() ?[]const u8 {
     return failureNotice();
 }
 
-fn ensureFactory() bool {
-    // Check both factories independently: a half-initialised state must
-    // retry the missing piece instead of reporting ready (WAZI-65 review).
-    if (state.factory == null) {
-        const hr = win.D2D1CreateFactory(win.D2D1_FACTORY_TYPE_SINGLE_THREADED, &iid_id2d1_factory, null, @ptrCast(&state.factory));
-        if (hr != 0 or state.factory == null) {
-            return fail(.d2d_factory, hr);
-        }
-    }
-    if (state.dwrite == null) {
-        const hr = win.DWriteCreateFactory(win.DWRITE_FACTORY_TYPE_SHARED, &iid_idwrite_factory, @ptrCast(&state.dwrite));
-        if (hr != 0 or state.dwrite == null) {
-            return fail(.dwrite_factory, hr);
-        }
-    }
-    return true;
-}
-
-fn ensureTarget(hdc: win.HDC) bool {
-    const factory = state.factory orelse return false;
-    if (state.target == null) {
-        // DC render targets composite onto a GDI DC, which carries no alpha:
-        // Microsoft's CreateDCRenderTarget sample pairs D2D1_ALPHA_MODE_IGNORE
-        // with the pixel format. Every PREMULTIPLIED combination shipped so
-        // far failed on the affected machine (v0.9.33: B8G8R8A8_UNORM,
-        // v0.9.41: DXGI_FORMAT_UNKNOWN - both logged render_target), so alpha
-        // mode was the common factor. Try both documented formats with IGNORE,
-        // each failure's HRESULT lands in emoji.log for the next diagnosis.
-        const candidates = [_]win.D2D1_PIXEL_FORMAT{
-            .{ .format = win.DXGI_FORMAT_UNKNOWN, .alphaMode = win.D2D1_ALPHA_MODE_IGNORE },
-            .{ .format = win.DXGI_FORMAT_B8G8R8A8_UNORM, .alphaMode = win.D2D1_ALPHA_MODE_IGNORE },
-        };
-        var create_hr: win.HRESULT = 0;
-        for (candidates) |pixel_format| {
-            var props = win.D2D1_RENDER_TARGET_PROPERTIES{
-                .type = win.D2D1_RENDER_TARGET_TYPE_SOFTWARE,
-                .pixelFormat = pixel_format,
-                .dpiX = 96.0,
-                .dpiY = 96.0,
-                .usage = 0,
-                .minLevel = win.D2D1_FEATURE_LEVEL_DEFAULT,
-            };
-            state.target = null;
-            create_hr = factory.*.lpVtbl.*.CreateDCRenderTarget.?(factory, &props, &state.target);
-            if (create_hr == 0 and state.target != null) break;
-        }
-        if (create_hr != 0 or state.target == null) {
-            return fail(.render_target_create, create_hr);
-        }
-        const target = state.target.?;
-        const base: *win.ID2D1RenderTarget = @ptrCast(target);
-        // Grayscale, not ClearType: the target composites over whatever GDI
-        // already drew, and ClearType fringes need an opaque known background.
-        _ = base.*.lpVtbl.*.SetTextAntialiasMode.?(base, win.D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
-        const white = win.D2D1_COLOR_F{ .r = 0, .g = 0, .b = 0, .a = 1 };
-        const brush_props = win.D2D1_BRUSH_PROPERTIES{ .opacity = 1, .transform = identityMatrix() };
-        const brush_hr = base.*.lpVtbl.*.CreateSolidColorBrush.?(base, &white, &brush_props, &state.brush);
-        if (brush_hr != 0 or state.brush == null) {
-            // Drop the half-built target so the next call rebuilds both.
-            releaseTarget();
-            return fail(.render_target_brush, brush_hr);
-        }
-    }
-    const already_bound = state.bound_hdc != null and state.bound_hdc.? == hdc;
-    if (!already_bound) {
-        var rect = win.RECT{
-            .left = 0,
-            .top = 0,
-            .right = @max(1, win.GetDeviceCaps(hdc, win.HORZRES)),
-            .bottom = @max(1, win.GetDeviceCaps(hdc, win.VERTRES)),
-        };
-        const bind_hr = state.target.?.*.lpVtbl.*.BindDC.?(state.target.?, hdc, &rect);
-        if (bind_hr != 0) return fail(.bind, bind_hr);
-        state.bound_hdc = hdc;
-    }
-    return true;
-}
-
-fn identityMatrix() win.D2D1_MATRIX_3X2_F {
-    return .{ .unnamed_0 = .{ .unnamed_0 = .{ .m11 = 1, .m12 = 0, .m21 = 0, .m22 = 1, .dx = 0, .dy = 0 } } };
-}
-
-fn formatFor(em: i32) ?*win.IDWriteTextFormat {
-    const dwrite = state.dwrite orelse return null;
-    for (state.formats[0..state.format_count]) |*entry| {
-        if (entry.em == em) return entry.format;
-    }
-    var format: ?*win.IDWriteTextFormat = null;
-    const family: [:0]const u16 = std.unicode.utf8ToUtf16LeStringLiteral("Segoe UI Emoji");
-    const locale: [:0]const u16 = std.unicode.utf8ToUtf16LeStringLiteral("en-us");
-    const hr = dwrite.*.lpVtbl.*.CreateTextFormat.?(
-        dwrite,
-        family.ptr,
-        null,
-        win.DWRITE_FONT_WEIGHT_NORMAL,
-        win.DWRITE_FONT_STYLE_NORMAL,
-        win.DWRITE_FONT_STRETCH_NORMAL,
-        @floatFromInt(em),
-        locale.ptr,
-        &format,
-    );
-    if (hr != 0 or format == null) {
-        _ = fail(.format, hr);
-        return null;
-    }
-    if (state.format_count < format_cache_size) {
-        state.formats[state.format_count] = .{ .em = em, .format = format };
-        state.format_count += 1;
-    } else {
-        // Ring of 8 em sizes is plenty for one app (a handful of font sizes);
-        // overwrite the smallest without ceremony.
-        var oldest: usize = 0;
-        var oldest_em = state.formats[0].em;
-        for (1..format_cache_size) |index| {
-            if (state.formats[index].em < oldest_em) {
-                oldest_em = state.formats[index].em;
-                oldest = index;
-            }
-        }
-        state.formats[oldest] = .{ .em = em, .format = format };
-    }
-    return format;
-}
-
 /// The one bounds check for an emoji sequence and its em size, shared by the
 /// measure and draw funnels so the two can never disagree about what takes
 /// the colour path versus the GDI fallback.
@@ -265,130 +176,322 @@ fn validSequence(text: []const u16, em: i32) bool {
     return text.len != 0 and text.len <= max_sequence_units and em > 0 and em <= 256;
 }
 
-/// Builds the one object DirectWrite can actually draw: an IDWriteTextLayout.
-/// Measure and draw share this so both always go through a real layout
-/// (WAZI-85: DrawTextLayout must never be handed the cached IDWriteTextFormat
-/// — D2D dispatches layout calls through the object it is given, and a format
-/// has no such vtable slots). This is the module boundary: every caller's
-/// input is validated here, before the expensive CreateTextLayout runs, so
-/// the invariant lives in one place and not in each caller. DirectWrite
-/// errors are logged here; input and factory-state rejections return null
-/// silently, and callers must run ensureFactory() first (metrics() and
-/// draw() do).
-fn textLayout(text: []const u16, em: i32) ?*win.IDWriteTextLayout {
-    if (!validSequence(text, em)) return null;
-    const dwrite = state.dwrite orelse return null;
-    const format = formatFor(em) orelse return null;
-    var layout: ?*win.IDWriteTextLayout = null;
-    const layout_hr = dwrite.*.lpVtbl.*.CreateTextLayout.?(dwrite, text.ptr, @intCast(text.len), format, 4096.0, 256.0, &layout);
-    if (layout_hr != 0 or layout == null) {
-        _ = fail(.layout, layout_hr);
+fn ensureDc() ?win.HDC {
+    if (state.dc) |dc| return dc;
+    const dc = win.CreateCompatibleDC(null) orelse {
+        fail(.surface, win.GetLastError());
         return null;
-    }
-    return layout;
+    };
+    _ = win.SetBkMode(dc, win.TRANSPARENT);
+    _ = win.SetTextColor(dc, 0x00FFFFFF);
+    _ = win.SetTextAlign(dc, win.TA_LEFT | win.TA_TOP | win.TA_NOUPDATECP);
+    state.dc = dc;
+    return dc;
 }
 
-/// Reads width and baseline out of an existing layout. Split from metrics()
-/// so draw() can build the layout once and reuse it for measuring and
-/// painting (the reviewer's WAZI-85 finding: CreateTextLayout is the
-/// expensive DirectWrite call and the paint path must not do it twice).
-fn metricsFromLayout(layout: *win.IDWriteTextLayout) ?Metrics {
-    var text_metrics: win.DWRITE_TEXT_METRICS = undefined;
-    const metrics_hr = layout.*.lpVtbl.*.GetMetrics.?(layout, &text_metrics);
-    if (metrics_hr != 0) {
-        _ = fail(.layout, metrics_hr);
-        return null;
+/// Selects the emoji font at `em` pixels into the module DC, creating it on
+/// first use. Grayscale AA (not ClearType): the layers become alpha masks,
+/// and per-channel ClearType coverage would leave colour fringes.
+fn selectFont(dc: win.HDC, em: i32) ?*FontEntry {
+    var slot: usize = 0;
+    for (&state.fonts, 0..) |*entry, index| {
+        if (entry.em == em and entry.font != null) {
+            if (state.selected_em != em) {
+                _ = win.SelectObject(dc, @ptrCast(entry.font.?));
+                state.selected_em = em;
+            }
+            return entry;
+        }
+        // Reuse an empty slot, else overwrite the smallest em without
+        // ceremony (an app uses a handful of sizes).
+        if (entry.font == null or (state.fonts[slot].font != null and entry.em < state.fonts[slot].em)) slot = index;
     }
-    var line: win.DWRITE_LINE_METRICS = undefined;
-    var line_count: u32 = 0;
-    const line_hr = layout.*.lpVtbl.*.GetLineMetrics.?(layout, &line, 1, &line_count);
-    if (line_hr != 0) {
-        _ = fail(.layout, line_hr);
+    const family: [:0]const u16 = std.unicode.utf8ToUtf16LeStringLiteral("Segoe UI Emoji");
+    const font = win.CreateFontW(-em, 0, 0, 0, win.FW_NORMAL, 0, 0, 0, win.DEFAULT_CHARSET, win.OUT_TT_ONLY_PRECIS, win.CLIP_DEFAULT_PRECIS, win.ANTIALIASED_QUALITY, win.DEFAULT_PITCH, family.ptr) orelse {
+        fail(.font, win.GetLastError());
         return null;
-    }
-    // A successful call with zero lines is an empty layout, not a DirectWrite
-    // failure: reject it silently so emoji.log never records "hr 0x00000000".
-    if (line_count == 0) return null;
-    return .{
-        .width = @intFromFloat(@ceil(text_metrics.widthIncludingTrailingWhitespace)),
-        .baseline = @intFromFloat(@ceil(line.baseline)),
     };
+    _ = win.SelectObject(dc, @ptrCast(font));
+    state.selected_em = em;
+    const entry = &state.fonts[slot];
+    if (entry.font) |old| {
+        _ = ScriptFreeCache(&entry.cache);
+        _ = win.DeleteObject(@ptrCast(old));
+    }
+    var text_metrics: win.TEXTMETRICW = undefined;
+    _ = win.GetTextMetricsW(dc, &text_metrics);
+    entry.* = .{ .em = em, .font = font, .ascent = text_metrics.tmAscent, .height = text_metrics.tmHeight };
+    return entry;
+}
+
+/// Loads the COLR v0 arrays and CPAL palette 0 once, from the font GDI
+/// already has open (GetFontData with offsets, so the multi-megabyte v1
+/// paint data is never copied). A missing or broken table latches the
+/// colour path off for the session: the font will not change under us.
+fn ensureColour(dc: win.HDC) bool {
+    switch (state.colour) {
+        .ready => return true,
+        .failed => return false,
+        .pending => {},
+    }
+    var face: [32]u16 = undefined;
+    const face_len = win.GetTextFaceW(dc, face.len, &face);
+    const expected = std.unicode.utf8ToUtf16LeStringLiteral("Segoe UI Emoji");
+    if (face_len <= 0 or !std.mem.eql(u16, face[0..@intCast(face_len - 1)], expected)) {
+        // Font substitution handed us some other face: its glyph ids mean
+        // nothing to a COLR table we would read from it.
+        state.colour = .failed;
+        fail(.font, @intCast(@max(face_len, 0)));
+        return false;
+    }
+    if (loadTables(dc)) |code| {
+        state.colour = .failed;
+        fail(if (code == gdi_error) .colour_tables else .colour_parse, code);
+        return false;
+    }
+    state.colour = .ready;
+    return true;
+}
+
+/// Returns null on success, else the failing code (gdi_error = table absent).
+fn loadTables(dc: win.HDC) ?u32 {
+    var header_bytes: [colr.header_len]u8 = undefined;
+    if (win.GetFontData(dc, tag_colr, 0, &header_bytes, header_bytes.len) != header_bytes.len) return gdi_error;
+    const header = colr.parseHeader(&header_bytes) catch return 1;
+    if (header.base_count == 0 or header.layer_count == 0) return 2;
+    const cpal_size = win.GetFontData(dc, tag_cpal, 0, null, 0);
+    if (cpal_size == gdi_error or cpal_size == 0) return gdi_error;
+    const cpal = std.heap.c_allocator.alloc(u8, cpal_size) catch return 3;
+    defer std.heap.c_allocator.free(cpal);
+    if (win.GetFontData(dc, tag_cpal, 0, cpal.ptr, cpal_size) != cpal_size) return 4;
+    const palette = colr.paletteZero(cpal) catch return 5;
+    const base_len = header.baseLen();
+    const layer_len = header.layerLen();
+    const kept = std.heap.c_allocator.alloc(u8, base_len + layer_len + palette.len) catch return 6;
+    const base = kept[0..base_len];
+    const layers = kept[base_len..][0..layer_len];
+    if (win.GetFontData(dc, tag_colr, header.base_offset, base.ptr, @intCast(base_len)) != base_len or
+        win.GetFontData(dc, tag_colr, header.layer_offset, layers.ptr, @intCast(layer_len)) != layer_len)
+    {
+        std.heap.c_allocator.free(kept);
+        return 7;
+    }
+    @memcpy(kept[base_len + layer_len ..], palette);
+    state.table = colr.Colr.init(base, layers, kept[base_len + layer_len ..]);
+    return null;
+}
+
+const Shaped = struct {
+    glyphs: [max_glyphs]u16 = undefined,
+    advances: [max_glyphs]c_int = undefined,
+    count: usize = 0,
+    width: i32 = 0,
+};
+
+/// The one shaping call behind both metrics() and draw(): Uniscribe maps the
+/// run to the font's glyphs, applying its ligatures so a ZWJ or skin-tone
+/// sequence becomes one composed glyph. null when the font lacks a glyph
+/// (GDI font fallback may still find one) or Uniscribe fails.
+fn shape(dc: win.HDC, font: *FontEntry, text: []const u16, out: *Shaped) bool {
+    var items: [max_sequence_units + 1]ScriptItem = undefined;
+    var item_count: c_int = 0;
+    const itemize_hr = ScriptItemize(text.ptr, @intCast(text.len), items.len, null, null, &items, &item_count);
+    if (itemize_hr != 0 or item_count <= 0) {
+        fail(.shape, @bitCast(itemize_hr));
+        return false;
+    }
+    out.count = 0;
+    out.width = 0;
+    for (0..@intCast(item_count)) |index| {
+        const start: usize = @intCast(items[index].char_pos);
+        const end: usize = @intCast(items[index + 1].char_pos);
+        if (end <= start) continue;
+        var clusters: [max_sequence_units]u16 = undefined;
+        var attributes: [max_glyphs]ScriptVisAttr = undefined;
+        var offsets: [max_glyphs]GOffset = undefined;
+        var glyph_count: c_int = 0;
+        const room: c_int = @intCast(max_glyphs - out.count);
+        const glyphs = out.glyphs[out.count..].ptr;
+        const shape_hr = ScriptShape(dc, &font.cache, text[start..].ptr, @intCast(end - start), room, &items[index].analysis, glyphs, &clusters, &attributes, &glyph_count);
+        if (shape_hr == usp_e_script_not_in_font) return false;
+        if (shape_hr != 0) {
+            fail(.shape, @bitCast(shape_hr));
+            return false;
+        }
+        const placed: usize = @intCast(glyph_count);
+        // Glyph 0 is .notdef: this font cannot draw the sequence.
+        for (out.glyphs[out.count..][0..placed]) |glyph| if (glyph == 0) return false;
+        const place_hr = ScriptPlace(dc, &font.cache, glyphs, glyph_count, &attributes, &items[index].analysis, out.advances[out.count..].ptr, &offsets, null);
+        if (place_hr != 0) {
+            fail(.shape, @bitCast(place_hr));
+            return false;
+        }
+        for (out.advances[out.count..][0..placed]) |advance| out.width += advance;
+        out.count += placed;
+    }
+    return out.count != 0;
+}
+
+/// Grows the scratch DIB that layers are rendered into and bitmaps are
+/// blitted from; it stays selected in the module DC.
+fn ensureScratch(dc: win.HDC, width: i32, height: i32) bool {
+    if (state.scratch != null and state.scratch_width >= width and state.scratch_height >= height) return true;
+    const new_width = @max(width, state.scratch_width);
+    const new_height = @max(height, state.scratch_height);
+    var info = std.mem.zeroes(win.BITMAPINFO);
+    info.bmiHeader.biSize = @sizeOf(win.BITMAPINFOHEADER);
+    info.bmiHeader.biWidth = new_width;
+    info.bmiHeader.biHeight = -new_height;
+    info.bmiHeader.biPlanes = 1;
+    info.bmiHeader.biBitCount = 32;
+    info.bmiHeader.biCompression = win.BI_RGB;
+    var bits: ?*anyopaque = null;
+    const bitmap = win.CreateDIBSection(dc, &info, win.DIB_RGB_COLORS, &bits, null, 0) orelse {
+        fail(.bitmap, win.GetLastError());
+        return false;
+    };
+    if (bits == null) {
+        _ = win.DeleteObject(bitmap);
+        fail(.bitmap, 0);
+        return false;
+    }
+    _ = win.SelectObject(dc, bitmap);
+    if (state.scratch) |old| _ = win.DeleteObject(old);
+    state.scratch = bitmap;
+    state.scratch_bits = @ptrCast(bits.?);
+    state.scratch_width = new_width;
+    state.scratch_height = new_height;
+    return true;
+}
+
+/// Horizontal room either side of the advance for glyph overhang.
+fn padFor(em: i32) i32 {
+    return @divTrunc(em, 8) + 1;
+}
+
+/// The composed premultiplied BGRA bitmap for one glyph, from the cache or
+/// rendered now: each COLR layer (or the glyph itself when it has none) is
+/// drawn white-on-black to get its coverage, then tinted and composited
+/// source-over in paint order.
+fn glyphBitmap(dc: win.HDC, font: *FontEntry, glyph: u16, advance: i32, foreground: win.COLORREF) ?*BitmapEntry {
+    state.clock += 1;
+    var victim = &state.bitmaps[0];
+    for (&state.bitmaps) |*entry| {
+        if (entry.pixels.len != 0 and entry.glyph == glyph and entry.em == font.em and entry.foreground == foreground) {
+            entry.last_used = state.clock;
+            return entry;
+        }
+        if (entry.last_used < victim.last_used) victim = entry;
+    }
+    const pad = padFor(font.em);
+    const width = advance + 2 * pad;
+    const height = font.height;
+    if (!ensureScratch(dc, width, height)) return null;
+    const size: usize = @intCast(width * height * 4);
+    const pixels = std.heap.c_allocator.alloc(u8, size) catch {
+        fail(.bitmap, 0);
+        return null;
+    };
+    @memset(pixels, 0);
+    const scratch = state.scratch_bits.?;
+    const stride: usize = @intCast(state.scratch_width * 4);
+    const scratch_size = stride * @as(usize, @intCast(state.scratch_height));
+    const range = state.table.find(glyph);
+    const layer_count = if (range) |found| found.count else 1;
+    for (0..layer_count) |layer_index| {
+        const layer = if (range) |found| state.table.layer(found.first + layer_index) else colr.Layer{ .glyph = glyph, .palette_index = colr.foreground };
+        const bgra: [4]u8 = if (layer.palette_index == colr.foreground)
+            .{ @truncate(foreground >> 16), @truncate(foreground >> 8), @truncate(foreground), 255 }
+        else
+            state.table.color(layer.palette_index) orelse continue;
+        if (bgra[3] == 0) continue;
+        @memset(scratch[0..scratch_size], 0);
+        const layer_glyph = [1]u16{layer.glyph};
+        _ = win.ExtTextOutW(dc, pad, 0, win.ETO_GLYPH_INDEX, null, &layer_glyph, 1, null);
+        _ = win.GdiFlush();
+        for (0..@intCast(height)) |y| {
+            for (0..@intCast(width)) |x| {
+                const coverage: u32 = scratch[y * stride + x * 4 + 1];
+                if (coverage == 0) continue;
+                const src_alpha = coverage * bgra[3] / 255;
+                const pixel = pixels[(y * @as(usize, @intCast(width)) + x) * 4 ..][0..4];
+                const keep = 255 - src_alpha;
+                for (0..3) |channel| {
+                    pixel[channel] = @intCast((@as(u32, bgra[channel]) * src_alpha + @as(u32, pixel[channel]) * keep) / 255);
+                }
+                pixel[3] = @intCast(src_alpha + @as(u32, pixel[3]) * keep / 255);
+            }
+        }
+    }
+    if (victim.pixels.len != 0) std.heap.c_allocator.free(victim.pixels);
+    victim.* = .{ .glyph = glyph, .em = font.em, .foreground = foreground, .width = width, .height = height, .pixels = pixels, .last_used = state.clock };
+    return victim;
+}
+
+fn blit(target: win.HDC, dc: win.HDC, entry: *const BitmapEntry, x: i32, y: i32) bool {
+    if (!ensureScratch(dc, entry.width, entry.height)) return false;
+    const scratch = state.scratch_bits.?;
+    const stride: usize = @intCast(state.scratch_width * 4);
+    const row: usize = @intCast(entry.width * 4);
+    for (0..@intCast(entry.height)) |line| {
+        @memcpy(scratch[line * stride ..][0..row], entry.pixels[line * row ..][0..row]);
+    }
+    _ = win.GdiFlush();
+    const blend = win.BLENDFUNCTION{
+        .BlendOp = win.AC_SRC_OVER,
+        .BlendFlags = 0,
+        .SourceConstantAlpha = 255,
+        .AlphaFormat = win.AC_SRC_ALPHA,
+    };
+    return win.AlphaBlend(target, x, y, entry.width, entry.height, dc, 0, 0, entry.width, entry.height, blend) != 0;
+}
+
+/// Shared front half of metrics() and draw(): the DC, font and colour tables
+/// ready, and the run shaped. null means "use the GDI fallback".
+fn prepare(text: []const u16, em: i32, shaped: *Shaped) ?*FontEntry {
+    if (!validSequence(text, em)) return null;
+    if (state.colour == .failed) return null;
+    const dc = ensureDc() orelse return null;
+    const font = selectFont(dc, em) orelse return null;
+    if (!ensureColour(dc)) return null;
+    if (!shape(dc, font, text, shaped)) return null;
+    return font;
 }
 
 /// Width and baseline distance of one emoji sequence at the given em size in
 /// pixels. null means the color path is unavailable for this sequence and the
 /// caller should measure and draw with GDI instead.
 pub fn metrics(text: []const u16, em: i32) ?Metrics {
-    if (!validSequence(text, em)) return null;
-    if (!ensureFactory()) return null;
-    const layout = textLayout(text, em) orelse return null;
-    defer _ = layout.*.lpVtbl.*.Release.?(layout);
-    // No clearError here: measurement proves the text engine only. Render
-    // stages (target, bind, draw) clear after a successful draw instead,
-    // so a measuring pass cannot wipe a diagnostic it did not verify.
-    return metricsFromLayout(layout);
+    var shaped: Shaped = .{};
+    const font = prepare(text, em, &shaped) orelse return null;
+    return .{ .width = shaped.width, .baseline = font.ascent };
 }
 
 /// Draws one emoji sequence with color glyphs and returns its measured run
 /// width. `top_y` is the top of the text line's character cell and `ascent`
 /// the text font's ascent, matching how GDI TextOutW positions the
-/// neighbouring runs. Returning the width lets a paint pass measure and
-/// paint from the one layout built here instead of a separate measuring
-/// call. null on any failure (the reason lands in emoji.log via failureNotice),
-/// meaning the caller should fall back to the GDI monochrome path.
+/// neighbouring runs; the emoji baseline lands on the text baseline. null on
+/// any failure (the reason lands in emoji.log via failureNotice), meaning the
+/// caller should fall back to the GDI monochrome path.
 pub fn draw(hdc: win.HDC, text: []const u16, x: i32, top_y: i32, text_ascent: i32, em: i32) ?Metrics {
-    if (!ensureFactory()) return null;
-    if (!ensureTarget(hdc)) return null;
-    // One layout for both the measure and the paint: CreateTextLayout is the
-    // expensive DirectWrite call and must not run twice per emoji draw.
-    const layout = textLayout(text, em) orelse return null;
-    defer _ = layout.*.lpVtbl.*.Release.?(layout);
-    const run_metrics = metricsFromLayout(layout) orelse return null;
-    const target = state.target.?;
-    const brush: *win.ID2D1Brush = @ptrCast(state.brush.?);
-    const origin_y = @as(f32, @floatFromInt(top_y + text_ascent - run_metrics.baseline));
-    const base: *win.ID2D1RenderTarget = @ptrCast(target);
-    base.*.lpVtbl.*.BeginDraw.?(base);
-    base.*.lpVtbl.*.DrawTextLayout.?(
-        base,
-        .{ .x = @floatFromInt(x), .y = origin_y },
-        layout,
-        brush,
-        win.D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT,
-    );
-    var tag1: win.D2D1_TAG = 0;
-    var tag2: win.D2D1_TAG = 0;
-    const end_hr = base.*.lpVtbl.*.EndDraw.?(base, &tag1, &tag2);
-    if (end_hr != 0) {
-        _ = fail(.draw, end_hr);
-        // The target may need recreation after device loss; drop it so the
-        // next call rebuilds, and fall back to GDI for this run.
-        releaseTarget();
-        return null;
+    var shaped: Shaped = .{};
+    const font = prepare(text, em, &shaped) orelse return null;
+    const dc = state.dc.?;
+    const foreground = win.GetTextColor(hdc) & 0x00FFFFFF;
+    const top = top_y + text_ascent - font.ascent;
+    const pad = padFor(em);
+    var pen = x;
+    for (shaped.glyphs[0..shaped.count], shaped.advances[0..shaped.count]) |glyph, advance| {
+        // Zero-width glyphs (an unjoined ZWJ, a variation selector) are blank.
+        if (advance > 0) {
+            const entry = glyphBitmap(dc, font, glyph, advance, foreground) orelse return null;
+            if (!blit(hdc, dc, entry, pen - pad, top)) {
+                fail(.bitmap, win.GetLastError());
+                return null;
+            }
+        }
+        pen += advance;
     }
     clearError();
-    return run_metrics;
-}
-
-fn releaseTarget() void {
-    if (state.brush) |brush| {
-        const unknown: *win.IUnknown = @ptrCast(brush);
-        _ = unknown.*.lpVtbl.*.Release.?(unknown);
-    }
-    if (state.target) |target| {
-        const unknown: *win.IUnknown = @ptrCast(target);
-        _ = unknown.*.lpVtbl.*.Release.?(unknown);
-    }
-    state.brush = null;
-    state.target = null;
-    state.bound_hdc = null;
-}
-
-pub fn reset() void {
-    releaseTarget();
-    for (state.formats[0..state.format_count]) |entry| {
-        if (entry.format) |format| _ = format.*.lpVtbl.*.Release.?(format);
-    }
-    state.formats = [_]FormatEntry{.{ .em = 0 }} ** format_cache_size;
-    state.format_count = 0;
+    return .{ .width = shaped.width, .baseline = font.ascent };
 }
