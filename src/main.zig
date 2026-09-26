@@ -10277,13 +10277,30 @@ fn createAvatarCircleDib(r: u8, g: u8, b: u8) ?win.HBITMAP {
     return bitmap;
 }
 
-fn isEmojiUnit(unit: u16) bool {
-    return (unit >= 0x1F000 and unit <= 0x1FAFF) or
-        (unit >= 0x2600 and unit <= 0x27BF) or
-        (unit >= 0x2B00 and unit <= 0x2BFF) or
-        (unit >= 0x1F1E6 and unit <= 0x1F1FF) or
-        unit == 0xFE0F or unit == 0x200D or unit == 0x20E3 or
-        unit == 0x00A9 or unit == 0x00AE or unit == 0x2122;
+fn isEmojiCodepoint(cp: u21) bool {
+    return (cp >= 0x1F000 and cp <= 0x1FAFF) or
+        (cp >= 0xE0020 and cp <= 0xE007F) or // tag characters (subdivision flags)
+        (cp >= 0x2600 and cp <= 0x27BF) or
+        (cp >= 0x2B00 and cp <= 0x2BFF) or
+        cp == 0xFE0F or cp == 0x200D or cp == 0x20E3 or
+        cp == 0x00A9 or cp == 0x00AE or cp == 0x2122;
+}
+
+const TextUnit = struct { emoji: bool, len: usize };
+
+/// Classifies the character starting at text[index]. Most emoji sit above
+/// U+FFFF, so they arrive as a UTF-16 surrogate pair and must be decoded
+/// before the range check; a lone code unit never matches them.
+fn emojiUnitAt(text: []const u16, index: usize) TextUnit {
+    const unit = text[index];
+    if (unit >= 0xD800 and unit <= 0xDBFF and index + 1 < text.len) {
+        const low = text[index + 1];
+        if (low >= 0xDC00 and low <= 0xDFFF) {
+            const cp: u21 = 0x10000 + ((@as(u21, unit) - 0xD800) << 10) + (@as(u21, low) - 0xDC00);
+            return .{ .emoji = isEmojiCodepoint(cp), .len = 2 };
+        }
+    }
+    return .{ .emoji = isEmojiCodepoint(unit), .len = 1 };
 }
 
 const TextRun = struct { start: usize, len: usize, emoji: bool };
@@ -10293,15 +10310,16 @@ fn splitRuns(text: []const u16, runs: []TextRun) usize {
     var count: usize = 0;
     var index: usize = 0;
     while (index < text.len) {
-        const emoji = isEmojiUnit(text[index]);
+        const emoji = emojiUnitAt(text, index).emoji;
         const start = index;
         while (index < text.len) {
             const unit = text[index];
+            const current = emojiUnitAt(text, index);
             // Joiners, variation selectors, and combining keycaps keep the
             // current run attached so ZWJ sequences render in one font.
             const glue = unit == 0x200D or unit == 0xFE0F or unit == 0x20E3;
-            if (isEmojiUnit(unit) != emoji and !glue) break;
-            index += 1;
+            if (current.emoji != emoji and !glue) break;
+            index += current.len;
         }
         if (count >= runs.len) break;
         runs[count] = .{ .start = start, .len = index - start, .emoji = emoji };
@@ -10311,7 +10329,12 @@ fn splitRuns(text: []const u16, runs: []TextRun) usize {
 }
 
 fn containsEmoji(text: []const u16) bool {
-    for (text) |unit| if (isEmojiUnit(unit)) return true;
+    var index: usize = 0;
+    while (index < text.len) {
+        const current = emojiUnitAt(text, index);
+        if (current.emoji) return true;
+        index += current.len;
+    }
     return false;
 }
 
@@ -14401,4 +14424,30 @@ test "wrapChunkLen keeps surrogate pairs and joiners whole" {
     }
     // A lone high surrogate is still one unit; do not over-advance past it.
     try std.testing.expectEqual(@as(usize, 1), wrapChunkLen(&[_]u16{0xD83D}, 1));
+}
+
+test "splitRuns sends surrogate-pair emoji to the colour path" {
+    var runs: [8]TextRun = undefined;
+    // "hi 😀 ok ❤": the astral emoji must form an emoji run (both halves), not
+    // fall through to the monochrome GDI text run as it did before.
+    const mixed = [_]u16{ 'h', 'i', ' ', 0xD83D, 0xDE00, ' ', 'o', 'k', ' ', 0x2764 };
+    const count = splitRuns(&mixed, &runs);
+    try std.testing.expectEqual(@as(usize, 4), count);
+    try std.testing.expect(runs[1].emoji);
+    try std.testing.expectEqual(@as(usize, 3), runs[1].start);
+    try std.testing.expectEqual(@as(usize, 2), runs[1].len);
+    try std.testing.expect(runs[3].emoji);
+    try std.testing.expect(containsEmoji(&mixed));
+
+    // A ZWJ sequence (woman + ZWJ + top hat) stays one emoji run.
+    const zwj = [_]u16{ 0xD83D, 0xDC69, 0x200D, 0xD83C, 0xDFA9 };
+    try std.testing.expectEqual(@as(usize, 1), splitRuns(&zwj, &runs));
+    try std.testing.expect(runs[0].emoji);
+    try std.testing.expectEqual(@as(usize, 5), runs[0].len);
+
+    // A non-emoji astral character (mathematical bold A) stays plain text.
+    const math = [_]u16{ 0xD835, 0xDC00, 'x' };
+    try std.testing.expectEqual(@as(usize, 1), splitRuns(&math, &runs));
+    try std.testing.expect(!runs[0].emoji);
+    try std.testing.expect(!containsEmoji(&math));
 }
