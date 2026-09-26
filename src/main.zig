@@ -11,6 +11,7 @@ const pending_reads = @import("pending_reads.zig");
 const chat_order = @import("chat_order.zig");
 const compose_layout = @import("compose_layout.zig");
 const media_age = @import("media_age.zig");
+const sync_gate = @import("sync_gate.zig");
 const webp_detect = @import("webp.zig");
 const paste_image = @import("paste_image.zig");
 const scrollbar = @import("scrollbar.zig");
@@ -56,9 +57,6 @@ fn sendRetryDelayMs(retries: u8) ?u64 {
         else => null,
     };
 }
-// One profile-picture fetch per sync pause, spaced so a long chat list does
-// not keep live sync off for minutes.
-const avatar_request_spacing_ms: u64 = 20_000;
 const max_avatars = 256;
 const timer_refresh = 1;
 const timer_search = 2;
@@ -367,6 +365,9 @@ const AvatarEntry = struct {
     path: WideText(519) = .{},
     bitmap: ?win.HBITMAP = null,
     status: enum { unknown, loading, ready, unavailable } = .unknown,
+    // A cached picture is shown but older than the cache TTL: the avatar
+    // batch asks WhatsApp again when it gets to it.
+    refresh: bool = false,
 };
 
 const PaletteItem = struct {
@@ -759,10 +760,19 @@ const App = struct {
     avatars: [max_avatars]AvatarEntry = [_]AvatarEntry{.{}} ** max_avatars,
     avatar_count: usize = 0,
     avatar_active_index: ?usize = null,
-    // Ticks at which the last avatar fetch started; requestNextAvatar spaces
-    // its own fetches by avatar_request_spacing_ms (explicit user requests are
-    // unaffected).
-    last_avatar_request_ms: u64 = 0,
+    // Avatar batches: one sync pause runs several picture fetches back to
+    // back (sync_gate caps count and time), then sync resumes once.
+    avatar_batch_active: bool = false,
+    avatar_batch_fetched: u32 = 0,
+    avatar_batch_started_ms: u64 = 0,
+    avatar_batch_end_ms: ?u64 = null,
+    // Ticks before which no batch starts, set when a fetch fails.
+    avatar_retry_after_ms: u64 = 0,
+    // Ticks of the last time stopSync killed a live child; background work
+    // checks it through sync_gate so it cannot pause sync back to back.
+    last_sync_stop_ms: ?u64 = null,
+    // Ticks of the last sync start that refreshed groups and contacts.
+    last_sync_refresh_ms: ?u64 = null,
     wic_factory: [*c]win.IWICImagingFactory = null,
     player_window: ?win.HWND = null,
     mf_player: ?*win.IMFPMediaPlayer = null,
@@ -4556,9 +4566,16 @@ fn startNextMarkRead(a: *App) void {
     if (a.send_child != null or sendReadyPending(a) or
         a.archive_child != null or a.pending_archive_count > 0 or
         avatarBusy(a) or mediaBusy(a)) return;
-    stopSync(a);
+    // With live sync running, wacli 0.19 hands mark-read to the sync child
+    // over its socket, so sync is never paused for a read. That hand-off
+    // only happens once the lock attempt fails, so no lock wait then (a 70s
+    // wait would just delay it), and the socket only opens once the child
+    // has connected: give a fresh child sync_gate.delegate_warmup_secs.
+    // With sync stopped, the read takes the store lock itself.
+    const delegated = a.sync_child != null;
+    if (delegated and nowUnixSeconds() - a.sync_started_secs < sync_gate.delegate_warmup_secs) return;
     const child = std.process.spawn(a.io, .{
-        .argv = &.{ a.wacli_path, "--json", "--lock-wait", "70s", "chats", "mark-read", "--receipts", "--chat", a.pending_reads[0].slice() },
+        .argv = &.{ a.wacli_path, "--json", "--lock-wait", if (delegated) "0s" else "70s", "chats", "mark-read", "--receipts", "--chat", a.pending_reads[0].slice() },
         .stdin = .ignore,
         .stdout = .ignore,
         .stderr = .ignore,
@@ -5260,7 +5277,7 @@ fn startMediaDownload(a: *App, chat_jid: []const u8, message_id: []const u8) boo
     const slot = freeMediaSlot(a) orelse return false;
     slot.jid.set(chat_jid);
     slot.id.set(message_id);
-    stopSync(a);
+    stopSync(a, "media");
     const args = [_][]const u8{ a.wacli_path, "--json", "--lock-wait", "10s", "--timeout", "60s", "media", "download", "--chat", slot.jid.slice(), "--id", slot.id.slice() };
     const child = std.process.spawn(a.io, .{
         .argv = &args,
@@ -5389,6 +5406,12 @@ fn autoDownloadNextMedia(a: *App) bool {
     // Failure cooldown: give transient store-lock or network failures time
     // to clear before trying again.
     if (win.GetTickCount64() < a.media_retry_after_ms) return false;
+    // Pausing live sync for background downloads is rate limited: the first
+    // download of a burst waits sync_gate.media_stop_gap_ms after the last
+    // pause, and the rest of the burst runs inside the same pause. A
+    // mark-read handed to the sync child finishes first.
+    if (a.sync_child != null and (a.read_child != null or
+        !sync_gate.gapElapsed(a.last_sync_stop_ms, win.GetTickCount64(), sync_gate.media_stop_gap_ms))) return false;
     // Newest first: the media the user is looking at arrives first.
     var index = a.message_count;
     while (index > 0) {
@@ -5399,6 +5422,14 @@ fn autoDownloadNextMedia(a: *App) bool {
         // Skip attachments older than the cache cutoff; the store's
         // LocalPath (kept across restarts) already holds anything fetched.
         if (!media_age.withinDays(message.timestamp.slice(), nowUnixSeconds(), media_cache_days)) continue;
+        // Live sync runs with --download-media and fetches what arrives
+        // while it runs: pausing it for those would restart sync on every
+        // incoming photo in the open chat.
+        if (a.sync_child != null) {
+            if (media_age.unixSeconds(message.timestamp.slice())) |sent| {
+                if (sent >= a.sync_started_secs) continue;
+            }
+        }
         if (mediaAttempted(a, message.id.slice())) continue;
         // The persistent fetched index: anything downloaded before (even in
         // an earlier session) is never re-checked or re-downloaded. A manual
@@ -5425,10 +5456,25 @@ fn ensureAvatarSession(a: *App) ?*avatar.Session {
     return a.avatar_session;
 }
 
+// The whole batch counts as busy, not just the fetch in flight: between two
+// fetches of one batch live sync is still paused and the store is ours.
 fn avatarBusy(a: *const App) bool {
+    if (a.avatar_batch_active) return true;
     return if (a.avatar_session) |session| session.state() == .working else false;
 }
 
+// Work that must not wait behind, or race, an avatar batch for the store
+// lock. A queued send in particular must never sit behind picture fetches.
+fn avatarBatchBlocked(a: *App) bool {
+    return a.read_child != null or a.pending_read_count > 0 or mediaBusy(a) or
+        a.send_child != null or a.pending_send_count > 0 or
+        a.archive_child != null or a.pending_archive_count > 0 or
+        wacliPendingGet(a, .reaction) > 0;
+}
+
+// The single path for every profile-picture fetch (chat list, open chat,
+// group participants): requestNextAvatar starts a batch, this finishes each
+// fetch and either chains the next one or ends the batch.
 fn checkAvatarDownload(a: *App) void {
     const session = a.avatar_session orelse {
         requestNextAvatar(a);
@@ -5438,56 +5484,148 @@ fn checkAvatarDownload(a: *App) void {
     if (state == .working) return;
     if (state != .idle) {
         if (a.avatar_active_index) |index| {
-            if (index < a.avatar_count) {
-                const entry = &a.avatars[index];
-                if (state == .ready) {
-                    entry.bitmap = loadAvatarBitmap(a, entry.path.ptr());
-                    entry.status = if (entry.bitmap != null) .ready else .unavailable;
-                } else entry.status = .unavailable;
-            }
+            if (index < a.avatar_count) applyAvatarResult(a, &a.avatars[index], state);
         }
         a.avatar_active_index = null;
         session.reset();
-        startSync(a);
+        if (state == .failed) a.avatar_retry_after_ms = win.GetTickCount64() + sync_gate.avatar_failure_backoff_ms;
+        if (a.avatar_batch_active) {
+            const continues = sync_gate.avatarBatchContinues(a.avatar_batch_fetched, a.avatar_batch_started_ms, win.GetTickCount64(), state == .failed) and
+                !avatarBatchBlocked(a);
+            const next = if (continues) nextAvatarIndex(a) else null;
+            if (next == null or !startAvatarFetch(a, next.?)) endAvatarBatch(a);
+        } else startSync(a);
         if (a.chats_hwnd) |list| _ = win.InvalidateRect(list, null, win.FALSE);
+        return;
     }
+    if (a.avatar_batch_active) endAvatarBatch(a);
     requestNextAvatar(a);
 }
 
-// Fetch missing chat icons in list order, one per sync pause, so chats the
-// user never opened still get their picture (fetched once, cached on disk).
-// ponytail: a failed or picture-less chat is terminal until the app restarts
-// (status .unavailable), and there is no TTL refresh of cached icons;
-// upgrade path: retry counter with backoff plus a weekly file-age check.
-fn requestNextAvatar(a: *App) void {
-    // Space the automatic fetches out so a long chat list cannot keep pausing
-    // live sync back-to-back; an explicit requestAvatar call is unaffected.
-    if (win.GetTickCount64() - a.last_avatar_request_ms < avatar_request_spacing_ms) return;
-    for (a.chats[0..a.chat_count], 0..) |*chat, index| {
+// Missing, stale or never-asked pictures: open chat first, then the chat
+// list in order, then any other avatar (group participants).
+fn avatarWanted(entry: *const AvatarEntry) bool {
+    if (entry.path.len == 0) return false;
+    return entry.status == .unknown or (entry.status == .ready and entry.refresh);
+}
+
+fn nextAvatarIndex(a: *App) ?usize {
+    if (a.selected_chat < a.chat_count) {
+        if (avatarForChat(a, a.chats[a.selected_chat].jid.slice())) |entry| {
+            if (avatarWanted(entry)) return avatarIndex(a, entry);
+        }
+    }
+    for (a.chats[0..a.chat_count]) |*chat| {
         const entry = avatarForChat(a, chat.jid.slice()) orelse continue;
-        if (entry.status != .unknown or entry.path.len == 0) continue;
-        requestAvatar(a, index);
-        return;
+        if (avatarWanted(entry)) return avatarIndex(a, entry);
+    }
+    for (a.avatars[0..a.avatar_count], 0..) |*entry, index| {
+        if (avatarWanted(entry)) return index;
+    }
+    return null;
+}
+
+fn avatarIndex(a: *const App, entry: *const AvatarEntry) usize {
+    return (@intFromPtr(entry) - @intFromPtr(&a.avatars[0])) / @sizeOf(AvatarEntry);
+}
+
+// Start a batch: pause live sync once, then fetch up to
+// sync_gate.avatar_batch_max pictures back to back. Batches are spaced by
+// sync_gate so a long chat list cannot keep pausing live sync, and every
+// answer (picture, no picture, failure) is cached on disk so a relaunch or
+// reinstall does not ask WhatsApp again (see avatarForChat).
+fn requestNextAvatar(a: *App) void {
+    if (avatarBusy(a) or avatarBatchBlocked(a)) return;
+    const now = win.GetTickCount64();
+    if (!sync_gate.avatarBatchMayStart(a.last_sync_stop_ms, a.avatar_batch_end_ms, a.avatar_retry_after_ms, now)) return;
+    const index = nextAvatarIndex(a) orelse return;
+    stopSync(a, "avatars");
+    a.avatar_batch_active = true;
+    a.avatar_batch_fetched = 0;
+    a.avatar_batch_started_ms = now;
+    if (!startAvatarFetch(a, index)) endAvatarBatch(a);
+}
+
+fn endAvatarBatch(a: *App) void {
+    a.avatar_batch_active = false;
+    a.avatar_batch_end_ms = win.GetTickCount64();
+    startSync(a);
+}
+
+fn startAvatarFetch(a: *App, index: usize) bool {
+    if (index >= a.avatar_count) return false;
+    const entry = &a.avatars[index];
+    // Whatever happens next, this entry is not picked again this session
+    // unless its answer says so.
+    entry.refresh = false;
+    const session = ensureAvatarSession(a) orelse return false;
+    const destination = std.unicode.utf16LeToUtf8Alloc(a.allocator, entry.path.slice()) catch return false;
+    defer a.allocator.free(destination);
+    if (!session.start(a.wacli_path, entry.jid.slice(), destination)) {
+        if (entry.status == .unknown) entry.status = .unavailable;
+        session.reset();
+        return false;
+    }
+    // A stale picture keeps showing while it is refreshed.
+    if (entry.status == .unknown) entry.status = .loading;
+    a.avatar_active_index = index;
+    a.avatar_batch_fetched += 1;
+    return true;
+}
+
+// Record a fetch answer in memory and on disk. "<hash>.img" is the picture,
+// "<hash>.img.none" says the chat has no picture, "<hash>.img.fail" says the
+// last fetch failed; their modification times drive sync_gate.classifyAvatar.
+fn applyAvatarResult(a: *App, entry: *AvatarEntry, state: avatar.State) void {
+    var buffer: [540]u16 = undefined;
+    switch (state) {
+        .ready => if (loadAvatarBitmap(a, entry.path.ptr())) |bitmap| {
+            if (entry.bitmap) |old| _ = win.DeleteObject(old);
+            entry.bitmap = bitmap;
+            entry.status = .ready;
+            if (avatarMarkerPath(entry, ".none", &buffer)) |path| _ = win.DeleteFileW(path);
+            if (avatarMarkerPath(entry, ".fail", &buffer)) |path| _ = win.DeleteFileW(path);
+        } else {
+            if (avatarMarkerPath(entry, ".fail", &buffer)) |path| touchFileW(path);
+            entry.status = if (entry.bitmap != null) .ready else .unavailable;
+        },
+        .unavailable => {
+            if (entry.bitmap) |old| _ = win.DeleteObject(old);
+            entry.bitmap = null;
+            _ = win.DeleteFileW(entry.path.ptr());
+            if (avatarMarkerPath(entry, ".none", &buffer)) |path| touchFileW(path);
+            if (avatarMarkerPath(entry, ".fail", &buffer)) |path| _ = win.DeleteFileW(path);
+            entry.status = .unavailable;
+        },
+        else => {
+            if (avatarMarkerPath(entry, ".fail", &buffer)) |path| touchFileW(path);
+            entry.status = if (entry.bitmap != null) .ready else .unavailable;
+        },
     }
 }
 
-fn requestAvatar(a: *App, chat_index: usize) void {
-    if (a.read_child != null or a.pending_read_count > 0 or mediaBusy(a) or a.send_child != null or a.archive_child != null or a.pending_archive_count > 0 or avatarBusy(a)) return;
-    if (a.chat_count == 0 or chat_index >= a.chat_count) return;
-    const entry = avatarForChat(a, a.chats[chat_index].jid.slice()) orelse return;
-    if (entry.status != .unknown or entry.path.len == 0) return;
-    var index: usize = 0;
-    while (index < a.avatar_count and &a.avatars[index] != entry) : (index += 1) {}
-    if (index >= a.avatar_count) return;
-    const destination = std.unicode.utf16LeToUtf8Alloc(a.allocator, entry.path.slice()) catch return;
-    defer a.allocator.free(destination);
-    const session = ensureAvatarSession(a) orelse return;
-    stopSync(a);
-    if (session.start(a.wacli_path, entry.jid.slice(), destination)) {
-        entry.status = .loading;
-        a.avatar_active_index = index;
-        a.last_avatar_request_ms = win.GetTickCount64();
-    } else startSync(a);
+fn avatarMarkerPath(entry: *const AvatarEntry, suffix: []const u8, buffer: *[540]u16) ?[*:0]const u16 {
+    const path = entry.path.slice();
+    if (path.len == 0 or path.len + suffix.len >= buffer.len) return null;
+    @memcpy(buffer[0..path.len], path);
+    for (suffix, 0..) |char, index| buffer[path.len + index] = char;
+    buffer[path.len + suffix.len] = 0;
+    return @ptrCast(buffer);
+}
+
+// Last-write time in unix seconds, null when the file is missing.
+fn fileStampSecs(path: [*:0]const u16) ?i64 {
+    var attributes = std.mem.zeroes(win.WIN32_FILE_ATTRIBUTE_DATA);
+    if (win.GetFileAttributesExW(path, win.GetFileExInfoStandard, &attributes) == 0) return null;
+    return filetimeToUnixSeconds(attributes.ftLastWriteTime);
+}
+
+// Recreate an empty marker file so its modification time is now.
+fn touchFileW(path: [*:0]const u16) void {
+    _ = win.DeleteFileW(path);
+    const handle = win.CreateFileW(path, win.GENERIC_WRITE, 0, null, win.CREATE_ALWAYS, win.FILE_ATTRIBUTE_NORMAL, null);
+    if (handle == win.INVALID_HANDLE_VALUE or handle == null) return;
+    _ = win.CloseHandle(handle);
 }
 
 fn loadTranscriptCache(a: *App, message: *Message) void {
@@ -7262,13 +7400,21 @@ fn startSync(a: *App) void {
         // - until a fresh auth status verifies the new account (WAZI-67).
         a.cache_tag.set("");
         enqueueCacheTagProbe(a);
+        a.last_sync_refresh_ms = null;
     }
     if (a.sync_child != null or a.read_child != null or readsPendingBlockingSync(a) or
         mediaBusy(a) or (a.send_child != null and a.send_direct) or
         a.archive_child != null or a.pending_archive_count > 0 or avatarBusy(a) or
         wacliPendingGet(a, .reaction) > 0) return;
+    // Refreshing groups and contacts on every restart got the account rate
+    // limited (429 rate-overlimit): do it on the first start of a run and
+    // then at most every sync_gate.sync_refresh_gap_ms.
+    const now_ms = win.GetTickCount64();
+    const refresh = sync_gate.gapElapsed(a.last_sync_refresh_ms, now_ms, sync_gate.sync_refresh_gap_ms);
+    const base_argv = [_][]const u8{ a.wacli_path, "--events", "sync", "--follow", "--max-reconnect", "0", "--stale-threshold", "1m", "--download-media" };
+    const refresh_argv = base_argv ++ [_][]const u8{ "--refresh-contacts", "--refresh-groups" };
     const child = std.process.spawn(a.io, .{
-        .argv = &.{ a.wacli_path, "--events", "sync", "--follow", "--max-reconnect", "0", "--stale-threshold", "1m", "--refresh-contacts", "--refresh-groups", "--download-media" },
+        .argv = if (refresh) &refresh_argv else &base_argv,
         .stdin = .ignore,
         .stdout = .ignore,
         .stderr = .pipe,
@@ -7303,7 +7449,8 @@ fn startSync(a: *App) void {
             file.close(a.io);
         }
     }
-    appendLaunchLog(a, "sync: child started");
+    if (refresh) a.last_sync_refresh_ms = now_ms;
+    appendLaunchLog(a, if (refresh) "sync: child started (refresh groups)" else "sync: child started");
     a.sync_started_secs = nowUnixSeconds();
     // A fresh child gets a fresh watchdog: unknown heartbeat stamp, first
     // check after sync_heartbeat_check_ticks, and the unreadable notice once.
@@ -7314,10 +7461,16 @@ fn startSync(a: *App) void {
     setStatus(a, "Live sync running");
 }
 
-fn stopSync(a: *App) void {
+// Every caller names its reason so the launch log shows what pauses live
+// sync ("sync: child stopped (avatars)"). Background callers check
+// last_sync_stop_ms through sync_gate before they get here.
+fn stopSync(a: *App, reason: []const u8) void {
     if (a.sync_child) |*child| {
         child.kill(a.io);
-        appendLaunchLog(a, "sync: child stopped");
+        a.last_sync_stop_ms = win.GetTickCount64();
+        var event_buffer: [96]u8 = undefined;
+        const event = std.fmt.bufPrint(&event_buffer, "sync: child stopped ({s})", .{reason}) catch "sync: child stopped";
+        appendLaunchLog(a, event);
     }
     a.sync_child = null;
 }
@@ -7369,7 +7522,7 @@ fn checkSyncHeartbeat(a: *App) void {
     const event = std.fmt.bufPrint(&event_buffer, "sync: heartbeat stale {d}s, restarting child", .{age}) catch return;
     appendLaunchLog(a, event);
     a.sync_heartbeat_restart_secs = now;
-    stopSync(a);
+    stopSync(a, "heartbeat");
 }
 
 fn checkSync(a: *App) void {
@@ -7601,10 +7754,15 @@ fn startNextSend(a: *App) void {
     var count: usize = 0;
     args[count] = a.wacli_path;
     count += 1;
-    // 70s lock wait, like mark-read: a picture/media child can hold the store
-    // lock for up to 60s. Sends no longer stop live sync; wacli 0.19
-    // delegates them to the running sync process.
-    for ([_][]const u8{ "--json", "--lock-wait", "70s", "send", if (is_file) "file" else "text", "--to", pending.jid.slice() }) |argument| {
+    // Sends never stop live sync: wacli 0.19 hands them to the running sync
+    // process over .send.sock, but only after the lock attempt fails, so a
+    // lock wait would delay every send by its full length. 0s while sync
+    // runs; with sync down, 70s like mark-read, since a picture or media
+    // child can hold the store lock for up to 60s. A send in the few seconds
+    // before a fresh sync child opens its socket fails on the lock and
+    // retries (sendRetryDelayMs).
+    const lock_wait = if (a.sync_child != null) "0s" else "70s";
+    for ([_][]const u8{ "--json", "--lock-wait", lock_wait, "send", if (is_file) "file" else "text", "--to", pending.jid.slice() }) |argument| {
         args[count] = argument;
         count += 1;
     }
@@ -9156,7 +9314,7 @@ fn removeFirstPendingArchive(a: *App) void {
 fn startNextArchive(a: *App) void {
     if (a.archive_child != null or a.read_child != null or a.pending_archive_count == 0) return;
     if (mediaBusy(a) or a.send_child != null or sendReadyPending(a) or avatarBusy(a)) return;
-    stopSync(a);
+    stopSync(a, "archive");
     const pending = &a.pending_archives[0];
     const child = std.process.spawn(a.io, .{
         .argv = &.{ a.wacli_path, "--json", "--lock-wait", "10s", "chats", if (pending.should_unarchive) "unarchive" else "archive", "--chat", pending.jid.slice() },
@@ -9658,7 +9816,7 @@ fn removeWhatsAppAccount(a: *App) void {
         setStatus(a, "Could not locate the WhatsApp data folder");
         return;
     }
-    stopSync(a);
+    stopSync(a, "remove account");
     const dir_wide = utf8ToWide(a.allocator, a.wacli_dir.slice()) catch {
         setStatus(a, "Could not locate the WhatsApp data folder");
         return;
@@ -10174,7 +10332,7 @@ fn runCommand(a: *App, command: u16) void {
             refreshMessages(a);
         },
         command_sync => {
-            stopSync(a);
+            stopSync(a, "restart command");
             a.sync_fail_count = 0;
             a.sync_logged_out = false;
             startSync(a);
@@ -10296,7 +10454,7 @@ fn runCommand(a: *App, command: u16) void {
         command_links => openLinkPalette(a),
         command_accounts => openAccountsPalette(a),
         command_accounts_reconnect => {
-            stopSync(a);
+            stopSync(a, "reconnect");
             // WAZI-82: a logged-out session cannot be fixed by restarting the
             // sync child; run the pairing window so the QR flow can relink.
             if (a.sync_logged_out) {
@@ -10435,10 +10593,18 @@ fn avatarForChat(a: *App, jid: []const u8) ?*AvatarEntry {
     const path = std.fs.path.join(a.allocator, &.{ a.avatar_dir, filename }) catch return entry;
     defer a.allocator.free(path);
     entry.path.set(a.allocator, path);
-    if (win.GetFileAttributesW(entry.path.ptr()) != win.INVALID_FILE_ATTRIBUTES) {
-        entry.bitmap = loadAvatarBitmap(a, entry.path.ptr());
-        entry.status = if (entry.bitmap != null) .ready else .unknown;
-    }
+    // The on-disk cache decides before any fetch: a picture shows at once,
+    // and a recent "no picture" or failed answer is not asked again.
+    const image_secs = fileStampSecs(entry.path.ptr());
+    if (image_secs != null) entry.bitmap = loadAvatarBitmap(a, entry.path.ptr());
+    var buffer: [540]u16 = undefined;
+    const none_secs = if (avatarMarkerPath(entry, ".none", &buffer)) |marker| fileStampSecs(marker) else null;
+    const failed_secs = if (avatarMarkerPath(entry, ".fail", &buffer)) |marker| fileStampSecs(marker) else null;
+    const cache = sync_gate.classifyAvatar(image_secs, entry.bitmap != null, none_secs, failed_secs, nowUnixSeconds());
+    if (cache.has_image) {
+        entry.status = .ready;
+        entry.refresh = cache.needs_fetch;
+    } else entry.status = if (cache.needs_fetch) .unknown else .unavailable;
     return entry;
 }
 
@@ -12460,7 +12626,6 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
                 retryPendingDownload(a);
                 retryUnarchiveChat(a);
                 _ = autoDownloadNextMedia(a);
-                requestAvatar(a, a.selected_chat);
             } else if (wparam == timer_search) {
                 _ = win.KillTimer(hwnd, timer_search);
                 refreshChats(a);
@@ -12544,7 +12709,7 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
             // process exit, whichever comes first; upgrade path is a stored
             // socket handle closed here to unblock the receive immediately.
             a.slack_stop.store(true, .release);
-            stopSync(a);
+            stopSync(a, "shutdown");
             if (a.sync_job) |job| _ = win.CloseHandle(job);
             a.sync_job = null;
             if (a.audio_player) |player| {
