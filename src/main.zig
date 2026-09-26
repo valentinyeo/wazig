@@ -5422,6 +5422,14 @@ fn autoDownloadNextMedia(a: *App) bool {
         // Skip attachments older than the cache cutoff; the store's
         // LocalPath (kept across restarts) already holds anything fetched.
         if (!media_age.withinDays(message.timestamp.slice(), nowUnixSeconds(), media_cache_days)) continue;
+        // Live sync runs with --download-media and fetches what arrives
+        // while it runs: pausing it for those would restart sync on every
+        // incoming photo in the open chat.
+        if (a.sync_child != null) {
+            if (media_age.unixSeconds(message.timestamp.slice())) |sent| {
+                if (sent >= a.sync_started_secs) continue;
+            }
+        }
         if (mediaAttempted(a, message.id.slice())) continue;
         // The persistent fetched index: anything downloaded before (even in
         // an earlier session) is never re-checked or re-downloaded. A manual

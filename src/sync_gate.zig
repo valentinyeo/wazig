@@ -60,6 +60,15 @@ pub fn fresh(stamp_secs: ?i64, now_secs: i64, ttl_secs: i64) bool {
     return now_secs - stamp < ttl_secs;
 }
 
+/// wacli exits non-zero when a chat has no picture or hides it from us
+/// (whatsmeow's ErrProfilePictureNotSet / ErrProfilePictureUnauthorized).
+/// Those are answers, not failures: cache them as "no picture" for a week
+/// instead of treating them like a rate limit.
+pub fn pictureAbsent(output: []const u8) bool {
+    return std.mem.indexOf(u8, output, "does not have a profile picture") != null or
+        std.mem.indexOf(u8, output, "hidden their profile picture") != null;
+}
+
 pub const AvatarCache = struct {
     /// A decodable picture is on disk: show it right away.
     has_image: bool,
@@ -123,4 +132,11 @@ test "cached avatars are trusted for a week, failures for a day" {
     // A failure (e.g. 429) an hour ago holds off even a stale picture.
     try std.testing.expectEqual(AvatarCache{ .has_image = true, .needs_fetch = false }, classifyAvatar(now - 8 * day, true, null, now - 3600, now));
     try std.testing.expectEqual(AvatarCache{ .has_image = false, .needs_fetch = true }, classifyAvatar(null, false, null, now - 2 * day, now));
+}
+
+test "no picture and hidden picture are answers, a rate limit is a failure" {
+    try std.testing.expect(pictureAbsent("{\"error\":\"get profile picture info: that user or group does not have a profile picture\"}"));
+    try std.testing.expect(pictureAbsent("get profile picture info: the user has hidden their profile picture from you"));
+    try std.testing.expect(!pictureAbsent("info query returned status 429: rate-overlimit"));
+    try std.testing.expect(!pictureAbsent("store is locked (another wacli is running?)"));
 }

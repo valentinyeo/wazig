@@ -1,5 +1,6 @@
 // Fetches one WhatsApp profile image through wacli and stores it on disk.
 const std = @import("std");
+const sync_gate = @import("sync_gate.zig");
 const win = @cImport({
     @cDefine("WIN32_LEAN_AND_MEAN", "1");
     @cInclude("windows.h");
@@ -87,7 +88,13 @@ fn workerRun(self: *Session, exe: []const u8, jid: []const u8, destination: []co
         .exited => |code| code == 0,
         else => false,
     };
-    if (!success) return error.WacliFailed;
+    if (!success) {
+        if (sync_gate.pictureAbsent(result.stderr) or sync_gate.pictureAbsent(result.stdout)) {
+            self.state_value.store(@intFromEnum(State.unavailable), .release);
+            return;
+        }
+        return error.WacliFailed;
+    }
 
     var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, result.stdout, .{});
     defer parsed.deinit();
