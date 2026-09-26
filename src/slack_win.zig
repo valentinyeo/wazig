@@ -240,10 +240,13 @@ fn urlHost(url: []const u8) []const u8 {
 fn readResponse(allocator: std.mem.Allocator, request: win.HINTERNET, max_bytes: usize) ![]u8 {
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
-    while (out.items.len < max_bytes) {
+    while (true) {
         var available: win.DWORD = 0;
-        if (win.WinHttpQueryDataAvailable(request, &available) == 0) break;
+        // A failed query mid-body used to break out and hand back a cut
+        // body as success; fail loudly instead.
+        if (win.WinHttpQueryDataAvailable(request, &available) == 0) return error.NetworkFailed;
         if (available == 0) break;
+        if (out.items.len + available > max_bytes) return error.ResponseTooLarge;
         const old_len = out.items.len;
         try out.resize(allocator, old_len + available);
         var read: win.DWORD = 0;
@@ -300,6 +303,10 @@ fn sharedApiHandles(host: []const u8) ?win.HINTERNET {
     return connection;
 }
 
+/// HTTP status of the last callApi on this thread (0 before any answer), so
+/// a failing job can log it. A job runs start to end on one thread.
+pub threadlocal var last_status: u32 = 0;
+
 /// One HTTPS call to slack.com/api. `body` null means GET. Returns the status
 /// and body; Slack's own "ok" flag is checked by the caller through the job
 /// runner. 429 responses surface with their status so the caller can honor
@@ -330,6 +337,7 @@ pub fn callApi(allocator: std.mem.Allocator, host: []const u8, token: []const u8
     var status: win.DWORD = 0;
     var status_size: win.DWORD = @sizeOf(win.DWORD);
     _ = win.WinHttpQueryHeaders(request, win.WINHTTP_QUERY_STATUS_CODE | win.WINHTTP_QUERY_FLAG_NUMBER, null, &status, &status_size, null);
+    last_status = status;
     const data = try readResponse(allocator, request, 32 * 1024 * 1024);
     var header_size: win.DWORD = 0;
     _ = win.WinHttpQueryHeaders(request, win.WINHTTP_QUERY_RAW_HEADERS_CRLF, null, null, &header_size, 0);
@@ -734,7 +742,7 @@ pub fn runJob(allocator: std.mem.Allocator, ctx: JobContext, kind: JobKind, args
                 try path.appendSlice(allocator, "&cursor=");
                 try path.appendSlice(allocator, encoded);
             }
-            return bodyOnly(allocator, try callWithRetry(allocator, ctx.host, ctx.user_token, path.items, null));
+            return listPage(allocator, try callWithRetry(allocator, ctx.host, ctx.user_token, path.items, null));
         },
         .users => {
             var path = std.ArrayList(u8).empty;
@@ -746,7 +754,7 @@ pub fn runJob(allocator: std.mem.Allocator, ctx: JobContext, kind: JobKind, args
                 try path.appendSlice(allocator, "&cursor=");
                 try path.appendSlice(allocator, encoded);
             }
-            return bodyOnly(allocator, try callWithRetry(allocator, ctx.host, ctx.user_token, path.items, null));
+            return listPage(allocator, try callWithRetry(allocator, ctx.host, ctx.user_token, path.items, null));
         },
         .history => {
             var path = std.ArrayList(u8).empty;
@@ -816,6 +824,16 @@ pub fn runJob(allocator: std.mem.Allocator, ctx: JobContext, kind: JobKind, args
             return allocator.dupe(u8, dest.items);
         },
     }
+}
+
+/// A conversations.list or users.list page: a non-200 answer or ok:false
+/// is an error, never an empty list that looks like success.
+fn listPage(allocator: std.mem.Allocator, response: Response) ![]u8 {
+    var owned = response;
+    errdefer owned.deinit(allocator);
+    if (owned.status != 200) return error.HttpFailed;
+    if (!httpOk(allocator, owned.body)) return error.SlackRejected;
+    return bodyOnly(allocator, owned);
 }
 
 /// Keep a response's body and free its header block, which callApi allocates

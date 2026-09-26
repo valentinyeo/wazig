@@ -547,6 +547,65 @@ pub const Log = struct {
     }
 };
 
+/// One conversations.list entry, borrowed from the parsed JSON. DMs carry
+/// the other person's user id instead of a name; the caller maps it.
+pub const WorkspaceChannel = struct {
+    id: []const u8,
+    name: []const u8,
+    user: []const u8,
+    is_im: bool,
+    seconds: i64,
+};
+
+/// Read one conversations.list entry; null when it has no id.
+pub fn workspaceChannel(object: std.json.ObjectMap) ?WorkspaceChannel {
+    const id = objectStringField(object, "id");
+    if (id.len == 0) return null;
+    return .{
+        .id = id,
+        .name = objectStringField(object, "name"),
+        .user = objectStringField(object, "user"),
+        .is_im = id[0] == 'D',
+        .seconds = conversationSeconds(object),
+    };
+}
+
+/// response_metadata.next_cursor, or "" on the last page.
+pub fn nextCursor(root: std.json.ObjectMap) []const u8 {
+    const metadata = switch (root.get("response_metadata") orelse return "") {
+        .object => |object| object,
+        else => return "",
+    };
+    return objectStringField(metadata, "next_cursor");
+}
+
+/// Hard stop for list pagination, so a server that keeps returning a cursor
+/// can never loop forever (50 pages of 200 is 10,000 entries).
+pub const max_list_pages = 50;
+
+/// Fetch another page only when the cursor fits a job argument and the page
+/// cap is not reached.
+pub fn wantsNextPage(cursor: []const u8, pages_done: u32, max_cursor_len: usize) bool {
+    return cursor.len > 0 and cursor.len <= max_cursor_len and pages_done < max_list_pages;
+}
+
+/// Launch-log lines from the minute poll repeat at most once per 10 minutes
+/// per job kind, and at once when what they say changes (another error, a
+/// different chat count), so the poll cannot flood the log.
+pub const log_repeat_interval_ms: u64 = 10 * 60 * 1000;
+
+pub fn logDue(last_logged_ms: u64, last_hash: u64, now_ms: u64, hash: u64) bool {
+    if (last_logged_ms == 0 or hash != last_hash) return true;
+    return now_ms -| last_logged_ms >= log_repeat_interval_ms;
+}
+
+/// "slack: workspace failed: NetworkFailed (HTTP 200)". Only the job kind,
+/// the error name and the status: never a token or message text.
+pub fn formatJobFailure(buffer: []u8, kind: []const u8, error_name: []const u8, http_status: u32) []const u8 {
+    if (http_status == 0) return std.fmt.bufPrint(buffer, "slack: {s} failed: {s}", .{ kind, error_name }) catch "slack: job failed";
+    return std.fmt.bufPrint(buffer, "slack: {s} failed: {s} (HTTP {d})", .{ kind, error_name, http_status }) catch "slack: job failed";
+}
+
 test "compareTs orders numerically, then by fraction" {
     try std.testing.expectEqual(std.math.Order.lt, compareTs("1740000000.000100", "1740000001.000000"));
     try std.testing.expectEqual(std.math.Order.lt, compareTs("1740000000.5", "1740000000.51"));
@@ -742,4 +801,68 @@ test "tsSeconds rejects empty and malformed ts" {
     try std.testing.expectEqual(@as(?i64, 1740000000), tsSeconds("1740000000.000123"));
     try std.testing.expectEqual(@as(?i64, null), tsSeconds(""));
     try std.testing.expectEqual(@as(?i64, null), tsSeconds("abc.1"));
+}
+
+// Shaped like a real conversations.list page: channels with names, a DM with
+// only a user id, an entry without an id, and a next_cursor.
+const workspace_fixture =
+    \\{"ok":true,"channels":[
+    \\{"id":"C0001","name":"general","is_channel":true,"is_im":false,"created":1700000000,"updated":1750000000123,"purpose":{"value":"x"}},
+    \\{"id":"G0002","name":"private-team","is_group":true,"created":1700000001},
+    \\{"id":"D0003","is_im":true,"user":"U0042","created":1700000002},
+    \\{"name":"no-id"}
+    \\],"warning":"superfluous_charset","response_metadata":{"next_cursor":"dGVhbTpDMDYxRkE1UEI="}}
+;
+
+test "workspace page yields every channel with an id, DMs by user, and the next cursor" {
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, workspace_fixture, .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+    var ids: [4][]const u8 = undefined;
+    var count: usize = 0;
+    for (root.get("channels").?.array.items) |item| {
+        const channel = workspaceChannel(item.object) orelse continue;
+        ids[count] = channel.id;
+        count += 1;
+        if (channel.is_im) {
+            try std.testing.expectEqualStrings("U0042", channel.user);
+            try std.testing.expectEqualStrings("", channel.name);
+        }
+    }
+    // The empty view came from zero channels reaching the list: every entry
+    // with an id must survive parsing.
+    try std.testing.expectEqual(@as(usize, 3), count);
+    try std.testing.expectEqualStrings("C0001", ids[0]);
+    try std.testing.expectEqualStrings("D0003", ids[2]);
+    try std.testing.expectEqual(@as(i64, 1750000000), workspaceChannel(root.get("channels").?.array.items[0].object).?.seconds);
+    try std.testing.expectEqualStrings("dGVhbTpDMDYxRkE1UEI=", nextCursor(root));
+}
+
+test "a last page has no cursor, and pagination stops at the cap" {
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"ok\":true,\"members\":[],\"response_metadata\":{\"next_cursor\":\"\"}}", .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("", nextCursor(parsed.value.object));
+    try std.testing.expect(!wantsNextPage("", 1, 512));
+    try std.testing.expect(wantsNextPage("abc", 1, 512));
+    // A server that never stops sending cursors must not loop forever.
+    try std.testing.expect(!wantsNextPage("abc", max_list_pages, 512));
+    // A cursor too long for a job argument would be cut and refetch page 1.
+    try std.testing.expect(!wantsNextPage("abcd", 1, 3));
+}
+
+test "poll log lines are rate limited, but a new error or count logs at once" {
+    const hash_a: u64 = 1;
+    const hash_b: u64 = 2;
+    try std.testing.expect(logDue(0, 0, 5_000, hash_a));
+    // Same error on the next minute poll: quiet.
+    try std.testing.expect(!logDue(5_000, hash_a, 65_000, hash_a));
+    // A different error is news: log it at once.
+    try std.testing.expect(logDue(5_000, hash_a, 65_000, hash_b));
+    try std.testing.expect(logDue(5_000, hash_a, 5_000 + log_repeat_interval_ms, hash_a));
+}
+
+test "failure line names kind, error and status only" {
+    var buffer: [96]u8 = undefined;
+    try std.testing.expectEqualStrings("slack: workspace failed: NetworkFailed (HTTP 200)", formatJobFailure(&buffer, "workspace", "NetworkFailed", 200));
+    try std.testing.expectEqualStrings("slack: users failed: OutOfMemory", formatJobFailure(&buffer, "users", "OutOfMemory", 0));
 }
