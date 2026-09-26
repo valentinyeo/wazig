@@ -18,6 +18,7 @@ const message_scroll = @import("message_scroll.zig");
 const message_filter = @import("message_filter.zig");
 const chat_cache = @import("chat_cache.zig");
 const unfurl = @import("unfurl.zig");
+const shortcuts = @import("shortcuts.zig");
 
 const webp = @cImport({
     @cInclude("src/webp/decode.h");
@@ -162,6 +163,7 @@ const command_resend = 2056;
 const command_show_whatsapp = 2057;
 const command_show_slack = 2058;
 const command_show_telegram = 2059;
+const command_shortcuts_help = 2060;
 const reaction_like = 3001;
 const reaction_love = 3002;
 const reaction_laugh = 3003;
@@ -742,6 +744,9 @@ const App = struct {
     // double-click window right after opening (the second half of the
     // double-click gesture that opened it) doesn't instantly close it.
     viewer_opened_ms: u64 = 0,
+    // Keyboard shortcuts help overlay (F1, or the palette command); one at a
+    // time, closed by Esc, F1 or a click.
+    shortcut_help: ?win.HWND = null,
     unfurl_entries: [max_unfurl_entries]UnfurlEntry = [_]UnfurlEntry{.{}} ** max_unfurl_entries,
     unfurl_entry_count: usize = 0,
     unfurl_evict_slot: usize = 0,
@@ -8998,6 +9003,7 @@ fn buildPaletteItems(a: *App) void {
     a.palette_item_count = 0;
     appendPalette(a, "Search chats", "Ctrl+F", command_search);
     appendPalette(a, "Compose message", "C", command_compose);
+    appendPalette(a, "Keyboard shortcuts", "F1", command_shortcuts_help);
     appendPalette(a, "Dictate", "Ctrl+D", command_dictate);
     appendPalette(a, "Dictation language: Automatic", "", command_dictation_auto);
     appendPalette(a, "Dictation language: English", "", command_dictation_english);
@@ -9642,6 +9648,189 @@ fn paletteProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: wi
     }
 }
 
+// Layout metrics for the keyboard shortcuts help overlay, in 96-DPI logical
+// pixels; px() scales them to the window's physical pixels at draw time.
+const shortcut_padding: i32 = 22;
+const shortcut_title_height: i32 = 40;
+const shortcut_heading_height: i32 = 30;
+const shortcut_row_height: i32 = 26;
+const shortcut_group_gap: i32 = 16;
+const shortcut_col_width: i32 = 460;
+const shortcut_key_col_width: i32 = 210;
+
+fn shortcutGroupHeight(a: *const App, group: shortcuts.Group) i32 {
+    const rows: i32 = @intCast(group.items.len);
+    return px(a, shortcut_heading_height) + rows * px(a, shortcut_row_height) + px(a, shortcut_group_gap);
+}
+
+const ShortcutLayout = struct {
+    two_columns: bool,
+    column_of: [shortcuts.groups.len]u1,
+    width: i32,
+    height: i32,
+};
+
+// One column when everything fits the available height, otherwise two
+// columns with groups assigned greedily to whichever column is shorter so
+// far, so the overlay never needs to scroll.
+fn computeShortcutLayout(a: *const App, available_height: i32) ShortcutLayout {
+    var total: i32 = 0;
+    for (shortcuts.groups) |group| total += shortcutGroupHeight(a, group);
+    const single_height = px(a, shortcut_title_height) + total + px(a, shortcut_padding);
+    var sh_layout = ShortcutLayout{
+        .two_columns = false,
+        .column_of = [_]u1{0} ** shortcuts.groups.len,
+        .width = px(a, shortcut_padding) * 2 + px(a, shortcut_col_width),
+        .height = single_height,
+    };
+    if (single_height <= available_height) return sh_layout;
+    sh_layout.two_columns = true;
+    var col_a_height: i32 = 0;
+    var col_b_height: i32 = 0;
+    for (shortcuts.groups, 0..) |group, index| {
+        const height = shortcutGroupHeight(a, group);
+        if (col_a_height <= col_b_height) {
+            sh_layout.column_of[index] = 0;
+            col_a_height += height;
+        } else {
+            sh_layout.column_of[index] = 1;
+            col_b_height += height;
+        }
+    }
+    sh_layout.width = px(a, shortcut_padding) * 3 + px(a, shortcut_col_width) * 2;
+    sh_layout.height = px(a, shortcut_title_height) + @max(col_a_height, col_b_height) + px(a, shortcut_padding);
+    return sh_layout;
+}
+
+// The shortcut table is plain ASCII, so a straight byte-to-u16 copy avoids
+// the allocator on every repaint.
+fn drawAscii(hdc: win.HDC, rect: *win.RECT, text: []const u8, flags: c_uint) void {
+    var buffer: [256]u16 = undefined;
+    const len = @min(text.len, buffer.len - 1);
+    for (text[0..len], 0..) |byte, index| buffer[index] = byte;
+    buffer[len] = 0;
+    _ = win.DrawTextW(hdc, &buffer, @intCast(len), rect, flags);
+}
+
+fn drawShortcutHelp(a: *App, hwnd: win.HWND) void {
+    var paint: win.PAINTSTRUCT = undefined;
+    const hdc = win.BeginPaint(hwnd, &paint);
+    defer _ = win.EndPaint(hwnd, &paint);
+    var client: win.RECT = undefined;
+    _ = win.GetClientRect(hwnd, &client);
+    _ = win.FillRect(hdc, &client, a.brush_panel orelse return);
+    _ = win.SetBkMode(hdc, win.TRANSPARENT);
+
+    _ = win.SelectObject(hdc, @ptrCast(a.font_bold.?));
+    _ = win.SetTextColor(hdc, color_text);
+    var title_rect = win.RECT{ .left = px(a, shortcut_padding), .top = px(a, 10), .right = client.right - px(a, shortcut_padding), .bottom = px(a, shortcut_title_height) };
+    drawAscii(hdc, &title_rect, "Keyboard shortcuts", win.DT_LEFT | win.DT_SINGLELINE | win.DT_VCENTER);
+
+    const available_height = client.bottom - client.top - px(a, shortcut_padding);
+    const sh_layout = computeShortcutLayout(a, available_height);
+    const col_width = px(a, shortcut_col_width);
+    const key_width = px(a, shortcut_key_col_width);
+    var col_x = [2]i32{ px(a, shortcut_padding), px(a, shortcut_padding) };
+    if (sh_layout.two_columns) col_x[1] = px(a, shortcut_padding) * 2 + col_width;
+    var col_y = [2]i32{ px(a, shortcut_title_height), px(a, shortcut_title_height) };
+
+    for (shortcuts.groups, 0..) |group, index| {
+        const col: usize = if (sh_layout.two_columns) sh_layout.column_of[index] else 0;
+        const x = col_x[col];
+        var y = col_y[col];
+
+        _ = win.SelectObject(hdc, @ptrCast(a.font_bold.?));
+        _ = win.SetTextColor(hdc, color_accent);
+        var heading_rect = win.RECT{ .left = x, .top = y, .right = x + col_width, .bottom = y + px(a, shortcut_heading_height) };
+        drawAscii(hdc, &heading_rect, group.name, win.DT_LEFT | win.DT_SINGLELINE | win.DT_VCENTER);
+        y += px(a, shortcut_heading_height);
+
+        for (group.items) |item| {
+            _ = win.SelectObject(hdc, @ptrCast(a.font.?));
+            _ = win.SetTextColor(hdc, color_text);
+            var key_rect = win.RECT{ .left = x, .top = y, .right = x + key_width, .bottom = y + px(a, shortcut_row_height) };
+            drawAscii(hdc, &key_rect, item.key, win.DT_LEFT | win.DT_SINGLELINE | win.DT_END_ELLIPSIS | win.DT_VCENTER);
+
+            _ = win.SetTextColor(hdc, color_muted);
+            var desc_rect = win.RECT{ .left = x + key_width, .top = y, .right = x + col_width, .bottom = y + px(a, shortcut_row_height) };
+            drawAscii(hdc, &desc_rect, item.desc, win.DT_LEFT | win.DT_SINGLELINE | win.DT_END_ELLIPSIS | win.DT_VCENTER);
+            y += px(a, shortcut_row_height);
+        }
+        y += px(a, shortcut_group_gap);
+        col_y[col] = y;
+    }
+}
+
+fn openShortcutHelp(a: *App) void {
+    if (a.shortcut_help != null) return;
+    const owner = a.hwnd orelse return;
+    const monitor = win.MonitorFromWindow(owner, win.MONITOR_DEFAULTTONEAREST);
+    var info = std.mem.zeroes(win.MONITORINFO);
+    info.cbSize = @sizeOf(win.MONITORINFO);
+    if (win.GetMonitorInfoW(monitor, &info) == 0) return;
+    const work = info.rcWork;
+    const margin = px(a, 40);
+    const available_height = @max(px(a, 200), (work.bottom - work.top) - margin);
+    const sh_layout = computeShortcutLayout(a, available_height);
+    const width = @min(sh_layout.width, work.right - work.left - margin);
+    const height = @min(sh_layout.height, work.bottom - work.top - margin);
+    const x = work.left + @divTrunc((work.right - work.left) - width, 2);
+    const y = work.top + @divTrunc((work.bottom - work.top) - height, 2);
+    const hwnd = win.CreateWindowExW(
+        win.WS_EX_TOOLWINDOW,
+        lit("MessagesShortcutHelp"),
+        null,
+        win.WS_POPUP,
+        x,
+        y,
+        width,
+        height,
+        owner,
+        null,
+        a.instance,
+        null,
+    ) orelse return;
+    a.shortcut_help = hwnd;
+    var corner: win.DWORD = 2; // DWMWCP_ROUND
+    _ = win.DwmSetWindowAttribute(hwnd, 33, &corner, @sizeOf(win.DWORD));
+    _ = win.ShowWindow(hwnd, win.SW_SHOW);
+    _ = win.SetForegroundWindow(hwnd);
+    _ = win.SetFocus(hwnd);
+}
+
+fn closeShortcutHelp(a: *App) void {
+    if (a.shortcut_help) |hwnd| _ = win.DestroyWindow(hwnd);
+}
+
+fn shortcutHelpProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.LPARAM) callconv(.winapi) win.LRESULT {
+    const a = app_ptr orelse return win.DefWindowProcW(hwnd, message, wparam, lparam);
+    switch (message) {
+        win.WM_ERASEBKGND => return 1,
+        win.WM_PAINT => {
+            drawShortcutHelp(a, hwnd);
+            return 0;
+        },
+        win.WM_KEYDOWN => {
+            if (wparam == win.VK_ESCAPE or wparam == win.VK_F1) closeShortcutHelp(a);
+            return 0;
+        },
+        win.WM_LBUTTONDOWN => {
+            closeShortcutHelp(a);
+            return 0;
+        },
+        win.WM_CLOSE => {
+            closeShortcutHelp(a);
+            return 0;
+        },
+        win.WM_DESTROY => {
+            if (a.shortcut_help != null and a.shortcut_help.? == hwnd) a.shortcut_help = null;
+            return 0;
+        },
+        else => {},
+    }
+    return win.DefWindowProcW(hwnd, message, wparam, lparam);
+}
+
 fn runCommand(a: *App, command: u16) void {
     switch (command) {
         command_search => {
@@ -9652,6 +9841,7 @@ fn runCommand(a: *App, command: u16) void {
             if (a.compose) |compose| _ = win.SetFocus(compose);
         },
         command_emoji => openEmojiPicker(a),
+        command_shortcuts_help => openShortcutHelp(a),
         command_emoji_diag => setStatus(a, emoji_draw.failureNotice() orelse "Colour emoji is working"),
         command_unread => {
             a.unread_only = !a.unread_only;
@@ -12145,6 +12335,13 @@ fn handleKeyboard(a: *App, message: *const win.MSG) bool {
     // The image viewer owns the keyboard too: shortcuts like Q (quit) or
     // E (archive) must not act on the chat hidden behind it.
     if (a.image_viewer_window != null) return false;
+    // The shortcuts help overlay owns the keyboard while open; its own
+    // window proc handles Esc/F1 to close it.
+    if (a.shortcut_help != null) return false;
+    if (key == win.VK_F1) {
+        openShortcutHelp(a);
+        return true;
+    }
     // With the composer empty, Up/Down walk the message highlight like
     // Alt+K/J; Down past the newest message clears it. Once there is text,
     // the arrows move the caret as usual.
@@ -13038,6 +13235,22 @@ pub fn main(init: std.process.Init) !void {
         .hIconSm = icon_small,
     };
     if (win.RegisterClassExW(&palette_class) == 0) return error.RegisterPaletteClassFailed;
+
+    var shortcut_help_class = win.WNDCLASSEXW{
+        .cbSize = @sizeOf(win.WNDCLASSEXW),
+        .style = 0,
+        .lpfnWndProc = shortcutHelpProc,
+        .cbClsExtra = 0,
+        .cbWndExtra = 0,
+        .hInstance = instance,
+        .hIcon = icon_big,
+        .hCursor = cursor,
+        .hbrBackground = null,
+        .lpszMenuName = null,
+        .lpszClassName = lit("MessagesShortcutHelp"),
+        .hIconSm = icon_small,
+    };
+    if (win.RegisterClassExW(&shortcut_help_class) == 0) return error.RegisterShortcutHelpClassFailed;
 
     var slack_class = std.mem.zeroes(win.WNDCLASSEXW);
     slack_class.cbSize = @sizeOf(win.WNDCLASSEXW);
