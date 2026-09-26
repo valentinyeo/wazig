@@ -564,7 +564,7 @@ const Decoder = struct {
     // Builds an input sample (copy of packet bytes with timestamps).
     fn makeInputSample(payload: []const u8, time_100ns: u64, duration_100ns: u64) !*win.IMFSample {
         var buffer: ?*win.IMFMediaBuffer = null;
-        if (win.MFCreateMemoryBuffer(@intCast(payload.len), &buffer) < 0 or buffer == null) return error.MfFailure;
+        if (mf_create_memory_buffer.?(@intCast(payload.len), &buffer) < 0 or buffer == null) return error.MfFailure;
         const owned_buffer = buffer.?;
         defer _ = owned_buffer.*.lpVtbl.*.Release.?(owned_buffer);
         {
@@ -577,7 +577,7 @@ const Decoder = struct {
             if (owned_buffer.*.lpVtbl.*.SetCurrentLength.?(owned_buffer, @intCast(payload.len)) < 0) return error.MfFailure;
         }
         var sample: ?*win.IMFSample = null;
-        if (win.MFCreateSample(&sample) < 0 or sample == null) return error.MfFailure;
+        if (mf_create_sample.?(&sample) < 0 or sample == null) return error.MfFailure;
         if (sample.?.*.lpVtbl.*.AddBuffer.?(sample.?, owned_buffer) < 0) {
             _ = sample.?.*.lpVtbl.*.Release.?(sample);
             return error.MfFailure;
@@ -600,10 +600,10 @@ const Decoder = struct {
         if ((stream_info.dwFlags & win.MFT_OUTPUT_STREAM_PROVIDES_SAMPLES) == 0) {
             const buffer_size: win.DWORD = @intCast(@max(stream_info.cbSize, 65536));
             var buffer: ?*win.IMFMediaBuffer = null;
-            if (win.MFCreateMemoryBuffer(buffer_size, &buffer) < 0 or buffer == null) return error.MfFailure;
+            if (mf_create_memory_buffer.?(buffer_size, &buffer) < 0 or buffer == null) return error.MfFailure;
             defer _ = buffer.?.*.lpVtbl.*.Release.?(buffer);
             var sample: ?*win.IMFSample = null;
-            if (win.MFCreateSample(&sample) < 0 or sample == null) return error.MfFailure;
+            if (mf_create_sample.?(&sample) < 0 or sample == null) return error.MfFailure;
             if (sample.?.*.lpVtbl.*.AddBuffer.?(sample.?, buffer) < 0) {
                 _ = sample.?.*.lpVtbl.*.Release.?(sample);
                 return error.MfFailure;

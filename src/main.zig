@@ -23,6 +23,9 @@ const unfurl = @import("unfurl.zig");
 const shortcuts = @import("shortcuts.zig");
 const control_api = @import("control.zig");
 const control_pipe = @import("control_pipe.zig");
+const mf_lazy = @import("mf_lazy.zig");
+const shell_lazy = @import("shell_lazy.zig");
+const bitmap_lru = @import("bitmap_lru.zig");
 
 const webp = @cImport({
     @cInclude("src/webp/decode.h");
@@ -796,6 +799,16 @@ const App = struct {
     wic_factory: [*c]win.IWICImagingFactory = null,
     player_window: ?win.HWND = null,
     mf_player: ?*win.IMFPMediaPlayer = null,
+    // Consecutive timer_refresh ticks (1s each) with no gif_reader and no
+    // mf_player: once past mf_idle_unload_ticks, Media Foundation is
+    // released. Reset to 0 whenever either is in use.
+    mf_idle_ticks: u32 = 0,
+    // Byte accounting for message.bitmap across the whole message list, so
+    // it can be capped instead of just wiped on every off-screen message
+    // each paint (see the pre-paint eviction pass).
+    message_bitmap_lru: bitmap_lru.Lru(max_messages) = .{},
+    startup_ticks: u32 = 0,
+    startup_memory_logged: bool = false,
     // WAZI-68 fullscreen state for the video player window.
     player_saved_placement: win.WINDOWPLACEMENT = undefined,
     player_fullscreen: bool = false,
@@ -2609,9 +2622,10 @@ fn handleTgKeyInput(a: *App, trimmed: []const u8) void {
 }
 
 fn openMyTelegramPage(a: *App) void {
+    if (!shell_lazy.ensureShell32()) return;
     const url_wide = utf8ToWide(a.allocator, "https://my.telegram.org/apps") catch return;
     defer a.allocator.free(url_wide);
-    const result = win.ShellExecuteW(a.hwnd orelse null, lit("open"), url_wide.ptr, null, null, win.SW_SHOWNORMAL);
+    const result = shell_lazy.shellExecuteW.?(a.hwnd orelse null, lit("open"), url_wide.ptr, null, null, win.SW_SHOWNORMAL);
     if (@intFromPtr(result) <= 32) setStatus(a, "Windows could not open the browser");
 }
 
@@ -2904,9 +2918,10 @@ fn smokeDrawCard(allocator: std.mem.Allocator, io: std.Io, a: *App, dir: []const
 // result when a machine refuses the sample clip. Diagnostic only: the
 // shipped play path above stays the one whose behaviour is judged.
 fn smokeMfProbe(a: *App) struct { hr: win.HRESULT, note: []const u8 } {
+    if (!mf_lazy.ensureStarted()) return .{ .hr = -1, .note = "Media Foundation failed to load on this machine" };
     var player: ?*win.IMFPMediaPlayer = null;
     const probe_url = lit("https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerBlazes.mp4");
-    const hr = win.MFPCreateMediaPlayer(probe_url, 0, win.MFP_OPTION_NONE, &player_callback, a.hwnd orelse null, &player);
+    const hr = mf_lazy.createMediaPlayer.?(probe_url, 0, win.MFP_OPTION_NONE, &player_callback, a.hwnd orelse null, &player);
     if (hr >= 0 and player != null) {
         _ = player.?.lpVtbl.*.Shutdown.?(player.?);
         _ = player.?.lpVtbl.*.Release.?(player.?);
@@ -2987,10 +3002,11 @@ fn unfurlSmoke(init: std.process.Init) u8 {
 
     _ = win.CoInitializeEx(null, win.COINIT_APARTMENTTHREADED);
     defer win.CoUninitialize();
-    const mf_started = win.MFStartup(win.MF_VERSION, win.MFSTARTUP_FULL) >= 0;
-    defer {
-        if (mf_started) _ = win.MFShutdown();
-    }
+    // The smoke test exercises the MFPlay video path, so start Media
+    // Foundation up front here (unlike the real app, which starts it lazily
+    // on first GIF/video use; see mf_lazy.zig).
+    _ = mf_lazy.ensureStarted();
+    defer mf_lazy.unloadIfStarted();
 
     var scratch: [1]u8 = .{0};
     var app = App{
@@ -4227,9 +4243,8 @@ const OPENFILENAMEW = extern struct {
     FlagsEx: win.DWORD,
 };
 
-extern "comdlg32" fn GetOpenFileNameW(ofn: *OPENFILENAMEW) win.BOOL;
-
 fn pickImageFile(a: *App) ?WideText(519) {
+    if (!shell_lazy.ensureComdlg32()) return null;
     var buffer: [519]u16 = [_]u16{0} ** 519;
     var ofn = std.mem.zeroes(OPENFILENAMEW);
     ofn.lStructSize = @sizeOf(OPENFILENAMEW);
@@ -4238,7 +4253,7 @@ fn pickImageFile(a: *App) ?WideText(519) {
     ofn.lpstrFile = @ptrCast(&buffer);
     ofn.nMaxFile = buffer.len;
     ofn.Flags = 0x00000800 | 0x00001000 | 0x00000008; // path + file must exist, no dir change
-    if (GetOpenFileNameW(&ofn) == 0) return null;
+    if (shell_lazy.getOpenFileNameW.?(@ptrCast(&ofn)) == 0) return null;
     const chosen = std.unicode.utf16LeToUtf8Alloc(a.allocator, std.mem.span(@as([*:0]const u16, @ptrCast(&buffer)))) catch return null;
     defer a.allocator.free(chosen);
     var result = WideText(519){};
@@ -4718,7 +4733,11 @@ fn retryPendingDownload(a: *App) void {
 
 fn clearMessages(a: *App) void {
     for (a.messages[0..a.message_count]) |*message| {
-        if (message.bitmap) |bitmap| _ = win.DeleteObject(bitmap);
+        if (message.bitmap) |bitmap| {
+            _ = win.DeleteObject(bitmap);
+            message.bitmap = null;
+        }
+        a.message_bitmap_lru.remove(@intFromPtr(message));
         if (message.gif_reader != null) _ = message.gif_reader.*.lpVtbl.*.Release.?(message.gif_reader);
     }
     a.message_count = 0;
@@ -5009,18 +5028,20 @@ fn decodeGifVideoFrame(message: *Message) bool {
         }
     }
     message.bitmap = bitmap;
+    noteMessageBitmap(message);
     return true;
 }
 
 fn ensureGifVideoBitmap(message: *Message) void {
     if (message.local_path.len == 0) return;
     if (message.gif_reader == null) {
+        if (!mf_lazy.ensureStarted()) return;
         var attributes: ?*win.IMFAttributes = null;
-        if (win.MFCreateAttributes(&attributes, 1) < 0 or attributes == null) return;
+        if (mf_lazy.createAttributes.?(&attributes, 1) < 0 or attributes == null) return;
         defer _ = attributes.?.*.lpVtbl.*.Release.?(attributes);
         _ = attributes.?.*.lpVtbl.*.SetUINT32.?(attributes.?, &win.MF_SOURCE_READER_ENABLE_ADVANCED_VIDEO_PROCESSING, 1);
         var reader: [*c]win.IMFSourceReader = null;
-        if (win.MFCreateSourceReaderFromURL(message.local_path.ptr(), attributes, &reader) < 0 or reader == null) return;
+        if (mf_lazy.createSourceReaderFromURL.?(message.local_path.ptr(), attributes, &reader) < 0 or reader == null) return;
         message.gif_reader = reader;
 
         var native_type: ?*win.IMFMediaType = null;
@@ -5045,7 +5066,7 @@ fn ensureGifVideoBitmap(message: *Message) void {
             target_width = @intCast(@max(1, @divTrunc(@as(u64, source_width) * target_height, source_height)));
         }
         var output_type: ?*win.IMFMediaType = null;
-        if (win.MFCreateMediaType(&output_type) < 0 or output_type == null) return;
+        if (mf_lazy.createMediaType.?(&output_type) < 0 or output_type == null) return;
         defer _ = output_type.?.*.lpVtbl.*.Release.?(output_type);
         _ = output_type.?.*.lpVtbl.*.SetGUID.?(output_type.?, &win.MF_MT_MAJOR_TYPE, &win.MFMediaType_Video);
         _ = output_type.?.*.lpVtbl.*.SetGUID.?(output_type.?, &win.MF_MT_SUBTYPE, &win.MFVideoFormat_RGB32);
@@ -5075,8 +5096,9 @@ fn ensureGifVideoBitmap(message: *Message) void {
 }
 
 fn ensureVideoBitmap(message: *Message) void {
+    if (!shell_lazy.ensureShell32()) return;
     var factory: [*c]win.IShellItemImageFactory = null;
-    if (win.SHCreateItemFromParsingName(message.local_path.ptr(), null, &win.IID_IShellItemImageFactory, @ptrCast(&factory)) < 0 or factory == null) return;
+    if (shell_lazy.shCreateItemFromParsingName.?(message.local_path.ptr(), null, &win.IID_IShellItemImageFactory, @ptrCast(&factory)) < 0 or factory == null) return;
     defer _ = factory.*.lpVtbl.*.Release.?(factory);
     var bitmap: win.HBITMAP = null;
     const requested = win.SIZE{ .cx = 420, .cy = 250 };
@@ -5089,10 +5111,17 @@ fn ensureVideoBitmap(message: *Message) void {
     message.bitmap = bitmap;
     message.bitmap_width = details.bmWidth;
     message.bitmap_height = details.bmHeight;
+    noteMessageBitmap(message);
 }
 
 fn ensureBitmap(a: *App, message: *Message) void {
-    if (message.bitmap != null or message.local_path.len == 0) return;
+    if (message.bitmap != null) {
+        // Already decoded: refresh recency so a long-visible image is not
+        // mistaken for stale by the LRU cap below.
+        noteMessageBitmap(message);
+        return;
+    }
+    if (message.local_path.len == 0) return;
     if (isVideoGif(message)) {
         ensureGifVideoBitmap(message);
         return;
@@ -5302,6 +5331,7 @@ fn fillDibFromSource(a: *App, message: *Message, source: *win.IWICBitmapSource, 
     message.bitmap = bitmap;
     message.bitmap_width = @intCast(target_width);
     message.bitmap_height = @intCast(target_height);
+    noteMessageBitmap(message);
 }
 
 // Current wall-clock unix seconds via FILETIME: std.time lost its
@@ -6253,7 +6283,11 @@ fn checkMediaDownload(a: *App) void {
 
 fn openMedia(a: *App, message: *const Message) void {
     if (message.local_path.len == 0) return;
-    const result = win.ShellExecuteW(a.hwnd.?, lit("open"), message.local_path.ptr(), null, null, win.SW_SHOWNORMAL);
+    if (!shell_lazy.ensureShell32()) {
+        setStatus(a, "Windows could not open the attachment");
+        return;
+    }
+    const result = shell_lazy.shellExecuteW.?(a.hwnd.?, lit("open"), message.local_path.ptr(), null, null, win.SW_SHOWNORMAL);
     if (@intFromPtr(result) <= 32) setStatus(a, "Windows could not open the attachment");
 }
 
@@ -6385,6 +6419,10 @@ fn playerProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win
 
 fn playVideoInline(a: *App, message: *const Message) void {
     if (message.local_path.len == 0) return;
+    if (!mf_lazy.ensureStarted()) {
+        setStatus(a, "Video playback is not available for this file");
+        return;
+    }
     if (a.player_window != null) closePlayer(a);
     const size = clampPlayerSize(@intCast(@max(message.bitmap_width, 0)), @intCast(@max(message.bitmap_height, 0)));
     var rect = win.RECT{ .left = 0, .top = 0, .right = @intCast(size[0]), .bottom = @intCast(size[1]) };
@@ -6394,7 +6432,7 @@ fn playVideoInline(a: *App, message: *const Message) void {
         return;
     };
     var player: ?*win.IMFPMediaPlayer = null;
-    const hr = win.MFPCreateMediaPlayer(message.local_path.ptr(), 1, win.MFP_OPTION_NONE, &player_callback, hwnd, &player);
+    const hr = mf_lazy.createMediaPlayer.?(message.local_path.ptr(), 1, win.MFP_OPTION_NONE, &player_callback, hwnd, &player);
     if (hr < 0 or player == null) {
         setStatus(a, "Video playback is not available for this file");
         a.player_window = null;
@@ -6409,13 +6447,17 @@ fn playVideoInline(a: *App, message: *const Message) void {
 // in the same MFPlay window used for downloaded videos.
 fn playUnfurlVideo(a: *App, entry: *const UnfurlEntry) void {
     if (entry.play_url.len == 0) return;
+    if (!mf_lazy.ensureStarted()) {
+        setStatus(a, "This video cannot play in the app");
+        return;
+    }
     if (a.player_window != null) closePlayer(a);
     const hwnd = openPlayerWindow(a, 800, 450) orelse {
         setStatus(a, "Could not open the video player");
         return;
     };
     var player: ?*win.IMFPMediaPlayer = null;
-    const hr = win.MFPCreateMediaPlayer(entry.play_url.ptr(), 1, win.MFP_OPTION_NONE, &player_callback, hwnd, &player);
+    const hr = mf_lazy.createMediaPlayer.?(entry.play_url.ptr(), 1, win.MFP_OPTION_NONE, &player_callback, hwnd, &player);
     if (hr < 0 or player == null) {
         setStatus(a, "This video cannot play in the app");
         a.player_window = null;
@@ -7136,6 +7178,122 @@ fn applyUnfurlResult(a: *App, result: *UnfurlResult) void {
     }
     // No matching entry: the message scrolled away and the slot was reused.
     // Nothing to repaint; the result (and its thumbnail bytes) just expires.
+}
+
+// Total budget for message.bitmap pixel data across the whole message
+// list. Once over budget, the least-recently-shown bitmaps are freed
+// first; scrolling back to one re-decodes it from the file on disk.
+const message_bitmap_budget_bytes: usize = 24 * 1024 * 1024;
+
+// Registers message.bitmap's current size/recency with the app (or drops
+// it from accounting when the caller already freed the bitmap itself).
+// Called through app_ptr because the three bitmap-creation functions this
+// feeds (decodeGifVideoFrame, ensureVideoBitmap, fillDibFromSource) work
+// on a single *Message and do not otherwise need the whole *App.
+fn noteMessageBitmap(message: *Message) void {
+    const a = app_ptr orelse return;
+    if (message.bitmap != null) {
+        const bytes: usize = @as(usize, @intCast(message.bitmap_width)) * @as(usize, @intCast(message.bitmap_height)) * 4;
+        a.message_bitmap_lru.touch(@intFromPtr(message), bytes);
+    } else {
+        a.message_bitmap_lru.remove(@intFromPtr(message));
+    }
+}
+
+// Frees message.bitmap and drops it from the LRU's accounting.
+fn dropMessageBitmap(message: *Message) void {
+    if (message.bitmap) |bitmap| {
+        _ = win.DeleteObject(bitmap);
+        message.bitmap = null;
+    }
+    if (app_ptr) |a| a.message_bitmap_lru.remove(@intFromPtr(message));
+}
+
+// PROCESS_MEMORY_COUNTERS_EX (psapi.h). Declared by hand and called through
+// kernel32's own K32GetProcessMemoryInfo (available since Windows 7) so this
+// does not need to link psapi.dll just for one diagnostic log line.
+const PROCESS_MEMORY_COUNTERS_EX = extern struct {
+    cb: win.DWORD = @sizeOf(@This()),
+    PageFaultCount: win.DWORD = 0,
+    PeakWorkingSetSize: usize = 0,
+    WorkingSetSize: usize = 0,
+    QuotaPeakPagedPoolUsage: usize = 0,
+    QuotaPagedPoolUsage: usize = 0,
+    QuotaPeakNonPagedPoolUsage: usize = 0,
+    QuotaNonPagedPoolUsage: usize = 0,
+    PagefileUsage: usize = 0,
+    PeakPagefileUsage: usize = 0,
+    PrivateUsage: usize = 0,
+};
+extern "kernel32" fn K32GetProcessMemoryInfo(process: win.HANDLE, counters: *PROCESS_MEMORY_COUNTERS_EX, cb: win.DWORD) win.BOOL;
+
+pub const MemorySnapshot = struct {
+    working_set_bytes: usize = 0,
+    private_bytes: usize = 0,
+    module_count: u32 = 0,
+};
+
+/// Cheap enough to call from a timer tick or wazigctl status: one
+/// GetProcessMemoryInfo call plus a Toolhelp module walk.
+pub fn readMemorySnapshot() MemorySnapshot {
+    var result = MemorySnapshot{};
+    var counters = PROCESS_MEMORY_COUNTERS_EX{};
+    if (K32GetProcessMemoryInfo(win.GetCurrentProcess(), &counters, @sizeOf(PROCESS_MEMORY_COUNTERS_EX)) != 0) {
+        result.working_set_bytes = counters.WorkingSetSize;
+        result.private_bytes = counters.PrivateUsage;
+    }
+    const TH32CS_SNAPMODULE = 0x00000008;
+    const snapshot = win.CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, win.GetCurrentProcessId()) orelse return result;
+    defer _ = win.CloseHandle(snapshot);
+    var entry = std.mem.zeroes(win.MODULEENTRY32W);
+    entry.dwSize = @sizeOf(win.MODULEENTRY32W);
+    if (win.Module32FirstW(snapshot, &entry) == 0) return result;
+    result.module_count = 1;
+    while (win.Module32NextW(snapshot, &entry) != 0) result.module_count += 1;
+    return result;
+}
+
+// One line in launch-log.txt ~30s after startup, so a memory regression on
+// the user's machine shows up without asking them to attach a profiler.
+fn logStartupMemorySnapshot(a: *App) void {
+    const snapshot = readMemorySnapshot();
+    var buffer: [160]u8 = undefined;
+    const line = std.fmt.bufPrint(&buffer, "memory: working set {d} KB, private {d} KB, {d} modules loaded", .{
+        snapshot.working_set_bytes / 1024,
+        snapshot.private_bytes / 1024,
+        snapshot.module_count,
+    }) catch "memory: snapshot failed to format";
+    appendLaunchLog(a, line);
+}
+
+const mf_idle_unload_ticks: u32 = 60; // ~60s at the 1s timer_refresh cadence
+
+fn anyGifReaderOpen(a: *App) bool {
+    for (a.messages[0..a.message_count]) |*message| {
+        if (message.gif_reader != null) return true;
+    }
+    return false;
+}
+
+// Frees Media Foundation once nothing has needed it for a while: called
+// once per timer_refresh tick (~1s). Keeps the ~20 MB of MF/codec DLLs
+// (mfplat, mfreadwrite, mfplay, and the Windows.Media/mfcore/msvproc they
+// pull in) from sitting resident for a session that opened one GIF or
+// video and then went back to plain chat.
+fn tickMediaFoundationIdle(a: *App) void {
+    if (!mf_lazy.isStarted()) {
+        a.mf_idle_ticks = 0;
+        return;
+    }
+    if (a.mf_player != null or anyGifReaderOpen(a)) {
+        a.mf_idle_ticks = 0;
+        return;
+    }
+    a.mf_idle_ticks += 1;
+    if (a.mf_idle_ticks >= mf_idle_unload_ticks) {
+        mf_lazy.unloadIfStarted();
+        a.mf_idle_ticks = 0;
+    }
 }
 
 fn advanceGifs(a: *App) void {
@@ -8135,7 +8293,8 @@ fn stageImageFromClipboard(a: *App) bool {
             // A copied file: reuse the original bytes, but only for formats
             // wacli uploads as images.
             var name_buffer: [520]u16 = undefined;
-            const chars = win.DragQueryFileW(@ptrCast(@alignCast(hdrop)), 0, &name_buffer, name_buffer.len);
+            if (!shell_lazy.ensureShell32()) return true;
+            const chars = shell_lazy.dragQueryFileW.?(@ptrCast(@alignCast(hdrop)), 0, &name_buffer, name_buffer.len);
             source_name = std.unicode.utf16LeToUtf8Alloc(a.allocator, name_buffer[0..chars]) catch {
                 setStatus(a, "Clipboard holds no image to paste");
                 return true;
@@ -9356,7 +9515,11 @@ fn addReactionItems(menu: win.HMENU) void {
 }
 
 fn openUrlWide(a: *App, url: [*:0]const u16) void {
-    const result = win.ShellExecuteW(a.hwnd.?, lit("open"), url, null, null, win.SW_SHOWNORMAL);
+    if (!shell_lazy.ensureShell32()) {
+        setStatus(a, "Windows could not open the link");
+        return;
+    }
+    const result = shell_lazy.shellExecuteW.?(a.hwnd.?, lit("open"), url, null, null, win.SW_SHOWNORMAL);
     if (@intFromPtr(result) <= 32) setStatus(a, "Windows could not open the link");
 }
 
@@ -9754,6 +9917,13 @@ fn controlStatus(a: *App, w: *std.Io.Writer) !void {
         a.slack_chat_count, a.chat_count,                     a.show_archived, a.unread_only,
     });
     try control_api.writeString(w, controlSearchText(a, &buffer));
+    const memory = readMemorySnapshot();
+    try w.print(",\"memory\":{{\"working_set_kb\":{d},\"private_kb\":{d},\"module_count\":{d},\"media_foundation_loaded\":{}}}", .{
+        memory.working_set_bytes / 1024,
+        memory.private_bytes / 1024,
+        memory.module_count,
+        mf_lazy.isStarted(),
+    });
     try w.writeAll("}}\n");
 }
 
@@ -12280,14 +12450,24 @@ fn drawCanvas(hwnd: win.HWND, a: *App) void {
     else
         "";
     const in_group = std.mem.endsWith(u8, chat_jid, "@g.us");
-    // Evict bitmaps left over from the previous frame for messages that
-    // scrolled off screen: between frames no handle is selected into a DC,
-    // and scrolling back re-decodes from the downloaded file on disk. This
-    // keeps bitmap memory bounded to roughly one viewport of images.
-    for (a.messages[0..a.message_count]) |*message| {
-        if (message.bitmap != null and message.bubble_hit.right <= message.bubble_hit.left) {
-            _ = win.DeleteObject(message.bitmap.?);
-            message.bitmap = null;
+    // Cap total message-image bitmap memory: once over budget, free the
+    // least-recently-shown ones first (typically messages that scrolled
+    // off screen a while ago). No handle is selected into a DC between
+    // frames, so freeing here is safe; scrolling back re-decodes from the
+    // downloaded file on disk.
+    if (a.message_bitmap_lru.total_bytes > message_bitmap_budget_bytes) {
+        var victims: [max_messages]usize = undefined;
+        const evicted = a.message_bitmap_lru.evict(message_bitmap_budget_bytes, &victims);
+        for (victims[0..evicted]) |key| {
+            for (a.messages[0..a.message_count]) |*message| {
+                if (@intFromPtr(message) == key) {
+                    if (message.bitmap) |bitmap| {
+                        _ = win.DeleteObject(bitmap);
+                        message.bitmap = null;
+                    }
+                    break;
+                }
+            }
         }
     }
     var total_height: i32 = px(a, 18);
@@ -13288,6 +13468,14 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
                 checkMarkRead(a);
                 checkAvatarDownload(a);
                 checkArchive(a);
+                tickMediaFoundationIdle(a);
+                if (!a.startup_memory_logged) {
+                    a.startup_ticks += 1;
+                    if (a.startup_ticks >= 30) {
+                        logStartupMemorySnapshot(a);
+                        a.startup_memory_logged = true;
+                    }
+                }
                 // Reads wait for media slots instead of racing them for the
                 // store lock: a read that loses the lock fails, so it would
                 // never mark the chat read.
@@ -14360,10 +14548,10 @@ pub fn main(init: std.process.Init) !void {
     }
     _ = win.CoInitializeEx(null, win.COINIT_APARTMENTTHREADED);
     defer win.CoUninitialize();
-    const media_foundation_started = win.MFStartup(win.MF_VERSION, win.MFSTARTUP_FULL) >= 0;
-    defer {
-        if (media_foundation_started) _ = win.MFShutdown();
-    }
+    // Media Foundation (mfplat/mfreadwrite/mfplay, plus the codecs and
+    // Windows.Media it drags in) starts lazily on first GIF/video use; see
+    // mf_lazy.zig. Not started here on purpose.
+    defer mf_lazy.unloadIfStarted();
     _ = win.CoCreateInstance(
         &win.CLSID_WICImagingFactory,
         null,

@@ -130,6 +130,28 @@ fn workerRun(self: *Session, exe: []const u8, jid: []const u8, destination: []co
     defer self.allocator.free(wide_url);
     const wide_path = try std.unicode.utf8ToUtf16LeAllocZ(self.allocator, destination);
     defer self.allocator.free(wide_path);
-    if (win.URLDownloadToFileW(null, wide_url.ptr, wide_path.ptr, 0, null) < 0) return error.DownloadFailed;
+    const download = urlDownloadToFileW() orelse return error.DownloadFailed;
+    if (download(null, wide_url.ptr, wide_path.ptr, 0, null) < 0) return error.DownloadFailed;
     self.state_value.store(@intFromEnum(State.ready), .release);
+}
+
+// urlmon.dll is not linked at build time (see build.zig): it is only ever
+// needed here, on a background thread, well after startup, and a static
+// import would put it (and iertutil.dll, which it pulls in) in the exe's
+// import table so both load unconditionally at process start.
+fn lit(comptime text: []const u8) [*:0]const u16 {
+    return std.unicode.utf8ToUtf16LeStringLiteral(text);
+}
+
+var urlmon: win.HMODULE = null;
+var url_download_to_file_w: ?*const @TypeOf(win.URLDownloadToFileW) = null;
+
+fn urlDownloadToFileW() ?*const @TypeOf(win.URLDownloadToFileW) {
+    if (url_download_to_file_w) |f| return f;
+    const module = urlmon orelse win.LoadLibraryW(lit("urlmon.dll")) orelse return null;
+    urlmon = module;
+    const raw = win.GetProcAddress(module, "URLDownloadToFileW") orelse return null;
+    const f: *const @TypeOf(win.URLDownloadToFileW) = @ptrCast(@alignCast(raw));
+    url_download_to_file_w = f;
+    return f;
 }
