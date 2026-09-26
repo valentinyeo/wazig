@@ -698,6 +698,11 @@ const App = struct {
     text_dragging: bool = false,
     drag_moved: bool = false,
     drag_origin: win.POINT = .{ .x = 0, .y = 0 },
+    // Tracks every canvas left-click from press to release so a click that
+    // turns into a drag (text selection or otherwise) never opens the image
+    // viewer: only a click that stays put counts as "click", not "drag".
+    click_origin: win.POINT = .{ .x = 0, .y = 0 },
+    click_moved: bool = false,
     openrouter_session: ?*dictation.TextSession = null,
     openrouter_active_id: Utf8Text(191) = .{},
     openrouter_key: []const u8 = "",
@@ -728,6 +733,10 @@ const App = struct {
     viewer_bitmap: ?win.HBITMAP = null,
     viewer_width: i32 = 0,
     viewer_height: i32 = 0,
+    // GetTickCount64() at open, so a click landing within the system
+    // double-click window right after opening (the second half of the
+    // double-click gesture that opened it) doesn't instantly close it.
+    viewer_opened_ms: u64 = 0,
     unfurl_entries: [max_unfurl_entries]UnfurlEntry = [_]UnfurlEntry{.{}} ** max_unfurl_entries,
     unfurl_entry_count: usize = 0,
     unfurl_evict_slot: usize = 0,
@@ -6157,6 +6166,7 @@ fn closeImageViewer(a: *App) void {
     }
     a.viewer_width = 0;
     a.viewer_height = 0;
+    if (a.hwnd) |main_hwnd| _ = win.SetFocus(main_hwnd);
 }
 
 // Fit the source into the work area: shrink to fit, but never grow a small
@@ -6290,6 +6300,7 @@ fn openImageViewer(a: *App, message: *const Message) void {
     a.viewer_bitmap = bitmap;
     a.viewer_width = bitmap_width;
     a.viewer_height = bitmap_height;
+    a.viewer_opened_ms = win.GetTickCount64();
     _ = win.ShowWindow(hwnd, win.SW_SHOW);
     _ = win.SetForegroundWindow(hwnd);
     _ = win.SetFocus(hwnd);
@@ -6323,18 +6334,22 @@ fn imageViewerProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam
             return 0;
         },
         // Close on the button release, not the press: closing on the press
-        // would hand the release to the chat underneath as a click.
-        win.WM_LBUTTONDOWN, win.WM_LBUTTONDBLCLK => {
-            _ = win.SetCapture(hwnd);
-            return 0;
-        },
+        // would hand the release to the chat underneath as a click. The
+        // viewer fully covers the monitor while shown, so both halves of the
+        // click land on it without needing to grab mouse capture.
+        win.WM_LBUTTONDOWN, win.WM_LBUTTONDBLCLK => return 0,
         win.WM_LBUTTONUP => {
-            _ = win.ReleaseCapture();
+            // The click that opened this viewer can have a second click
+            // riding along behind it (a real double-click, or Windows
+            // coalescing a fast double-click into one open). Ignore any
+            // click inside the system double-click window after opening so
+            // it doesn't close the viewer the instant it appears.
+            if (win.GetTickCount64() - a.viewer_opened_ms < win.GetDoubleClickTime()) return 0;
             closeImageViewer(a);
             return 0;
         },
         win.WM_KEYDOWN => {
-            if (wparam == 27) { // escape
+            if (wparam == 27 or wparam == win.VK_SPACE or wparam == win.VK_RETURN) { // esc, space, enter
                 closeImageViewer(a);
                 return 0;
             }
@@ -8282,8 +8297,10 @@ fn handleCanvasClick(a: *App, hwnd: win.HWND, x: i32, y: i32) void {
             } else if (std.ascii.eqlIgnoreCase(item.media_type.slice(), "video")) {
                 playVideoInline(a, item);
             } else if (isImage(item)) {
-                // Images open in the in-app viewer on double-click; a single
-                // click only selects the message.
+                // A click that stayed put opens the in-app viewer; a click
+                // that turned into a drag (text selection, or dragging off
+                // the image) leaves it at just selecting the message.
+                if (!a.click_moved) openImageViewer(a, item);
             } else if (!isGif(item)) {
                 // GIFs already animate in place; popping them out to
                 // an external player was unwanted.
@@ -8337,6 +8354,11 @@ fn handleCanvasDoubleClick(a: *App, x: i32, y: i32) bool {
             downloadMedia(a, index, false);
             return true;
         }
+        // A downloaded still image already opened on the first half of this
+        // double-click (single-click-to-open handles it in handleCanvasClick);
+        // opening it again here would relaunch the external viewer a second
+        // time for a WIC-undecodable sticker. GIFs only ever open here.
+        if (isImage(item)) return true;
         openImageViewer(a, item);
         return true;
     }
@@ -11187,6 +11209,11 @@ fn canvasProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win
                     }
                 }
             }
+            // Tracked for every press so the matching release can tell a
+            // plain click (opens an image) from a drag (selects text, or
+            // just moves off the target) that happens to land on media too.
+            a.click_origin = .{ .x = x, .y = y };
+            a.click_moved = false;
             for (a.messages[0..a.message_count], 0..) |*item, index| {
                 const bubble = item.bubble_hit;
                 if (x >= bubble.left and x <= bubble.right and y >= bubble.top and y <= bubble.bottom) {
@@ -11208,7 +11235,13 @@ fn canvasProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win
         win.WM_LBUTTONDBLCLK => {
             const x: i32 = @as(i16, @bitCast(loword(@as(usize, @bitCast(lparam)))));
             const y: i32 = @as(i16, @bitCast(hiword(@as(usize, @bitCast(lparam)))));
-            if (handleCanvasDoubleClick(a, x, y)) return 0;
+            if (handleCanvasDoubleClick(a, x, y)) {
+                // The trailing release of this double-click still reaches
+                // WM_LBUTTONUP; mark it as "moved" so handleCanvasClick's
+                // click-to-open doesn't fire a second time for it.
+                a.click_moved = true;
+                return 0;
+            }
             // CS_DBLCLKS turns a fast second press into a double-click;
             // anywhere but an image it is still a press (scrollbar drag,
             // text selection).
@@ -11219,6 +11252,13 @@ fn canvasProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win
                 const y: i32 = @as(i16, @bitCast(hiword(@as(usize, @bitCast(lparam)))));
                 if (a.canvas != null) dragStrip(a, canvasStripRect(a), canvasScrollInfo(a), y, setCanvasScroll);
                 return 0;
+            }
+            if (!a.click_moved) {
+                const x: i32 = @as(i16, @bitCast(loword(@as(usize, @bitCast(lparam)))));
+                const y: i32 = @as(i16, @bitCast(hiword(@as(usize, @bitCast(lparam)))));
+                const cdx = x - a.click_origin.x;
+                const cdy = y - a.click_origin.y;
+                if (cdx * cdx + cdy * cdy > 16) a.click_moved = true;
             }
             if (!a.text_dragging or a.sel_message == null) return win.DefWindowProcW(hwnd, message, wparam, lparam);
             const x: i32 = @as(i16, @bitCast(loword(@as(usize, @bitCast(lparam)))));
