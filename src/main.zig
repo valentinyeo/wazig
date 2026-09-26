@@ -1600,7 +1600,10 @@ fn wacliRunJob(a: *App, job: WacliJob) void {
         .stdout_limit = .limited(8 * 1024 * 1024),
         .stderr_limit = .limited(256 * 1024),
         .create_no_window = true,
-    }) catch {
+    }) catch |err| {
+        // .reaction reuses result.extra to carry the emoji through to
+        // applyReaction; only .messages may repurpose it for error text.
+        if (job.kind == .messages) result.extra.set(@errorName(err));
         wacliPost(a, result);
         return;
     };
@@ -1617,6 +1620,21 @@ fn wacliRunJob(a: *App, job: WacliJob) void {
             result.ok = false;
             break :blk &.{};
         };
+    } else if (job.kind == .messages) {
+        // Bounded error text for the launch log. .reaction reuses this same
+        // field for its emoji, so only .messages may overwrite it here.
+        const stderr_trim = std.mem.trim(u8, run.stderr, " \t\r\n");
+        const stderr_line = stderr_trim[0..(std.mem.indexOfScalar(u8, stderr_trim, '\n') orelse stderr_trim.len)];
+        if (stderr_line.len > 0) {
+            result.extra.set(stderr_line);
+        } else {
+            var code_buf: [32]u8 = undefined;
+            const text = switch (run.term) {
+                .exited => |code| std.fmt.bufPrint(&code_buf, "exit code {d}", .{code}) catch "wacli failed",
+                else => @tagName(run.term),
+            };
+            result.extra.set(text);
+        }
     }
     wacliPost(a, result);
 }
@@ -3400,8 +3418,10 @@ fn refreshSlackWorkspace(a: *App) void {
 fn refreshSlackHistory(a: *App) void {
     if (!selectedChatIsSlack(a)) return;
     const chat = &a.chats[a.selected_chat];
-    // Only the bridge poll calls this. The first fetch after a chat change
-    // bumps the generation so a stale wacli read cannot paint over it; later
+    // The bridge poll and refreshMessages (chat selection, manual refresh,
+    // send/archive completion) both call this. refreshMessages always zeroes
+    // slack_history_hash first, so the first fetch after any of those bumps
+    // the generation, the same guard a stale wacli read needs; later bridge
     // polls reuse it so replies queued by the previous apply still land.
     if (a.slack_history_hash == 0) a.messages_gen += 1;
     var job = WacliJob{ .kind = .slack_history, .gen = a.messages_gen };
@@ -4097,20 +4117,23 @@ fn applySlackEvent(a: *App, event: *slack_win.Event) void {
             chat.unread_count += 1;
         }
     }
-    // WAZI-62: a new message must pull an archived chat back into the list.
-    // The visible list filters archived chats out, so a chat that is absent
-    // here but present in the workspace cache is archived.
+    // WAZI-62 pulled an archived WhatsApp chat back into the list on a new
+    // message via queueUnarchiveChat, a WhatsApp-store wacli call. Chat.archived
+    // is only ever set from a WhatsApp wacli read, so it is always false for a
+    // Slack channel here; "not visible" just means the sidebar is showing
+    // another messenger or a.slack_chats has not picked the channel up yet,
+    // neither of which wacli can fix. Rebuild the Slack list from its own
+    // cache (no wacli call) when that view is on screen; otherwise leave it
+    // for the next view switch or workspace poll to pick up.
     if (!is_open) {
         var visible = false;
-        var archived = false;
         for (a.chats[0..a.chat_count]) |*chat| {
             if (std.mem.eql(u8, chat.jid.slice(), channel)) {
                 visible = true;
-                archived = chat.archived;
                 break;
             }
         }
-        if (slack.resurfacesChat(from_me, visible, archived)) queueUnarchiveChat(a, channel);
+        if (!visible and !from_me and activeChatView(a) == .slack) refreshVisibleChats(a);
     }
     if (is_open) {
         var item = slack.HistoryItem{
@@ -5326,6 +5349,10 @@ fn downloadMedia(a: *App, message_index: usize, automatic: bool) void {
     // a retry must not re-download.
     if (message.local_path.len > 0) return;
     const chat = &a.chats[a.selected_chat];
+    // wacli media download is a WhatsApp-store call. Slack attachments fetch
+    // through requestSlackDownload and Telegram ones through the TDLib
+    // client; neither may reach here with their chat id as a WhatsApp jid.
+    if (chat.provider != .whatsapp) return;
     // Already downloading in another slot: nothing to queue.
     if (mediaDownloading(a, message.id.slice())) return;
     if (freeMediaSlot(a) == null) {
@@ -5528,12 +5555,15 @@ fn avatarWanted(entry: *const AvatarEntry) bool {
 }
 
 fn nextAvatarTarget(a: *App) ?AvatarTarget {
-    if (a.selected_chat < a.chat_count) {
+    // avatarForChat's fetch is a wacli WhatsApp-store call; Slack and
+    // Telegram chat ids must never be looked up (or created) here.
+    if (a.selected_chat < a.chat_count and a.chats[a.selected_chat].provider == .whatsapp) {
         if (avatarForChat(a, a.chats[a.selected_chat].jid.slice())) |entry| {
             if (avatarWanted(entry)) return .{ .chat = avatarIndex(a, entry) };
         }
     }
     for (a.chats[0..a.chat_count]) |*chat| {
+        if (chat.provider != .whatsapp) continue;
         const entry = avatarForChat(a, chat.jid.slice()) orelse continue;
         if (avatarWanted(entry)) return .{ .chat = avatarIndex(a, entry) };
     }
@@ -7138,6 +7168,7 @@ fn refreshMessages(a: *App) void {
     const chat = &a.chats[a.selected_chat];
     a.slack_history_hash = 0;
     if (chat.provider == .telegram) return refreshTelegramMessages(a);
+    if (chat.provider == .slack) return refreshSlackHistory(a);
     const chat_changed = !std.mem.eql(u8, a.displayed_jid.slice(), chat.jid.slice());
     if (chat_changed) stopAudio(a);
     // Instant first paint: render the chat's last known response from the
@@ -9425,6 +9456,12 @@ fn archiveSelectedChat(a: *App) void {
         setStatus(a, "Archiving is not available for Telegram chats yet");
         return;
     }
+    if (selectedChatIsSlack(a)) {
+        // Archive/unarchive is a wacli WhatsApp-store call; a Slack channel
+        // id must never reach it as a WhatsApp jid.
+        setStatus(a, "Archiving is not available for Slack channels yet");
+        return;
+    }
     if (a.pending_archive_count >= a.pending_archives.len) {
         setStatus(a, "Archive queue is full");
         return;
@@ -11181,7 +11218,10 @@ fn drawChat(a: *App, item: *win.DRAWITEMSTRUCT) void {
     // own box stays 42 to keep the baked circle and initial centered.
     const avatar_left = item.rcItem.left + px(a, 12);
     const avatar_top = item.rcItem.top + px(a, 10);
-    const avatar_entry = avatarForChat(a, chat.jid.slice());
+    // avatarForChat fetches through wacli, a WhatsApp-only call: looking one
+    // up for a Slack/Telegram row would register its channel/chat id as a
+    // pending WhatsApp avatar fetch. Those chats fall back to initials.
+    const avatar_entry = if (chat.provider == .whatsapp) avatarForChat(a, chat.jid.slice()) else null;
     if (avatar_entry != null and avatar_entry.?.bitmap != null) {
         drawAvatarBitmap(item.hDC, avatar_entry.?.bitmap.?, avatar_left, avatar_top, 42);
     } else {
@@ -11442,7 +11482,12 @@ fn drawSenderAvatar(hdc: win.HDC, a: *App, x: i32, top: i32, message: *const Mes
     // A real profile picture, reused from a matching contact or fetched for
     // this participant, replaces the initials circle at the same DPI-scaled
     // size; no bitmap yet (or no jid) falls through to initials below.
-    if (message.sender_jid.len > 0) {
+    // avatarEntryForSender fetches through wacli, a WhatsApp-only call: the
+    // displayed messages all belong to the selected chat, so only look one
+    // up when that chat is WhatsApp (Slack/Telegram senders get initials).
+    if (message.sender_jid.len > 0 and a.selected_chat < a.chat_count and
+        a.chats[a.selected_chat].provider == .whatsapp)
+    {
         if (avatarEntryForSender(a, message.sender_jid.slice())) |entry| {
             if (entry.bitmap) |bitmap| {
                 drawAvatarBitmap(hdc, bitmap, x, top, px(a, 30));
@@ -12294,6 +12339,17 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
                 .messages => {
                     if (!result.ok) {
                         setStatus(a, "Unable to read messages from wacli");
+                        // Chat kind + error only, never the message payload.
+                        var kind: []const u8 = "unknown";
+                        for (a.chats[0..a.chat_count]) |*chat| {
+                            if (std.mem.eql(u8, chat.jid.slice(), result.jid.slice())) {
+                                kind = @tagName(chat.provider);
+                                break;
+                            }
+                        }
+                        var fail_buffer: [128]u8 = undefined;
+                        const fail_line = std.fmt.bufPrint(&fail_buffer, "messages-read: fail, chat={s} err={s}", .{ kind, result.extra.slice() }) catch "messages-read: fail";
+                        appendLaunchLog(a, fail_line);
                     } else if (a.selected_chat < a.chat_count and
                         std.mem.eql(u8, a.chats[a.selected_chat].jid.slice(), result.jid.slice()) and
                         result.gen == a.messages_gen)
