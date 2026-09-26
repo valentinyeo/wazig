@@ -3344,9 +3344,16 @@ fn buildSlackMessage(a: *App, item: slack.HistoryItem) Message {
     message.from_me = from_me;
     const name = if (from_me) "You" else (slackUserName(a, item.user) orelse (if (item.user.len > 0) item.user else "Slack"));
     message.sender.set(a.allocator, name);
-    const text = if (item.text.len > 0) item.text else item.file_name;
+    // A shared/forwarded Slack message renders as a quote block; the
+    // message's own text, if any, stays as the body.
+    if (item.share_text.len > 0 or item.share_sender.len > 0) {
+        message.quote.set(a.allocator, item.share_text);
+        message.quote_sender.set(a.allocator, item.share_sender);
+    }
+    var body_buffer: [900]u8 = undefined;
+    const text = slack.historyItemBody(item, &body_buffer);
     const is_thread_reply = item.thread_ts.len > 0 and !std.mem.eql(u8, item.thread_ts, item.ts);
-    if (is_thread_reply and text.len + 4 <= slack.max_text) {
+    if (is_thread_reply and text.len > 0 and text.len + 4 <= slack.max_text) {
         var threaded: [slack.max_text + 4]u8 = undefined;
         const rendered = std.fmt.bufPrint(&threaded, "\u{21a9} {s}", .{text}) catch text;
         message.text.set(a.allocator, rendered);
@@ -10921,7 +10928,14 @@ fn quoteBlockTint(base: win.COLORREF, toward: u8) win.COLORREF {
 fn measureMessage(hdc: win.HDC, a: *App, message: *const Message, width: i32, show_sender: bool) i32 {
     _ = win.SelectObject(hdc, @ptrCast(a.font.?));
     const header_height = messageHeaderHeight(hdc, a, show_sender);
-    var height = quoteBlockHeight(hdc, a, message, width) + wrapMixedSink(hdc, a, if (message.text.len > 0) message.text.ptr() else lit(" "), if (message.text.len > 0) @intCast(message.text.len) else 1, width - px(a, 24), false, 0, 0, message) + header_height;
+    // A quote block with no body text (a shared message with nothing added)
+    // gets no reserved body line; every other case keeps its placeholder
+    // line, matching the draw pass below.
+    const skip_body_line = message.text.len == 0 and message.quote.len > 0;
+    var height = quoteBlockHeight(hdc, a, message, width) + header_height;
+    if (!skip_body_line) {
+        height += wrapMixedSink(hdc, a, if (message.text.len > 0) message.text.ptr() else lit(" "), if (message.text.len > 0) @intCast(message.text.len) else 1, width - px(a, 24), false, 0, 0, message);
+    }
     // WAZI-68: a video link unfurls into a fixed-size card below the text.
     // Links are collected during the measure pass above, so classify here;
     // once classified the result is sticky for the message's lifetime.
@@ -11467,8 +11481,11 @@ fn drawCanvas(hwnd: win.HWND, a: *App) void {
         }
         _ = win.SelectObject(hdc, @ptrCast(a.font.?));
         _ = win.SetTextColor(hdc, color_text);
+        // Matches measureMessage's skip_body_line: a quote block with an
+        // empty body draws no placeholder line beneath it.
+        const skip_body_line = message.text.len == 0 and message.quote.len > 0;
         const text_len: c_int = if (message.text.len > 0) @intCast(message.text.len) else 1;
-        const text_height = wrapMixedSink(hdc, a, if (message.text.len > 0) message.text.ptr() else lit(" "), text_len, right - left - px(a, 24), true, left + px(a, 12), text_top, message);
+        const text_height: i32 = if (skip_body_line) 0 else wrapMixedSink(hdc, a, if (message.text.len > 0) message.text.ptr() else lit(" "), text_len, right - left - px(a, 24), true, left + px(a, 12), text_top, message);
         // WAZI-68: the unfurled video card sits below the text; its height
         // was reserved in measureMessage, so no other block moves.
         if (message.unfurl_provider != .none) {
