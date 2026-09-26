@@ -1,4 +1,4 @@
-# Tag vX.Y.Z on main -> build Messages.exe, package zip + per-user MSI on GitHub
+# Tag vX.Y.Z on main -> build Messages.exe and wazigctl.exe, package zip + per-user MSI on GitHub
 # runners, smoke-test the MSI on a real Windows runner, publish a GitHub Release.
 name: release
 on:
@@ -100,7 +100,7 @@ jobs:
       - name: Package zip
         run: |
           cd zig-out/bin
-          zip -r "${GITHUB_WORKSPACE}/Messages-${GITHUB_REF_NAME}.zip" Messages.exe *.ttf *LICENSE*
+          zip -r "${GITHUB_WORKSPACE}/Messages-${GITHUB_REF_NAME}.zip" Messages.exe wazigctl.exe *.ttf *LICENSE*
       - name: Package MSI
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq wixl wixl-data
@@ -153,6 +153,14 @@ jobs:
           if (-not (Test-Path $exe)) { throw "missing $exe" }
           if (-not (Test-Path "$env:LOCALAPPDATA\Programs\Messages\IBMPlexSans-Regular.ttf")) { throw "missing bundled font" }
           if (-not (Test-Path $lnk)) { throw "missing Start menu shortcut $lnk" }
+          # wazigctl is a console exe: `&` waits and sets $LASTEXITCODE.
+          $ctl = "$env:LOCALAPPDATA\Programs\Messages\wazigctl.exe"
+          if (-not (Test-Path $ctl)) { throw "missing $ctl" }
+          & $ctl --help | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "wazigctl --help failed: $LASTEXITCODE" }
+          # The app is not running here, so status must say so with exit 3.
+          & $ctl status 2>$null | Out-Null
+          if ($LASTEXITCODE -ne 3) { throw "wazigctl status without the app returned $LASTEXITCODE, expected 3" }
       - name: Headless Telegram smoke
         # Telegram is off for now (not in use); flip back to re-enable.
         if: false
@@ -175,6 +183,7 @@ jobs:
           $code = $LASTEXITCODE
           if ($code -ne 0) { throw "msiexec uninstall failed: $code" }
           if (Test-Path "$env:LOCALAPPDATA\Programs\Messages\Messages.exe") { throw "exe left behind after uninstall" }
+          if (Test-Path "$env:LOCALAPPDATA\Programs\Messages\wazigctl.exe") { throw "wazigctl left behind after uninstall" }
           if (Test-Path "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Messages.lnk") { throw "shortcut left behind after uninstall" }
 
   release:
