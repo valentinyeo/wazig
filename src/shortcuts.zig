@@ -22,6 +22,7 @@ pub const groups = [_]Group{
         .{ .key = "Ctrl+Page Up / Ctrl+Page Down", .desc = "Move the selection by a page" },
         .{ .key = "Mouse wheel over the list", .desc = "Scroll the chat list" },
         .{ .key = "Ctrl+F or /", .desc = "Focus search" },
+        .{ .key = "Esc", .desc = "Clear the search and show all chats" },
         .{ .key = "U", .desc = "Toggle unread chats" },
         .{ .key = "Ctrl+E or E", .desc = "Archive or unarchive the selected chat" },
         .{ .key = "R", .desc = "Refresh" },

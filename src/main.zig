@@ -3217,6 +3217,15 @@ fn updateSearchCue(a: *App, view: transport.Provider) void {
     _ = win.SendMessageW(search, win.EM_SETCUEBANNER, 1, @bitCast(@intFromPtr(&wide)));
 }
 
+/// Empties the sidebar search so the full chat list comes back (the
+/// EN_CHANGE debounce refilters). Returns false when there was nothing to clear.
+fn clearSearch(a: *App) bool {
+    const search = a.search orelse return false;
+    if (win.GetWindowTextLengthW(search) == 0) return false;
+    _ = win.SetWindowTextW(search, lit(""));
+    return true;
+}
+
 /// Rebuild the sidebar for the active view. Slack and Telegram lists come
 /// from local caches, so they rebuild at once without a wacli read.
 fn refreshVisibleChats(a: *App) void {
@@ -13274,6 +13283,7 @@ fn handleKeyboard(a: *App, message: *const win.MSG) bool {
                     setStatus(a, "Pasted image discarded");
                     return true;
                 }
+                _ = clearSearch(a);
                 focusCompose(a);
                 return true;
             }
@@ -13287,6 +13297,7 @@ fn handleKeyboard(a: *App, message: *const win.MSG) bool {
                 return true;
             }
             if (key == win.VK_ESCAPE) {
+                _ = clearSearch(a);
                 focusCompose(a);
                 return true;
             }
