@@ -25,6 +25,7 @@ const control_api = @import("control.zig");
 const control_pipe = @import("control_pipe.zig");
 const mf_lazy = @import("mf_lazy.zig");
 const shell_lazy = @import("shell_lazy.zig");
+const bitmap_lru = @import("bitmap_lru.zig");
 
 const webp = @cImport({
     @cInclude("src/webp/decode.h");
@@ -802,6 +803,10 @@ const App = struct {
     // mf_player: once past mf_idle_unload_ticks, Media Foundation is
     // released. Reset to 0 whenever either is in use.
     mf_idle_ticks: u32 = 0,
+    // Byte accounting for message.bitmap across the whole message list, so
+    // it can be capped instead of just wiped on every off-screen message
+    // each paint (see the pre-paint eviction pass).
+    message_bitmap_lru: bitmap_lru.Lru(max_messages) = .{},
     // WAZI-68 fullscreen state for the video player window.
     player_saved_placement: win.WINDOWPLACEMENT = undefined,
     player_fullscreen: bool = false,
@@ -4726,7 +4731,11 @@ fn retryPendingDownload(a: *App) void {
 
 fn clearMessages(a: *App) void {
     for (a.messages[0..a.message_count]) |*message| {
-        if (message.bitmap) |bitmap| _ = win.DeleteObject(bitmap);
+        if (message.bitmap) |bitmap| {
+            _ = win.DeleteObject(bitmap);
+            message.bitmap = null;
+        }
+        a.message_bitmap_lru.remove(@intFromPtr(message));
         if (message.gif_reader != null) _ = message.gif_reader.*.lpVtbl.*.Release.?(message.gif_reader);
     }
     a.message_count = 0;
@@ -5017,6 +5026,7 @@ fn decodeGifVideoFrame(message: *Message) bool {
         }
     }
     message.bitmap = bitmap;
+    noteMessageBitmap(message);
     return true;
 }
 
@@ -5099,10 +5109,17 @@ fn ensureVideoBitmap(message: *Message) void {
     message.bitmap = bitmap;
     message.bitmap_width = details.bmWidth;
     message.bitmap_height = details.bmHeight;
+    noteMessageBitmap(message);
 }
 
 fn ensureBitmap(a: *App, message: *Message) void {
-    if (message.bitmap != null or message.local_path.len == 0) return;
+    if (message.bitmap != null) {
+        // Already decoded: refresh recency so a long-visible image is not
+        // mistaken for stale by the LRU cap below.
+        noteMessageBitmap(message);
+        return;
+    }
+    if (message.local_path.len == 0) return;
     if (isVideoGif(message)) {
         ensureGifVideoBitmap(message);
         return;
@@ -5312,6 +5329,7 @@ fn fillDibFromSource(a: *App, message: *Message, source: *win.IWICBitmapSource, 
     message.bitmap = bitmap;
     message.bitmap_width = @intCast(target_width);
     message.bitmap_height = @intCast(target_height);
+    noteMessageBitmap(message);
 }
 
 // Current wall-clock unix seconds via FILETIME: std.time lost its
@@ -7158,6 +7176,35 @@ fn applyUnfurlResult(a: *App, result: *UnfurlResult) void {
     }
     // No matching entry: the message scrolled away and the slot was reused.
     // Nothing to repaint; the result (and its thumbnail bytes) just expires.
+}
+
+// Total budget for message.bitmap pixel data across the whole message
+// list. Once over budget, the least-recently-shown bitmaps are freed
+// first; scrolling back to one re-decodes it from the file on disk.
+const message_bitmap_budget_bytes: usize = 24 * 1024 * 1024;
+
+// Registers message.bitmap's current size/recency with the app (or drops
+// it from accounting when the caller already freed the bitmap itself).
+// Called through app_ptr because the three bitmap-creation functions this
+// feeds (decodeGifVideoFrame, ensureVideoBitmap, fillDibFromSource) work
+// on a single *Message and do not otherwise need the whole *App.
+fn noteMessageBitmap(message: *Message) void {
+    const a = app_ptr orelse return;
+    if (message.bitmap != null) {
+        const bytes: usize = @as(usize, @intCast(message.bitmap_width)) * @as(usize, @intCast(message.bitmap_height)) * 4;
+        a.message_bitmap_lru.touch(@intFromPtr(message), bytes);
+    } else {
+        a.message_bitmap_lru.remove(@intFromPtr(message));
+    }
+}
+
+// Frees message.bitmap and drops it from the LRU's accounting.
+fn dropMessageBitmap(message: *Message) void {
+    if (message.bitmap) |bitmap| {
+        _ = win.DeleteObject(bitmap);
+        message.bitmap = null;
+    }
+    if (app_ptr) |a| a.message_bitmap_lru.remove(@intFromPtr(message));
 }
 
 const mf_idle_unload_ticks: u32 = 60; // ~60s at the 1s timer_refresh cadence
@@ -12337,14 +12384,24 @@ fn drawCanvas(hwnd: win.HWND, a: *App) void {
     else
         "";
     const in_group = std.mem.endsWith(u8, chat_jid, "@g.us");
-    // Evict bitmaps left over from the previous frame for messages that
-    // scrolled off screen: between frames no handle is selected into a DC,
-    // and scrolling back re-decodes from the downloaded file on disk. This
-    // keeps bitmap memory bounded to roughly one viewport of images.
-    for (a.messages[0..a.message_count]) |*message| {
-        if (message.bitmap != null and message.bubble_hit.right <= message.bubble_hit.left) {
-            _ = win.DeleteObject(message.bitmap.?);
-            message.bitmap = null;
+    // Cap total message-image bitmap memory: once over budget, free the
+    // least-recently-shown ones first (typically messages that scrolled
+    // off screen a while ago). No handle is selected into a DC between
+    // frames, so freeing here is safe; scrolling back re-decodes from the
+    // downloaded file on disk.
+    if (a.message_bitmap_lru.total_bytes > message_bitmap_budget_bytes) {
+        var victims: [max_messages]usize = undefined;
+        const evicted = a.message_bitmap_lru.evict(message_bitmap_budget_bytes, &victims);
+        for (victims[0..evicted]) |key| {
+            for (a.messages[0..a.message_count]) |*message| {
+                if (@intFromPtr(message) == key) {
+                    if (message.bitmap) |bitmap| {
+                        _ = win.DeleteObject(bitmap);
+                        message.bitmap = null;
+                    }
+                    break;
+                }
+            }
         }
     }
     var total_height: i32 = px(a, 18);
