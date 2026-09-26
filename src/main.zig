@@ -643,6 +643,9 @@ const App = struct {
     dictation_language: dictation.Language = .automatic,
     last_dictation_state: dictation.State = .idle,
     sync_child: ?std.process.Child = null,
+    // WAZI-83: set when a timed-out read proved the sync child wedged on the
+    // store lock; keeps live sync off until a chats read succeeds again.
+    sync_hold: bool = false,
     sync_job: ?win.HANDLE = null,
     audio_player: ?*audio.Player = null,
     audio_state: enum { empty, ready, playing, paused } = .empty,
@@ -1461,9 +1464,118 @@ fn wacliWorkerMain(a: *App, slack_lane: bool) void {
     }
 }
 
-// ponytail: no hard timeout around the worker's wacli call, so a hung wacli
-// read stalls the queue and blocks shutdown; upgrade path is spawn plus a
-// WaitForSingleObject deadline with TerminateProcess.
+// WAZI-83 (upgrades the former ponytail corner here): read-only queries used
+// to run with no timeout at all, so once the live-sync child held the store
+// lock nearly continuously (post-re-link media backlog) startup reads blocked
+// forever and the thread list stayed empty. Read children are now bounded:
+// output is drained while waiting (a full pipe would wedge the child exactly
+// like the incident), and a child still running at the deadline is killed so
+// the existing retry cycle takes over. Write
+// jobs keep the unbounded run: they pause live sync first and carry their own
+// --lock-wait, so they can never starve behind sync.
+const wacli_read_timeout_ms: u64 = 30_000;
+const wacli_read_stdout_limit: usize = 8 * 1024 * 1024;
+
+fn wacliJobIsReadOnly(kind: WacliJobKind) bool {
+    return switch (kind) {
+        .chats, .groups, .messages, .cache_tag => true,
+        else => false,
+    };
+}
+
+/// Reads whatever is ready on a child's output pipe without blocking. Appends
+/// to `sink` when non-null, dropping chunks once `limit` is reached so the
+/// pipe still drains (a blocked child would masquerade as a timeout). Returns
+/// true when at least one chunk was consumed. Bounded per call so a child
+/// writing continuously cannot starve the caller's deadline checks; the
+/// remainder drains on the next tick.
+const drain_pipe_max_chunks = 64;
+
+fn drainChildPipe(allocator: std.mem.Allocator, file: ?std.Io.File, sink: ?*std.ArrayListUnmanaged(u8), limit: usize, truncated: *bool) bool {
+    const stream = file orelse return false;
+    var consumed = false;
+    var chunks: u32 = 0;
+    while (chunks < drain_pipe_max_chunks) : (chunks += 1) {
+        var available: win.DWORD = 0;
+        if (win.PeekNamedPipe(stream.handle, null, 0, null, &available, null) == 0) break;
+        if (available == 0) break;
+        var chunk: [16 * 1024]u8 = undefined;
+        var got: win.DWORD = 0;
+        if (win.ReadFile(stream.handle, &chunk, @min(available, chunk.len), &got, null) == 0 or got == 0) break;
+        if (sink) |list| {
+            if (list.items.len < limit) {
+                const room = limit - list.items.len;
+                if (got > room) truncated.* = true;
+                list.appendSlice(allocator, chunk[0..@min(got, room)]) catch {
+                    truncated.* = true;
+                    break;
+                };
+            } else truncated.* = true;
+        }
+        consumed = true;
+    }
+    return consumed;
+}
+
+fn wacliRunBoundedRead(a: *App, argv: [][]const u8, result: *WacliResult) void {
+    var child = std.process.spawn(a.io, .{
+        .argv = argv,
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .pipe,
+        .create_no_window = true,
+    }) catch {
+        wacliPost(a, result);
+        return;
+    };
+    defer _ = child.wait(a.io) catch {};
+    const deadline = win.GetTickCount64() + wacli_read_timeout_ms;
+    var output: std.ArrayListUnmanaged(u8) = .empty;
+    defer output.deinit(a.allocator);
+    var timed_out = false;
+    var truncated = false;
+    var exit_code: win.DWORD = 1;
+    while (true) {
+        var code: win.DWORD = 0;
+        var exited = false;
+        if (child.id) |handle| {
+            _ = win.WaitForSingleObject(handle, 50);
+            if (win.GetExitCodeProcess(handle, &code) != 0 and code != win.STILL_ACTIVE) {
+                exited = true;
+                exit_code = code;
+            }
+        }
+        _ = drainChildPipe(a.allocator, child.stdout, &output, wacli_read_stdout_limit, &truncated);
+        // Stderr is small but must also drain or the child wedges on a full
+        // pipe exactly like the incident being fixed here.
+        _ = drainChildPipe(a.allocator, child.stderr, null, 0, &truncated);
+        if (exited) break;
+        if (win.GetTickCount64() >= deadline) {
+            timed_out = true;
+            result.extra.set("timeout");
+            _ = child.kill(a.io);
+            // Drain to EOF so a killed child cannot hold a broken pipe.
+            while (drainChildPipe(a.allocator, child.stdout, &output, wacli_read_stdout_limit, &truncated)) {}
+            _ = drainChildPipe(a.allocator, child.stderr, null, 0, &truncated);
+            break;
+        }
+    }
+    if (timed_out) {
+        result.ok = false;
+        wacliPost(a, result);
+        return;
+    }
+    // A nonzero wacli exit (store error, bad arguments) or truncated capture
+    // must fail the read like a timeout does, so the retry cycle runs and
+    // cached data is never replaced with partial output.
+    result.ok = exit_code == 0 and !truncated;
+    result.data = a.allocator.dupe(u8, output.items) catch blk: {
+        result.ok = false;
+        break :blk &.{};
+    };
+    wacliPost(a, result);
+}
+
 fn wacliRunJob(a: *App, job: WacliJob) void {
     var argv: [max_wacli_args][]const u8 = undefined;
     var count: usize = 0;
@@ -1497,6 +1609,10 @@ fn wacliRunJob(a: *App, job: WacliJob) void {
             return;
         },
         else => {},
+    }
+    if (wacliJobIsReadOnly(job.kind)) {
+        wacliRunBoundedRead(a, argv[0..count], result);
+        return;
     }
     const run = std.process.run(a.allocator, a.io, .{
         .argv = argv[0..count],
@@ -7108,6 +7224,10 @@ fn syncStderrMain(a: *App, stderr: std.Io.File) void {
 }
 
 fn startSync(a: *App) void {
+    // WAZI-83: while a wedged sync child has been killed on suspicion, stay
+    // stopped until a chats read succeeds; checkSync must not respawn into
+    // the same lock-wedge ahead of the retries.
+    if (a.sync_hold) return;
     // Hold off while any write job is pending: they pause live sync and
     // serialize on the store lock, so don't fight them. checkSync restarts
     // sync once the last job finishes.
@@ -11502,6 +11622,15 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
                     // success path below).
                     if (!result.ok and result.gen == a.chats_gen) {
                         setStatus(a, "Unable to read chats from wacli");
+                        // WAZI-83: a timed-out read means the store lock was
+                        // held for the whole 30s window; the only known holder
+                        // is the live-sync child wedged on the post-re-link
+                        // backlog. End it and hold sync off until a read
+                        // succeeds, so the retries run with the store free.
+                        if (std.mem.eql(u8, result.extra.slice(), "timeout") and a.sync_child != null) {
+                            stopSync(a);
+                            a.sync_hold = true;
+                        }
                         // WAZI-67: refreshChats used to re-run only when the
                         // wacli store changed, so a read that failed once at
                         // the very first launch after an update left the
@@ -11513,6 +11642,11 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
                             var fail_buffer: [48]u8 = undefined;
                             const fail_line = std.fmt.bufPrint(&fail_buffer, "chats-read: fail, retry {d}/3", .{a.chats_read_attempts}) catch "chats-read: fail";
                             appendLaunchLog(a, fail_line);
+                        } else {
+                            // Retries exhausted: release the sync hold so live
+                            // sync resumes instead of staying off all session.
+                            a.sync_hold = false;
+                            startSync(a);
                         }
                     } else if (result.ok and result.gen == a.chats_gen) {
                         // A queued job with older archive/unread flags must
@@ -11526,6 +11660,12 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
                             a.chats_read_retry_ticks = 0;
                             a.chats_read_attempts = 0;
                             saveChatsCache(a, result.data);
+                            // WAZI-83: reads work again, so live sync (held
+                            // off while the wedged child was cleared) resumes.
+                            if (a.sync_hold) {
+                                a.sync_hold = false;
+                                startSync(a);
+                            }
                             var log_buffer: [64]u8 = undefined;
                             const log_line = std.fmt.bufPrint(&log_buffer, "chats-read: ok {d} bytes, {d} chats", .{ result.data.len, a.chat_count }) catch "chats-read: ok";
                             appendLaunchLog(a, log_line);
@@ -14069,6 +14209,16 @@ test "unresolvable chat entries are dropped, real chats are kept" {
     try std.testing.expect(!isUnresolvableChatEntry("", "4917012345678@s.whatsapp.net", "unknown"));
     // A named chat resolves even when wacli reports no type.
     try std.testing.expect(!isUnresolvableChatEntry("Mum", "00C6AD6F2E64", "unknown"));
+}
+
+test "wacli read-only job kinds are exactly the store reads, never writes" {
+    // WAZI-83: the bounded-read runner must only ever receive read-only
+    // kinds; a routed write would be killable at the deadline mid-store-write.
+    try std.testing.expect(wacliJobIsReadOnly(.chats));
+    try std.testing.expect(wacliJobIsReadOnly(.groups));
+    try std.testing.expect(wacliJobIsReadOnly(.messages));
+    try std.testing.expect(wacliJobIsReadOnly(.cache_tag));
+    try std.testing.expect(!wacliJobIsReadOnly(.reaction));
 }
 
 test "launch log rotates one byte past its cap, never at or under it" {
