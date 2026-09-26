@@ -89,16 +89,10 @@ pub fn build(b: *std.Build) void {
         "comctl32",
         "ole32",
         "windowscodecs",
-        "shell32",
         "dwmapi",
-        "mfplat",
-        "mfplay",
-        "mfreadwrite",
         "mfuuid",
         "winhttp",
         "crypt32",
-        "comdlg32",
-        "urlmon",
         "msimg32",
     }) |library| {
         exe.root_module.linkSystemLibrary(library, .{});
