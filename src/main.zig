@@ -58,6 +58,9 @@ fn sendRetryDelayMs(retries: u8) ?u64 {
     };
 }
 const max_avatars = 256;
+// Bounded separately from max_avatars so participants can't fill or evict
+// chat icons: a chat-heavy account can already fill all 256 chat slots.
+const max_participant_avatars = 64;
 const timer_refresh = 1;
 const timer_search = 2;
 const timer_animation = 3;
@@ -369,6 +372,13 @@ const AvatarEntry = struct {
     // batch asks WhatsApp again when it gets to it.
     refresh: bool = false,
 };
+
+// Which of the two avatar tables a batch fetch is working on: chat icons
+// (App.avatars, max_avatars) or group participants (App.participant_avatars,
+// max_participant_avatars). Kept separate so a chat-heavy account can never
+// fill the chat table and starve, or evict, participant entries, or the
+// other way around.
+const AvatarTarget = union(enum) { chat: usize, participant: usize };
 
 const PaletteItem = struct {
     label: WideText(63) = .{},
@@ -759,7 +769,14 @@ const App = struct {
     chat_wheel_accum: i32 = 0,
     avatars: [max_avatars]AvatarEntry = [_]AvatarEntry{.{}} ** max_avatars,
     avatar_count: usize = 0,
-    avatar_active_index: ?usize = null,
+    // Group participants who don't reuse a contact's avatar (see
+    // reuseContactAvatar); a separate bounded table so they never compete
+    // with chat icons for a max_avatars slot. Full table evicts the entry
+    // least recently drawn.
+    participant_avatars: [max_participant_avatars]AvatarEntry = [_]AvatarEntry{.{}} ** max_participant_avatars,
+    participant_avatar_count: usize = 0,
+    participant_avatar_touch_ms: [max_participant_avatars]u64 = [_]u64{0} ** max_participant_avatars,
+    avatar_active_index: ?AvatarTarget = null,
     // Avatar batches: one sync pause runs several picture fetches back to
     // back (sync_gate caps count and time), then sync resumes once.
     avatar_batch_active: bool = false,
@@ -5483,16 +5500,17 @@ fn checkAvatarDownload(a: *App) void {
     const state = session.state();
     if (state == .working) return;
     if (state != .idle) {
-        if (a.avatar_active_index) |index| {
-            if (index < a.avatar_count) applyAvatarResult(a, &a.avatars[index], state);
-        }
+        if (a.avatar_active_index) |target| switch (target) {
+            .chat => |index| if (index < a.avatar_count) applyAvatarResult(a, &a.avatars[index], state),
+            .participant => |index| if (index < a.participant_avatar_count) applyAvatarResult(a, &a.participant_avatars[index], state),
+        };
         a.avatar_active_index = null;
         session.reset();
         if (state == .failed) a.avatar_retry_after_ms = win.GetTickCount64() + sync_gate.avatar_failure_backoff_ms;
         if (a.avatar_batch_active) {
             const continues = sync_gate.avatarBatchContinues(a.avatar_batch_fetched, a.avatar_batch_started_ms, win.GetTickCount64(), state == .failed) and
                 !avatarBatchBlocked(a);
-            const next = if (continues) nextAvatarIndex(a) else null;
+            const next = if (continues) nextAvatarTarget(a) else null;
             if (next == null or !startAvatarFetch(a, next.?)) endAvatarBatch(a);
         } else startSync(a);
         if (a.chats_hwnd) |list| _ = win.InvalidateRect(list, null, win.FALSE);
@@ -5503,24 +5521,29 @@ fn checkAvatarDownload(a: *App) void {
 }
 
 // Missing, stale or never-asked pictures: open chat first, then the chat
-// list in order, then any other avatar (group participants).
+// list in order, then any other chat avatar, then group participants last.
 fn avatarWanted(entry: *const AvatarEntry) bool {
     if (entry.path.len == 0) return false;
     return entry.status == .unknown or (entry.status == .ready and entry.refresh);
 }
 
-fn nextAvatarIndex(a: *App) ?usize {
+fn nextAvatarTarget(a: *App) ?AvatarTarget {
     if (a.selected_chat < a.chat_count) {
         if (avatarForChat(a, a.chats[a.selected_chat].jid.slice())) |entry| {
-            if (avatarWanted(entry)) return avatarIndex(a, entry);
+            if (avatarWanted(entry)) return .{ .chat = avatarIndex(a, entry) };
         }
     }
     for (a.chats[0..a.chat_count]) |*chat| {
         const entry = avatarForChat(a, chat.jid.slice()) orelse continue;
-        if (avatarWanted(entry)) return avatarIndex(a, entry);
+        if (avatarWanted(entry)) return .{ .chat = avatarIndex(a, entry) };
     }
     for (a.avatars[0..a.avatar_count], 0..) |*entry, index| {
-        if (avatarWanted(entry)) return index;
+        if (avatarWanted(entry)) return .{ .chat = index };
+    }
+    // Lower priority than every chat icon above: a participant fetch never
+    // jumps ahead of a chat icon that still needs one.
+    for (a.participant_avatars[0..a.participant_avatar_count], 0..) |*entry, index| {
+        if (avatarWanted(entry)) return .{ .participant = index };
     }
     return null;
 }
@@ -5538,12 +5561,12 @@ fn requestNextAvatar(a: *App) void {
     if (avatarBusy(a) or avatarBatchBlocked(a)) return;
     const now = win.GetTickCount64();
     if (!sync_gate.avatarBatchMayStart(a.last_sync_stop_ms, a.avatar_batch_end_ms, a.avatar_retry_after_ms, now)) return;
-    const index = nextAvatarIndex(a) orelse return;
+    const target = nextAvatarTarget(a) orelse return;
     stopSync(a, "avatars");
     a.avatar_batch_active = true;
     a.avatar_batch_fetched = 0;
     a.avatar_batch_started_ms = now;
-    if (!startAvatarFetch(a, index)) endAvatarBatch(a);
+    if (!startAvatarFetch(a, target)) endAvatarBatch(a);
 }
 
 fn endAvatarBatch(a: *App) void {
@@ -5552,9 +5575,11 @@ fn endAvatarBatch(a: *App) void {
     startSync(a);
 }
 
-fn startAvatarFetch(a: *App, index: usize) bool {
-    if (index >= a.avatar_count) return false;
-    const entry = &a.avatars[index];
+fn startAvatarFetch(a: *App, target: AvatarTarget) bool {
+    const entry = switch (target) {
+        .chat => |index| if (index < a.avatar_count) &a.avatars[index] else return false,
+        .participant => |index| if (index < a.participant_avatar_count) &a.participant_avatars[index] else return false,
+    };
     // Whatever happens next, this entry is not picked again this session
     // unless its answer says so.
     entry.refresh = false;
@@ -5568,7 +5593,7 @@ fn startAvatarFetch(a: *App, index: usize) bool {
     }
     // A stale picture keeps showing while it is refreshed.
     if (entry.status == .unknown) entry.status = .loading;
-    a.avatar_active_index = index;
+    a.avatar_active_index = target;
     a.avatar_batch_fetched += 1;
     return true;
 }
@@ -7164,6 +7189,33 @@ fn resolveQuoteSender(a: *const App, chat_jid: []const u8, jid: []const u8) Wide
 fn jidUser(jid: []const u8) []const u8 {
     const end = std.mem.indexOfAny(u8, jid, "@:") orelse jid.len;
     return jid[0..end];
+}
+
+// Most group participants are also 1:1 contacts whose avatar is already
+// cached under their own chat jid. A participant's in-group jid can carry a
+// different suffix for the same person (@lid vs @s.whatsapp.net), so match
+// on jidUser rather than the full jid. Reusing avatarForChat here means both
+// the in-memory entry and the on-disk cache (keyed by the contact's own jid)
+// are picked up exactly as a direct chat's icon would be, and no extra fetch
+// or table slot is spent on them.
+fn reuseContactAvatar(a: *App, sender_jid: []const u8) ?*AvatarEntry {
+    if (sender_jid.len == 0) return null;
+    const sender_user = jidUser(sender_jid);
+    if (sender_user.len == 0) return null;
+    for (a.chats[0..a.chat_count]) |*chat| {
+        const chat_jid = chat.jid.slice();
+        if (std.mem.endsWith(u8, chat_jid, "@g.us")) continue;
+        if (std.mem.eql(u8, jidUser(chat_jid), sender_user)) return avatarForChat(a, chat_jid);
+    }
+    return null;
+}
+
+// Reuse first, the participant's own (bounded, lower-priority) table entry
+// second: see reuseContactAvatar and avatarForParticipant.
+fn avatarEntryForSender(a: *App, sender_jid: []const u8) ?*AvatarEntry {
+    if (sender_jid.len == 0) return null;
+    if (reuseContactAvatar(a, sender_jid)) |entry| return entry;
+    return avatarForParticipant(a, sender_jid);
 }
 
 fn applyMessageData(a: *App, raw: []const u8, final: bool) void {
@@ -10580,21 +10632,17 @@ fn loadAvatarBitmap(a: *App, path: [*:0]const u16) ?win.HBITMAP {
     return bitmap;
 }
 
-fn avatarForChat(a: *App, jid: []const u8) ?*AvatarEntry {
-    for (a.avatars[0..a.avatar_count]) |*entry| {
-        if (std.mem.eql(u8, entry.jid.slice(), jid)) return entry;
-    }
-    if (a.avatar_count >= max_avatars) return null;
-    const entry = &a.avatars[a.avatar_count];
-    a.avatar_count += 1;
+// Shared by both avatar tables (avatarForChat, avatarForParticipant): fills
+// a freshly jid'd entry from the on-disk cache. A picture shows at once, and
+// a recent "no picture" or failed answer (sync_gate's TTLs) is not asked
+// again, so this is the one place that reads those markers.
+fn populateAvatarEntry(a: *App, entry: *AvatarEntry, jid: []const u8) void {
     entry.jid.set(jid);
     var filename_buffer: [40]u8 = undefined;
-    const filename = std.fmt.bufPrint(&filename_buffer, "{x:0>16}.img", .{std.hash.Wyhash.hash(0, jid)}) catch return entry;
-    const path = std.fs.path.join(a.allocator, &.{ a.avatar_dir, filename }) catch return entry;
+    const filename = std.fmt.bufPrint(&filename_buffer, "{x:0>16}.img", .{std.hash.Wyhash.hash(0, jid)}) catch return;
+    const path = std.fs.path.join(a.allocator, &.{ a.avatar_dir, filename }) catch return;
     defer a.allocator.free(path);
     entry.path.set(a.allocator, path);
-    // The on-disk cache decides before any fetch: a picture shows at once,
-    // and a recent "no picture" or failed answer is not asked again.
     const image_secs = fileStampSecs(entry.path.ptr());
     if (image_secs != null) entry.bitmap = loadAvatarBitmap(a, entry.path.ptr());
     var buffer: [540]u16 = undefined;
@@ -10605,10 +10653,53 @@ fn avatarForChat(a: *App, jid: []const u8) ?*AvatarEntry {
         entry.status = .ready;
         entry.refresh = cache.needs_fetch;
     } else entry.status = if (cache.needs_fetch) .unknown else .unavailable;
+}
+
+fn avatarForChat(a: *App, jid: []const u8) ?*AvatarEntry {
+    for (a.avatars[0..a.avatar_count]) |*entry| {
+        if (std.mem.eql(u8, entry.jid.slice(), jid)) return entry;
+    }
+    if (a.avatar_count >= max_avatars) return null;
+    const entry = &a.avatars[a.avatar_count];
+    a.avatar_count += 1;
+    populateAvatarEntry(a, entry, jid);
     return entry;
 }
 
-fn drawAvatarBitmap(hdc: win.HDC, bitmap: win.HBITMAP, left: i32, top: i32) void {
+// Group participants without a matching contact (see reuseContactAvatar)
+// get their own small, bounded table so they never fill up or evict a chat
+// icon out of avatarForChat's table, and vice versa. A full table evicts the
+// entry least recently drawn rather than refusing new participants.
+fn avatarForParticipant(a: *App, jid: []const u8) ?*AvatarEntry {
+    const now = win.GetTickCount64();
+    for (a.participant_avatars[0..a.participant_avatar_count], 0..) |*entry, index| {
+        if (std.mem.eql(u8, entry.jid.slice(), jid)) {
+            a.participant_avatar_touch_ms[index] = now;
+            return entry;
+        }
+    }
+    var slot: usize = undefined;
+    if (a.participant_avatar_count < max_participant_avatars) {
+        slot = a.participant_avatar_count;
+        a.participant_avatar_count += 1;
+    } else {
+        slot = 0;
+        for (a.participant_avatar_touch_ms[0..max_participant_avatars], 0..) |touch, index| {
+            if (touch < a.participant_avatar_touch_ms[slot]) slot = index;
+        }
+        if (a.participant_avatars[slot].bitmap) |bitmap| _ = win.DeleteObject(bitmap);
+        a.participant_avatars[slot] = .{};
+    }
+    const entry = &a.participant_avatars[slot];
+    a.participant_avatar_touch_ms[slot] = now;
+    populateAvatarEntry(a, entry, jid);
+    return entry;
+}
+
+// size is the destination box (DPI-scaled by callers); the source DIB is
+// always the fixed 42px bake from loadAvatarBitmap/createAvatarCircleDib, so
+// AlphaBlend stretches it when size differs.
+fn drawAvatarBitmap(hdc: win.HDC, bitmap: win.HBITMAP, left: i32, top: i32, size: i32) void {
     const memory = win.CreateCompatibleDC(hdc) orelse return;
     defer _ = win.DeleteDC(memory);
     const old_bitmap = win.SelectObject(memory, bitmap);
@@ -10621,7 +10712,7 @@ fn drawAvatarBitmap(hdc: win.HDC, bitmap: win.HBITMAP, left: i32, top: i32) void
         .SourceConstantAlpha = 255,
         .AlphaFormat = win.AC_SRC_ALPHA,
     };
-    _ = win.AlphaBlend(hdc, left, top, 42, 42, memory, 0, 0, 42, 42, blend);
+    _ = win.AlphaBlend(hdc, left, top, size, size, memory, 0, 0, 42, 42, blend);
 }
 
 fn createAvatarCircleDib(r: u8, g: u8, b: u8) ?win.HBITMAP {
@@ -11092,12 +11183,12 @@ fn drawChat(a: *App, item: *win.DRAWITEMSTRUCT) void {
     const avatar_top = item.rcItem.top + px(a, 10);
     const avatar_entry = avatarForChat(a, chat.jid.slice());
     if (avatar_entry != null and avatar_entry.?.bitmap != null) {
-        drawAvatarBitmap(item.hDC, avatar_entry.?.bitmap.?, avatar_left, avatar_top);
+        drawAvatarBitmap(item.hDC, avatar_entry.?.bitmap.?, avatar_left, avatar_top, 42);
     } else {
         // Anti-aliased circle via per-pixel alpha; GDI Ellipse has a hard edge.
         if (createAvatarCircleDib(59, 74, 84)) |circle| {
             defer _ = win.DeleteObject(circle);
-            drawAvatarBitmap(item.hDC, circle, avatar_left, avatar_top);
+            drawAvatarBitmap(item.hDC, circle, avatar_left, avatar_top, 42);
         }
         if (chat.name.len > 0) {
             var initial_length: c_int = 1;
@@ -11348,6 +11439,17 @@ fn senderInitial(sender: []const u16) []const u16 {
 }
 
 fn drawSenderAvatar(hdc: win.HDC, a: *App, x: i32, top: i32, message: *const Message) void {
+    // A real profile picture, reused from a matching contact or fetched for
+    // this participant, replaces the initials circle at the same DPI-scaled
+    // size; no bitmap yet (or no jid) falls through to initials below.
+    if (message.sender_jid.len > 0) {
+        if (avatarEntryForSender(a, message.sender_jid.slice())) |entry| {
+            if (entry.bitmap) |bitmap| {
+                drawAvatarBitmap(hdc, bitmap, x, top, px(a, 30));
+                return;
+            }
+        }
+    }
     // Seed the color from the jid; fall back to the first name code unit when
     // the jid is missing (both are stable per person).
     const seed = if (message.sender_jid.len > 0)
@@ -12733,6 +12835,9 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
                 a.openrouter_session = null;
             }
             for (a.avatars[0..a.avatar_count]) |*entry| {
+                if (entry.bitmap) |bitmap| _ = win.DeleteObject(bitmap);
+            }
+            for (a.participant_avatars[0..a.participant_avatar_count]) |*entry| {
                 if (entry.bitmap) |bitmap| _ = win.DeleteObject(bitmap);
             }
             a.audio_state = .empty;
@@ -14771,6 +14876,37 @@ test "sender name shows only at the start of a same-sender run" {
     a.messages[1].from_me = false;
     a.messages[1].sender_jid.set("111@g.us");
     try std.testing.expect(!showSenderName(&a, 2));
+}
+
+test "reuseContactAvatar matches a group participant to their contact's cached jid" {
+    var scratch: [1]u8 = .{0};
+    var a: App = undefined;
+    a.allocator = std.testing.allocator;
+    a.avatar_dir = scratch[0..0];
+    a.avatar_count = 0;
+    a.avatars = [_]AvatarEntry{.{}} ** max_avatars;
+    a.chat_count = 3;
+    a.chats[0] = .{};
+    a.chats[0].jid.set("15551234567@s.whatsapp.net");
+    // A group jid sharing the same digits must never be treated as a contact.
+    a.chats[1] = .{};
+    a.chats[1].jid.set("15551234567@g.us");
+    a.chats[2] = .{};
+    a.chats[2].jid.set("999@s.whatsapp.net");
+
+    // Same person, but the group-scoped jid uses @lid where the contact's
+    // own chat jid uses @s.whatsapp.net: jidUser must still line them up.
+    const entry = reuseContactAvatar(&a, "15551234567@lid") orelse return error.TestExpectedEntry;
+    try std.testing.expectEqualStrings("15551234567@s.whatsapp.net", entry.jid.slice());
+
+    // No matching contact.
+    try std.testing.expect(reuseContactAvatar(&a, "77777@lid") == null);
+
+    // A device-suffixed exact match on the same domain also lines up.
+    const same_domain = reuseContactAvatar(&a, "999@s.whatsapp.net:5") orelse return error.TestExpectedEntry;
+    try std.testing.expectEqualStrings("999@s.whatsapp.net", same_domain.jid.slice());
+
+    try std.testing.expect(reuseContactAvatar(&a, "") == null);
 }
 
 test "telegram api_id parsing accepts positive numbers only" {
