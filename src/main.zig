@@ -467,6 +467,8 @@ const WacliResult = struct {
     msg_id: Utf8Text(191) = .{},
     extra: Utf8Text(63) = .{},
     started_ms: u64 = 0,
+    // Slack jobs: HTTP status of the last call, 0 when none answered.
+    http_status: u32 = 0,
     data: []u8 = &.{},
 };
 
@@ -794,6 +796,15 @@ const App = struct {
     slack_setup_window: ?win.HWND = null,
     slack_chats: [max_chats]Chat = [_]Chat{.{}} ** max_chats,
     slack_chat_count: usize = 0,
+    // Pages fetched in the current conversations.list / users.list round.
+    slack_workspace_pages: u32 = 0,
+    slack_user_pages: u32 = 0,
+    // Launch-log rate limits: per job kind for failures, one slot for the
+    // chat count logged after a workspace load.
+    slack_fail_log_ms: [wacli_kind_count]u64 = [_]u64{0} ** wacli_kind_count,
+    slack_fail_log_hash: [wacli_kind_count]u64 = [_]u64{0} ** wacli_kind_count,
+    slack_count_log_ms: u64 = 0,
+    slack_count_log_hash: u64 = 0,
     // One messenger at a time in the sidebar (Alt+1/2/3). The last selected
     // chat per messenger is kept by id so switching back restores it.
     chat_view: transport.Provider = .whatsapp,
@@ -1493,11 +1504,17 @@ fn wacliRunJob(a: *App, job: WacliJob) void {
                 .slack_auth => .auth,
                 else => .download,
             };
-            result.data = slack_win.runJob(a.allocator, slackContext(a), kind, slack_args[0..slack_count]) catch |err| blk: {
-                result.ok = false;
+            slack_win.last_status = 0;
+            // ok defaults to false, so success must set it: without this
+            // every Slack answer (channels, users, history, sends) was
+            // treated as a failure and the Slack view stayed empty.
+            if (slack_win.runJob(a.allocator, slackContext(a), kind, slack_args[0..slack_count])) |data| {
+                result.data = data;
+                result.ok = true;
+            } else |err| {
                 result.extra.set(@errorName(err));
-                break :blk &.{};
-            };
+            }
+            result.http_status = slack_win.last_status;
             wacliPost(a, result);
             return;
         },
@@ -3144,31 +3161,30 @@ fn appendSlackChats(a: *App, query_utf8: ?[]const u8) void {
     }
 }
 
-/// Move the accumulated Slack workspace page into a.slack_chats / a.slack_users.
-fn applySlackWorkspace(a: *App, raw: []const u8) void {
-    var parsed = std.json.parseFromSlice(std.json.Value, a.allocator, raw, .{}) catch return;
+/// Merge one conversations.list page into a.slack_chats and queue the next
+/// page while Slack returns a cursor. False when the page is not a channel
+/// list, so the caller can log it.
+fn applySlackWorkspace(a: *App, raw: []const u8) bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, a.allocator, raw, .{}) catch return false;
     defer parsed.deinit();
     const root = switch (parsed.value) {
         .object => |object| object,
-        else => return,
+        else => return false,
     };
-    const list = switch (root.get("channels") orelse return) {
+    const list = switch (root.get("channels") orelse return false) {
         .array => |items| items,
-        else => return,
+        else => return false,
     };
     for (list.items) |item| {
         const object = switch (item) {
             .object => |object| object,
             else => continue,
         };
-        const id = getString(object, "id");
-        if (id.len == 0) continue;
-        const is_im = id[0] == 'D';
-        var name: []const u8 = getString(object, "name");
-        if (is_im) {
-            const user_id = getString(object, "user");
-            name = slackUserName(a, user_id) orelse user_id;
-        }
+        const channel = slack.workspaceChannel(object) orelse continue;
+        const id = channel.id;
+        const is_im = channel.is_im;
+        var name: []const u8 = channel.name;
+        if (is_im) name = slackUserName(a, channel.user) orelse channel.user;
         if (name.len == 0) continue;
         var chat = Chat{ .provider = .slack };
         chat.jid.set(id);
@@ -3176,7 +3192,7 @@ fn applySlackWorkspace(a: *App, raw: []const u8) void {
         const shown = if (hash_prefix) std.fmt.allocPrint(a.allocator, "#{s}", .{name}) catch a.allocator.dupe(u8, name) catch continue else a.allocator.dupe(u8, name) catch continue;
         defer a.allocator.free(shown);
         // Upsert: a later page or refresh must not duplicate a channel.
-        const seconds = slack.conversationSeconds(object);
+        const seconds = channel.seconds;
         if (slackChatById(a, id)) |existing| {
             existing.name.set(a.allocator, shown);
             // Never lower: a live event or history poll may know a newer one.
@@ -3190,18 +3206,51 @@ fn applySlackWorkspace(a: *App, raw: []const u8) void {
         a.slack_chats[a.slack_chat_count] = chat;
         a.slack_chat_count += 1;
     }
+    a.slack_workspace_pages += 1;
+    const cursor = slack.nextCursor(root);
+    if (slack.wantsNextPage(cursor, a.slack_workspace_pages, wacli_arg_cap)) {
+        var job = WacliJob{ .kind = .slack_workspace };
+        wacliJobArgs(&job, &.{ slack_workspace_types, cursor });
+        wacliEnqueue(a, job, false);
+        return true;
+    }
+    // Last page: one line with the chat count, repeated at most every 10
+    // minutes unless the count changes.
+    const now = win.GetTickCount64();
+    if (slack.logDue(a.slack_count_log_ms, a.slack_count_log_hash, now, a.slack_chat_count)) {
+        a.slack_count_log_ms = now;
+        a.slack_count_log_hash = a.slack_chat_count;
+        var buffer: [96]u8 = undefined;
+        appendLaunchLog(a, std.fmt.bufPrint(&buffer, "slack: workspace loaded, {d} chats in {d} pages", .{ a.slack_chat_count, a.slack_workspace_pages }) catch "slack: workspace loaded");
+    }
+    return true;
 }
 
-fn applySlackUsers(a: *App, raw: []const u8) void {
-    var parsed = std.json.parseFromSlice(std.json.Value, a.allocator, raw, .{}) catch return;
+/// One launch-log line per failing Slack job: kind, error name and HTTP
+/// status, never tokens or message text. Rate limited per job kind.
+fn logSlackFailure(a: *App, kind: WacliJobKind, error_name: []const u8, http_status: u32) void {
+    const index = @intFromEnum(kind);
+    const now = win.GetTickCount64();
+    const hash = std.hash.Wyhash.hash(http_status, error_name);
+    if (!slack.logDue(a.slack_fail_log_ms[index], a.slack_fail_log_hash[index], now, hash)) return;
+    a.slack_fail_log_ms[index] = now;
+    a.slack_fail_log_hash[index] = hash;
+    const tag = @tagName(kind);
+    const name = if (std.mem.startsWith(u8, tag, "slack_")) tag["slack_".len..] else tag;
+    var buffer: [128]u8 = undefined;
+    appendLaunchLog(a, slack.formatJobFailure(&buffer, name, if (error_name.len > 0) error_name else "Unknown", http_status));
+}
+
+fn applySlackUsers(a: *App, raw: []const u8) bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, a.allocator, raw, .{}) catch return false;
     defer parsed.deinit();
     const root = switch (parsed.value) {
         .object => |object| object,
-        else => return,
+        else => return false,
     };
-    const list = switch (root.get("members") orelse return) {
+    const list = switch (root.get("members") orelse return false) {
         .array => |items| items,
-        else => return,
+        else => return false,
     };
     for (list.items) |item| {
         const object = switch (item) {
@@ -3233,13 +3282,27 @@ fn applySlackUsers(a: *App, raw: []const u8) void {
         a.slack_users[a.slack_user_count] = user;
         a.slack_user_count += 1;
     }
+    a.slack_user_pages += 1;
+    const cursor = slack.nextCursor(root);
+    if (slack.wantsNextPage(cursor, a.slack_user_pages, wacli_arg_cap)) {
+        var job = WacliJob{ .kind = .slack_users };
+        wacliJobArgs(&job, &.{cursor});
+        wacliEnqueue(a, job, false);
+    }
+    return true;
 }
+
+const slack_workspace_types = "public_channel,private_channel,im";
 
 fn refreshSlackWorkspace(a: *App) void {
     if (!slackConfigured(a)) return;
+    a.slack_workspace_pages = 0;
     var job = WacliJob{ .kind = .slack_workspace };
-    wacliJobArgs(&job, &.{ "public_channel,private_channel,im", "" });
+    wacliJobArgs(&job, &.{ slack_workspace_types, "" });
     wacliEnqueue(a, job, false);
+    // A users.list round still paging keeps going; do not start a second.
+    if (wacliPendingGet(a, .slack_users) != 0) return;
+    a.slack_user_pages = 0;
     var users_job = WacliJob{ .kind = .slack_users };
     wacliJobArgs(&users_job, &.{""});
     wacliEnqueue(a, users_job, false);
@@ -11684,6 +11747,7 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
                 a.allocator.destroy(result);
             }
             wacliPendingSub(a, result.kind);
+            if (jobIsSlack(result.kind) and !result.ok) logSlackFailure(a, result.kind, result.extra.slice(), result.http_status);
             switch (result.kind) {
                 .groups => if (result.ok) applyGroups(a, result.data),
                 .chats => {
@@ -11758,11 +11822,11 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
                     }
                 },
                 .slack_workspace => if (result.ok) {
-                    applySlackWorkspace(a, result.data);
+                    if (!applySlackWorkspace(a, result.data)) logSlackFailure(a, result.kind, "ParseFailed", result.http_status);
                     refreshVisibleChats(a);
                 } else if (slackConfigured(a)) setStatus(a, "Unable to read Slack channels"),
                 .slack_users => if (result.ok) {
-                    applySlackUsers(a, result.data);
+                    if (!applySlackUsers(a, result.data)) logSlackFailure(a, result.kind, "ParseFailed", result.http_status);
                     refreshVisibleChats(a);
                 },
                 .slack_auth => if (result.ok) {
