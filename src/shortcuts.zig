@@ -17,6 +17,10 @@ pub const groups = [_]Group{
     .{ .name = "Chats", .items = &[_]Shortcut{
         .{ .key = "Ctrl+1..9", .desc = "Open the chat at that position in the list" },
         .{ .key = "Ctrl+Tab / Ctrl+Shift+Tab", .desc = "Next / previous chat" },
+        .{ .key = "Ctrl+Shift+Home", .desc = "Jump to the first chat" },
+        .{ .key = "Ctrl+Shift+End", .desc = "Jump to the last chat" },
+        .{ .key = "Ctrl+Page Up / Ctrl+Page Down", .desc = "Move the selection by a page" },
+        .{ .key = "Mouse wheel over the list", .desc = "Scroll the chat list" },
         .{ .key = "Ctrl+F or /", .desc = "Focus search" },
         .{ .key = "U", .desc = "Toggle unread chats" },
         .{ .key = "Ctrl+E or E", .desc = "Archive or unarchive the selected chat" },
@@ -42,7 +46,7 @@ pub const groups = [_]Group{
         .{ .key = "Shift+Enter", .desc = "Insert a new line" },
         .{ .key = "C", .desc = "Focus the composer" },
         .{ .key = "Ctrl+V", .desc = "Paste a copied image to send" },
-        .{ .key = "Esc", .desc = "Cancel the reply, discard a pasted image, or leave the composer" },
+        .{ .key = "Esc", .desc = "Cancel the reply or discard a pasted image" },
         .{ .key = "Arrows / Enter / Esc, emoji picker open", .desc = "Move, insert or close the emoji picker" },
     } },
     .{ .name = "Messengers", .items = &[_]Shortcut{
