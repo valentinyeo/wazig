@@ -807,6 +807,8 @@ const App = struct {
     // it can be capped instead of just wiped on every off-screen message
     // each paint (see the pre-paint eviction pass).
     message_bitmap_lru: bitmap_lru.Lru(max_messages) = .{},
+    startup_ticks: u32 = 0,
+    startup_memory_logged: bool = false,
     // WAZI-68 fullscreen state for the video player window.
     player_saved_placement: win.WINDOWPLACEMENT = undefined,
     player_fullscreen: bool = false,
@@ -7207,6 +7209,63 @@ fn dropMessageBitmap(message: *Message) void {
     if (app_ptr) |a| a.message_bitmap_lru.remove(@intFromPtr(message));
 }
 
+// PROCESS_MEMORY_COUNTERS_EX (psapi.h). Declared by hand and called through
+// kernel32's own K32GetProcessMemoryInfo (available since Windows 7) so this
+// does not need to link psapi.dll just for one diagnostic log line.
+const PROCESS_MEMORY_COUNTERS_EX = extern struct {
+    cb: win.DWORD = @sizeOf(@This()),
+    PageFaultCount: win.DWORD = 0,
+    PeakWorkingSetSize: usize = 0,
+    WorkingSetSize: usize = 0,
+    QuotaPeakPagedPoolUsage: usize = 0,
+    QuotaPagedPoolUsage: usize = 0,
+    QuotaPeakNonPagedPoolUsage: usize = 0,
+    QuotaNonPagedPoolUsage: usize = 0,
+    PagefileUsage: usize = 0,
+    PeakPagefileUsage: usize = 0,
+    PrivateUsage: usize = 0,
+};
+extern "kernel32" fn K32GetProcessMemoryInfo(process: win.HANDLE, counters: *PROCESS_MEMORY_COUNTERS_EX, cb: win.DWORD) win.BOOL;
+
+pub const MemorySnapshot = struct {
+    working_set_bytes: usize = 0,
+    private_bytes: usize = 0,
+    module_count: u32 = 0,
+};
+
+/// Cheap enough to call from a timer tick or wazigctl status: one
+/// GetProcessMemoryInfo call plus a Toolhelp module walk.
+pub fn readMemorySnapshot() MemorySnapshot {
+    var result = MemorySnapshot{};
+    var counters = PROCESS_MEMORY_COUNTERS_EX{};
+    if (K32GetProcessMemoryInfo(win.GetCurrentProcess(), &counters, @sizeOf(PROCESS_MEMORY_COUNTERS_EX)) != 0) {
+        result.working_set_bytes = counters.WorkingSetSize;
+        result.private_bytes = counters.PrivateUsage;
+    }
+    const TH32CS_SNAPMODULE = 0x00000008;
+    const snapshot = win.CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, win.GetCurrentProcessId()) orelse return result;
+    defer _ = win.CloseHandle(snapshot);
+    var entry = std.mem.zeroes(win.MODULEENTRY32W);
+    entry.dwSize = @sizeOf(win.MODULEENTRY32W);
+    if (win.Module32FirstW(snapshot, &entry) == 0) return result;
+    result.module_count = 1;
+    while (win.Module32NextW(snapshot, &entry) != 0) result.module_count += 1;
+    return result;
+}
+
+// One line in launch-log.txt ~30s after startup, so a memory regression on
+// the user's machine shows up without asking them to attach a profiler.
+fn logStartupMemorySnapshot(a: *App) void {
+    const snapshot = readMemorySnapshot();
+    var buffer: [160]u8 = undefined;
+    const line = std.fmt.bufPrint(&buffer, "memory: working set {d} KB, private {d} KB, {d} modules loaded", .{
+        snapshot.working_set_bytes / 1024,
+        snapshot.private_bytes / 1024,
+        snapshot.module_count,
+    }) catch "memory: snapshot failed to format";
+    appendLaunchLog(a, line);
+}
+
 const mf_idle_unload_ticks: u32 = 60; // ~60s at the 1s timer_refresh cadence
 
 fn anyGifReaderOpen(a: *App) bool {
@@ -9858,6 +9917,13 @@ fn controlStatus(a: *App, w: *std.Io.Writer) !void {
         a.slack_chat_count, a.chat_count,                     a.show_archived, a.unread_only,
     });
     try control_api.writeString(w, controlSearchText(a, &buffer));
+    const memory = readMemorySnapshot();
+    try w.print(",\"memory\":{{\"working_set_kb\":{d},\"private_kb\":{d},\"module_count\":{d},\"media_foundation_loaded\":{}}}", .{
+        memory.working_set_bytes / 1024,
+        memory.private_bytes / 1024,
+        memory.module_count,
+        mf_lazy.isStarted(),
+    });
     try w.writeAll("}}\n");
 }
 
@@ -13403,6 +13469,13 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
                 checkAvatarDownload(a);
                 checkArchive(a);
                 tickMediaFoundationIdle(a);
+                if (!a.startup_memory_logged) {
+                    a.startup_ticks += 1;
+                    if (a.startup_ticks >= 30) {
+                        logStartupMemorySnapshot(a);
+                        a.startup_memory_logged = true;
+                    }
+                }
                 // Reads wait for media slots instead of racing them for the
                 // store lock: a read that loses the lock fails, so it would
                 // never mark the chat read.
