@@ -34,7 +34,7 @@ pub const groups = [_]Group{
         .{ .key = "Page Up / Page Down", .desc = "Scroll the chat a screen at a time" },
         .{ .key = "Ctrl+End", .desc = "Jump back to the newest message" },
         .{ .key = "Alt+G, Alt+G", .desc = "Jump to the latest message (press twice)" },
-        .{ .key = "Ctrl+R", .desc = "React to the selected message" },
+        .{ .key = "Ctrl+R", .desc = "React to message (search any emoji)" },
         .{ .key = "Ctrl+Shift+R", .desc = "Reply to the selected message" },
         .{ .key = "Ctrl+C or Ctrl+Shift+C", .desc = "Copy the selected message text" },
         .{ .key = "Ctrl+P", .desc = "Play or pause the selected voice message" },
