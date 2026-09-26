@@ -39,3 +39,17 @@ test "message taller than the view shows its top, not its bottom" {
 test "oversized message already top-aligned needs no scroll" {
     if (scrollDelta(8, 400, 0, 100, 8) != 0) return error.TestExpectedEqual;
 }
+
+test "Ctrl+Up onto a partly visible image reveals its full top" {
+    // Real numbers from the reported bug: a ~290px image message near the
+    // top of a ~650px chat view, cut off with only its lower part on screen.
+    const view_top = 0;
+    const view_bottom = 650;
+    const margin = 8;
+    const msg_height = 290;
+    const msg_top = -180; // top is off-screen; bottom (110) still shows
+    const delta = scrollDelta(msg_top, msg_height, view_top, view_bottom, margin);
+    const new_top = msg_top + delta;
+    if (new_top != margin) return error.TestExpectedEqual;
+    if (new_top + msg_height > view_bottom - margin) return error.TestExpectedEqual;
+}
