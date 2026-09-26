@@ -14,6 +14,7 @@ const media_age = @import("media_age.zig");
 const webp_detect = @import("webp.zig");
 const paste_image = @import("paste_image.zig");
 const scrollbar = @import("scrollbar.zig");
+const message_scroll = @import("message_scroll.zig");
 const message_filter = @import("message_filter.zig");
 const chat_cache = @import("chat_cache.zig");
 const unfurl = @import("unfurl.zig");
@@ -8120,9 +8121,8 @@ fn scrollToSelectedMessage(a: *App) void {
         const height = measureMessage(hdc, a, &a.messages[index], bubble_width, showSenderName(a, index));
         y -= height + messageGap(a, index);
         if (index != selected) continue;
-        if (y < client.top + px(a, 8)) a.scroll_y += client.top + px(a, 8) - y;
-        if (y + height > client.bottom - px(a, 8)) a.scroll_y -= y + height - (client.bottom - px(a, 8));
-        a.scroll_y = std.math.clamp(a.scroll_y, 0, a.max_scroll);
+        const delta = message_scroll.scrollDelta(y, height, client.top, client.bottom, px(a, 8));
+        a.scroll_y = std.math.clamp(a.scroll_y + delta, 0, a.max_scroll);
         break;
     }
 }
@@ -8143,6 +8143,20 @@ fn selectMessage(a: *App, delta: i32) void {
         // caret keeps blinking and typing can resume immediately.
         _ = win.InvalidateRect(canvas, null, win.TRUE);
     }
+}
+
+/// Up/Down and Ctrl+Up/Down share this: Down past the newest message clears
+/// the highlight, everything else steps selectMessage by one.
+fn walkMessageHighlight(a: *App, key: u32) void {
+    if (key == win.VK_DOWN) {
+        if (a.selected_message) |selected| {
+            if (selected + 1 >= a.message_count) {
+                a.selected_message = null;
+                a.scroll_y = 0;
+                if (a.canvas) |canvas| _ = win.InvalidateRect(canvas, null, win.TRUE);
+            } else selectMessage(a, 1);
+        }
+    } else selectMessage(a, -1);
 }
 
 fn reactionForCommand(command: u16) ?[]const u8 {
@@ -12045,18 +12059,16 @@ fn handleKeyboard(a: *App, message: *const win.MSG) bool {
     if (!control and !alt and !shift and (key == win.VK_UP or key == win.VK_DOWN)) {
         if (a.compose) |compose| {
             if (win.GetFocus() == compose and win.GetWindowTextLengthW(compose) == 0 and a.message_count > 0) {
-                if (key == win.VK_DOWN) {
-                    if (a.selected_message) |selected| {
-                        if (selected + 1 >= a.message_count) {
-                            a.selected_message = null;
-                            a.scroll_y = 0;
-                            if (a.canvas) |canvas| _ = win.InvalidateRect(canvas, null, win.TRUE);
-                        } else selectMessage(a, 1);
-                    }
-                } else selectMessage(a, -1);
+                walkMessageHighlight(a, key);
                 return true;
             }
         }
+    }
+    // Ctrl+Up/Down walk the highlight the same way, but always: Ctrl makes
+    // the intent explicit regardless of composer focus or content.
+    if (control and !alt and !shift and (key == win.VK_UP or key == win.VK_DOWN) and a.message_count > 0) {
+        walkMessageHighlight(a, key);
+        return true;
     }
     // Alt+1..9 show one messenger: WhatsApp, then Slack and Telegram when set up.
     if (alt and !control and !shift and key >= '1' and key <= '9') {
@@ -12072,11 +12084,11 @@ fn handleKeyboard(a: *App, message: *const win.MSG) bool {
         }
         return true;
     }
-    // Chat history from the keyboard: Page Up/Down a screen, Ctrl+Up/Down a
-    // few lines, Ctrl+End back to the newest message. Same path as the wheel,
-    // so older messages load the same way.
+    // Chat history from the keyboard: Page Up/Down a screen, Ctrl+End back to
+    // the newest message. Same path as the wheel, so older messages load the
+    // same way. Ctrl+Up/Down walk the message highlight instead (above).
     if (a.canvas != null and !alt and (key == win.VK_PRIOR or key == win.VK_NEXT or
-        (control and (key == win.VK_UP or key == win.VK_DOWN or key == win.VK_END))))
+        (control and key == win.VK_END)))
     {
         if (a.canvas) |canvas| {
             var client: win.RECT = undefined;
@@ -12085,9 +12097,7 @@ fn handleKeyboard(a: *App, message: *const win.MSG) bool {
             const step: i32 = switch (key) {
                 win.VK_PRIOR => page,
                 win.VK_NEXT => -page,
-                win.VK_UP => px(a, 90),
-                win.VK_DOWN => -px(a, 90),
-                else => -a.scroll_y,
+                else => -a.scroll_y, // Ctrl+End
             };
             a.scroll_y = std.math.clamp(a.scroll_y + step, 0, a.max_scroll);
             _ = win.InvalidateRect(canvas, null, win.TRUE);
