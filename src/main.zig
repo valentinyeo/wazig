@@ -662,6 +662,11 @@ const App = struct {
     read_retries: [max_pending_reads]u8 = [_]u8{0} ** max_pending_reads,
     pending_download_jid: Utf8Text(191) = .{},
     pending_download_id: Utf8Text(191) = .{},
+    // An image queued to download from Ctrl+O or Enter, so it can open in the
+    // viewer as soon as the download completes instead of needing a second
+    // press.
+    pending_viewer_open_jid: Utf8Text(191) = .{},
+    pending_viewer_open_id: Utf8Text(191) = .{},
     pins: [max_pins]Utf8Text(191) = [_]Utf8Text(191){.{}} ** max_pins,
     pin_count: usize = 0,
     pins_loaded: bool = false,
@@ -6306,6 +6311,23 @@ fn openImageViewer(a: *App, message: *const Message) void {
     _ = win.SetFocus(hwnd);
 }
 
+// Opens an image message in the viewer if it's already on disk; otherwise
+// starts the same download a media click starts and remembers the message so
+// checkMediaDownload can open it the moment the download finishes.
+fn openImageInViewerOrQueue(a: *App, index: usize, message: *const Message) void {
+    if (message.local_path.len > 0) {
+        openImageViewer(a, message);
+        return;
+    }
+    if (a.selected_chat < a.chat_count and a.chats[a.selected_chat].provider == .whatsapp) {
+        a.pending_viewer_open_jid.set(a.chats[a.selected_chat].jid.slice());
+        a.pending_viewer_open_id.set(message.id.slice());
+        downloadMedia(a, index, false);
+    } else {
+        setStatus(a, "Still downloading");
+    }
+}
+
 fn imageViewerProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.LPARAM) callconv(.winapi) win.LRESULT {
     const a = app_ptr orelse return win.DefWindowProcW(hwnd, message, wparam, lparam);
     switch (message) {
@@ -6973,6 +6995,20 @@ fn applyMessageData(a: *App, raw: []const u8, final: bool) void {
         for (a.messages[0..a.message_count], 0..) |*message, index| {
             if (std.mem.eql(u8, selected_id.slice(), message.id.slice())) {
                 a.selected_message = index;
+                break;
+            }
+        }
+    }
+    // An image queued from Ctrl+O or Enter opens the moment its download
+    // shows up here, so the picker doesn't need a second press.
+    if (final and a.pending_viewer_open_id.len > 0 and std.mem.eql(u8, a.pending_viewer_open_jid.slice(), chat.jid.slice())) {
+        for (a.messages[0..a.message_count]) |*message| {
+            if (std.mem.eql(u8, message.id.slice(), a.pending_viewer_open_id.slice())) {
+                if (message.local_path.len > 0) {
+                    a.pending_viewer_open_jid.set("");
+                    a.pending_viewer_open_id.set("");
+                    openImageViewer(a, message);
+                }
                 break;
             }
         }
@@ -8120,12 +8156,20 @@ fn selectChat(a: *App, delta: i32, wrap: bool) void {
 
 fn scrollToSelectedMessage(a: *App) void {
     const selected = a.selected_message orelse return;
+    if (selected >= a.message_count) return;
     const canvas = a.canvas orelse return;
     const hdc = win.GetDC(canvas) orelse return;
     defer _ = win.ReleaseDC(canvas, hdc);
     var client: win.RECT = undefined;
     _ = win.GetClientRect(canvas, &client);
     const bubble_width = std.math.clamp(@divTrunc((client.right - client.left) * 7, 10), px(a, 280), px(a, 620));
+    // A message that has never been painted has no decoded bitmap yet, so
+    // measureMessage falls back to a small placeholder height for its media
+    // instead of the real one. Decoding it here first (paint does the same
+    // once it's on screen) keeps this walk's height in sync with what will
+    // actually render, so the scroll lands the real bubble in view instead of
+    // undershooting a taller image and leaving its top cut off.
+    ensureBitmap(a, &a.messages[selected]);
     var total_height: i32 = px(a, 18);
     for (a.messages[0..a.message_count], 0..) |*message, index| total_height += measureMessage(hdc, a, message, bubble_width, showSenderName(a, index)) + messageGap(a, index);
     a.max_scroll = @max(0, total_height - (client.bottom - client.top));
@@ -9175,6 +9219,14 @@ fn paletteActivate(a: *App) void {
             return;
         };
         const message = &a.messages[index];
+        // Images open in the app's own viewer (downloading first if needed,
+        // then opening once the download finishes); anything else keeps
+        // opening externally.
+        if (isImage(message)) {
+            closePalette(a);
+            openImageInViewerOrQueue(a, index, message);
+            return;
+        }
         if (message.local_path.len > 0) {
             closePalette(a);
             openMedia(a, message);
@@ -12222,6 +12274,22 @@ fn handleKeyboard(a: *App, message: *const win.MSG) bool {
                 const compose_empty = if (a.compose) |compose| win.GetWindowTextLengthW(compose) == 0 else true;
                 const in_search = if (a.search) |search| focus == search else false;
                 if (compose_empty and !in_search and resendFailedMessage(a, selected)) return true;
+            }
+        }
+    }
+    // Enter opens the highlighted image message in the viewer, the same
+    // download-then-open path as Ctrl+O and a single click. Resend above
+    // takes priority on a failed message; with text (or a staged image)
+    // ready to send, Enter still sends as usual.
+    if (!control and !alt and key == win.VK_RETURN) {
+        if (a.selected_message) |selected| {
+            if (selected < a.message_count and isImage(&a.messages[selected])) {
+                const compose_empty = if (a.compose) |compose| win.GetWindowTextLengthW(compose) == 0 else true;
+                const in_search = if (a.search) |search| focus == search else false;
+                if (compose_empty and a.staged_image.path.len == 0 and !in_search) {
+                    openImageInViewerOrQueue(a, selected, &a.messages[selected]);
+                    return true;
+                }
             }
         }
     }
