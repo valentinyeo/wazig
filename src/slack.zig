@@ -204,6 +204,14 @@ pub const HistoryItem = struct {
     file_name: []const u8 = "",
     file_mime: []const u8 = "",
     file_size: i64 = 0,
+    // A shared/forwarded message ("is_share"/"is_msg_unfurl") renders as a
+    // quote block above the body.
+    share_sender: []const u8 = "",
+    share_text: []const u8 = "",
+    // A link unfurl (or other attachment) fills in for an empty body.
+    link_title: []const u8 = "",
+    link_text: []const u8 = "",
+    link_fallback: []const u8 = "",
 };
 
 /// Extract displayable fields from a history item. Messages with a subtype
@@ -240,7 +248,7 @@ pub fn readHistoryItem(value: std.json.Value) ?HistoryItem {
                 const file = file_value.object;
                 item.file_id = objectString(file, "id") orelse "";
                 item.file_url = objectString(file, "url_private_download") orelse objectString(file, "url_private") orelse "";
-                item.file_name = objectString(file, "name") orelse "";
+                item.file_name = objectString(file, "name") orelse objectString(file, "title") orelse "";
                 item.file_mime = objectString(file, "mimetype") orelse "";
                 item.file_size = switch (file.get("size") orelse std.json.Value{ .integer = 0 }) {
                     .integer => |size| size,
@@ -249,7 +257,96 @@ pub fn readHistoryItem(value: std.json.Value) ?HistoryItem {
             }
         }
     }
+    // Slack messages with empty `text` and an `attachments` array are either
+    // a shared/forwarded message (quote block) or a link unfurl (fills the
+    // body). A message can carry several attachments; take the first share
+    // and the first attachment with any content, whichever comes first of
+    // each kind, so a body with any text never renders blank.
+    if (object.get("attachments")) |attachments_value| {
+        if (attachments_value == .array) {
+            for (attachments_value.array.items) |attachment_value| {
+                if (attachment_value != .object) continue;
+                const attachment = attachment_value.object;
+                if (boolField(attachment, "is_share") or boolField(attachment, "is_msg_unfurl")) {
+                    if (item.share_text.len > 0 or item.share_sender.len > 0) continue;
+                    item.share_sender = objectStringField(attachment, "author_name");
+                    const text = objectStringField(attachment, "text");
+                    item.share_text = if (text.len > 0) text else objectStringField(attachment, "fallback");
+                } else {
+                    if (item.link_title.len > 0 or item.link_text.len > 0 or item.link_fallback.len > 0) continue;
+                    const title = objectStringField(attachment, "title");
+                    const text = objectStringField(attachment, "text");
+                    const fallback = objectStringField(attachment, "fallback");
+                    if (title.len == 0 and text.len == 0 and fallback.len == 0) continue;
+                    item.link_title = title;
+                    item.link_text = text;
+                    item.link_fallback = fallback;
+                }
+            }
+        }
+    }
     return item;
+}
+
+fn boolField(object: std.json.ObjectMap, key: []const u8) bool {
+    return switch (object.get(key) orelse return false) {
+        .bool => |value| value,
+        else => false,
+    };
+}
+
+/// The message body Wazig shows: the message's own text, else the shared
+/// file's name, else a compact line built from a link-unfurl/other
+/// attachment. Never blank when the item carries any recoverable text.
+pub fn historyItemBody(item: HistoryItem, buffer: []u8) []const u8 {
+    if (item.text.len > 0) return item.text;
+    if (item.file_name.len > 0) return item.file_name;
+    if (item.link_title.len > 0 or item.link_text.len > 0 or item.link_fallback.len > 0)
+        return attachmentSummary(buffer, item.link_title, item.link_text, item.link_fallback);
+    return "";
+}
+
+/// Compact one-line summary for a link-unfurl/other attachment, used only
+/// when the message's own text is empty. Prefers "title: text", falls back
+/// to whichever half is present, then to Slack's plain-text fallback. Writes
+/// into `buffer` and returns the slice actually used; truncates rather than
+/// dropping content when the combined text overflows the buffer, and never
+/// splits a multi-byte UTF-8 character at the cut point.
+pub fn attachmentSummary(buffer: []u8, title: []const u8, text: []const u8, fallback: []const u8) []const u8 {
+    if (buffer.len == 0) return "";
+    if (title.len > 0 and text.len > 0) {
+        const separator = ": ";
+        if (title.len + separator.len < buffer.len) {
+            const title_end = utf8Boundary(title, title.len);
+            @memcpy(buffer[0..title_end], title[0..title_end]);
+            var offset = title_end;
+            @memcpy(buffer[offset..][0..separator.len], separator);
+            offset += separator.len;
+            const remaining = buffer.len - offset;
+            const text_end = utf8Boundary(text, remaining);
+            @memcpy(buffer[offset..][0..text_end], text[0..text_end]);
+            return buffer[0 .. offset + text_end];
+        }
+        // Not enough room for the separator: show what fits of the title alone.
+        return truncateInto(buffer, title);
+    }
+    if (title.len > 0) return truncateInto(buffer, title);
+    if (text.len > 0) return truncateInto(buffer, text);
+    return truncateInto(buffer, fallback);
+}
+
+/// The largest n <= max such that text[0..n] does not split a multi-byte
+/// UTF-8 character (a continuation byte, 0b10xxxxxx, never starts a rune).
+fn utf8Boundary(text: []const u8, max: usize) usize {
+    var n = @min(max, text.len);
+    while (n > 0 and n < text.len and (text[n] & 0xC0) == 0x80) n -= 1;
+    return n;
+}
+
+fn truncateInto(buffer: []u8, text: []const u8) []const u8 {
+    const n = utf8Boundary(text, buffer.len);
+    @memcpy(buffer[0..n], text[0..n]);
+    return buffer[0..n];
 }
 
 /// Pull {"ok":true,"url":"wss://..."} into connection parts. Slices borrow
@@ -670,6 +767,103 @@ test "readHistoryItem filters noise and reads files" {
     defer parsed_bot.deinit();
     const bot_item = readHistoryItem(parsed_bot.value).?;
     try std.testing.expectEqualStrings("from bot", bot_item.text);
+}
+
+test "readHistoryItem reads a shared/forwarded message as a quote" {
+    const shared =
+        \\{"ts":"5.4","user":"U1","text":"","attachments":[{"is_share":true,"is_msg_unfurl":true,"author_name":"Jane","fallback":"Jane: hi there","from_url":"https://x.slack.com/archives/C1/p1","text":"hi there, this is the shared body"}]}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, shared, .{});
+    defer parsed.deinit();
+    const item = readHistoryItem(parsed.value).?;
+    try std.testing.expectEqualStrings("", item.text);
+    try std.testing.expectEqualStrings("Jane", item.share_sender);
+    try std.testing.expectEqualStrings("hi there, this is the shared body", item.share_text);
+    try std.testing.expectEqualStrings("", item.link_title);
+}
+
+test "readHistoryItem falls back to attachment fallback when text is empty" {
+    const shared =
+        \\{"ts":"5.5","user":"U1","text":"","attachments":[{"is_share":true,"author_name":"Jane","fallback":"Jane: hi there","text":""}]}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, shared, .{});
+    defer parsed.deinit();
+    const item = readHistoryItem(parsed.value).?;
+    try std.testing.expectEqualStrings("Jane: hi there", item.share_text);
+}
+
+test "readHistoryItem reads a link unfurl attachment" {
+    const unfurl =
+        \\{"ts":"5.6","user":"U1","text":"","attachments":[{"title":"Example Page","title_link":"https://example.com","text":"A short description","service_name":"example.com","image_url":"https://example.com/img.png","fallback":"Example Page"}]}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, unfurl, .{});
+    defer parsed.deinit();
+    const item = readHistoryItem(parsed.value).?;
+    try std.testing.expectEqualStrings("", item.share_sender);
+    try std.testing.expectEqualStrings("Example Page", item.link_title);
+    try std.testing.expectEqualStrings("A short description", item.link_text);
+    try std.testing.expectEqualStrings("Example Page", item.link_fallback);
+}
+
+test "attachmentSummary builds a compact line, falling back as needed" {
+    var buffer: [128]u8 = undefined;
+    try std.testing.expectEqualStrings("Example Page: A short description", attachmentSummary(&buffer, "Example Page", "A short description", "Example Page"));
+    try std.testing.expectEqualStrings("Example Page", attachmentSummary(&buffer, "Example Page", "", "fallback text"));
+    try std.testing.expectEqualStrings("A short description", attachmentSummary(&buffer, "", "A short description", "fallback text"));
+    try std.testing.expectEqualStrings("fallback text", attachmentSummary(&buffer, "", "", "fallback text"));
+    try std.testing.expectEqualStrings("", attachmentSummary(&buffer, "", "", ""));
+}
+
+test "attachmentSummary truncates instead of splitting a multi-byte character" {
+    // "caf" + e-acute (2 bytes) landing right at the buffer's last byte: a
+    // byte-count cut would keep only the lead byte of the accented e and
+    // produce invalid UTF-8.
+    var buffer: [4]u8 = undefined;
+    const out = attachmentSummary(&buffer, "", "caf\u{e9}", "fallback");
+    try std.testing.expect(std.unicode.utf8ValidateSlice(out));
+    try std.testing.expectEqualStrings("caf", out);
+
+    // The combined "title: text" overflows the buffer: truncate the whole
+    // thing rather than discarding it for the fallback.
+    var small: [10]u8 = undefined;
+    const combined = attachmentSummary(&small, "Title", "a whole lot of text that will not fit", "fallback");
+    try std.testing.expect(std.unicode.utf8ValidateSlice(combined));
+    try std.testing.expectEqualStrings("Title: a w", combined);
+}
+
+test "historyItemBody falls back from text to file name to attachment summary" {
+    var buffer: [128]u8 = undefined;
+    try std.testing.expectEqualStrings("hi", historyItemBody(.{ .text = "hi", .file_name = "report.pdf" }, &buffer));
+    try std.testing.expectEqualStrings("report.pdf", historyItemBody(.{ .file_name = "report.pdf" }, &buffer));
+    try std.testing.expectEqualStrings("Example Page: A short description", historyItemBody(.{ .link_title = "Example Page", .link_text = "A short description" }, &buffer));
+    try std.testing.expectEqualStrings("", historyItemBody(.{}, &buffer));
+}
+
+test "readHistoryItem reads a file with no text as the body via its name" {
+    const files_only =
+        \\{"ts":"5.7","user":"U1","text":"","files":[{"id":"F1","url_private":"https://f/priv","name":"report.pdf","mimetype":"application/pdf","size":10}]}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, files_only, .{});
+    defer parsed.deinit();
+    const item = readHistoryItem(parsed.value).?;
+    var buffer: [128]u8 = undefined;
+    try std.testing.expectEqualStrings("report.pdf", historyItemBody(item, &buffer));
+}
+
+test "readHistoryItem picks the first attachment of each kind out of several" {
+    const mixed =
+        \\{"ts":"5.8","user":"U1","text":"","attachments":[
+        \\{"title":"","text":"","fallback":""},
+        \\{"is_share":true,"author_name":"Jane","text":"shared body"},
+        \\{"title":"Second link","text":"ignored, not first"}
+        \\]}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, mixed, .{});
+    defer parsed.deinit();
+    const item = readHistoryItem(parsed.value).?;
+    try std.testing.expectEqualStrings("Jane", item.share_sender);
+    try std.testing.expectEqualStrings("shared body", item.share_text);
+    try std.testing.expectEqualStrings("Second link", item.link_title);
 }
 
 test "parseWsUrl extracts host and path" {
