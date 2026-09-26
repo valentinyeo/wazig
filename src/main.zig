@@ -21,6 +21,8 @@ const message_filter = @import("message_filter.zig");
 const chat_cache = @import("chat_cache.zig");
 const unfurl = @import("unfurl.zig");
 const shortcuts = @import("shortcuts.zig");
+const control_api = @import("control.zig");
+const control_pipe = @import("control_pipe.zig");
 
 const webp = @cImport({
     @cInclude("src/webp/decode.h");
@@ -77,6 +79,7 @@ const wm_wacli_done = win.WM_APP + 3;
 const wm_slack_event = win.WM_APP + 4;
 const wm_slack_reload = win.WM_APP + 5;
 const wm_unfurl_done = win.WM_APP + 6;
+const wm_control = win.WM_APP + 7;
 const wacli_queue_size = 8;
 const max_wacli_args = 16;
 const wacli_arg_cap = 512;
@@ -9443,12 +9446,14 @@ fn checkArchive(a: *App) void {
     } else startNextArchive(a);
 }
 
-fn removeSelectedChatOptimistically(a: *App) void {
-    if (a.selected_chat >= a.chat_count) return;
-    const removed = a.selected_chat;
+/// Drop one row from the visible list; the selection stays on the same chat,
+/// or moves to the next row when the removed row was selected.
+fn removeChatRow(a: *App, removed: usize) void {
+    if (removed >= a.chat_count) return;
     var index = removed + 1;
     while (index < a.chat_count) : (index += 1) a.chats[index - 1] = a.chats[index];
     a.chat_count -= 1;
+    if (removed < a.selected_chat) a.selected_chat -= 1;
     if (a.chat_count > 0 and a.selected_chat >= a.chat_count) a.selected_chat = a.chat_count - 1;
     if (a.chats_hwnd) |list| {
         _ = win.SendMessageW(list, win.LB_DELETESTRING, removed, 0);
@@ -9456,33 +9461,542 @@ fn removeSelectedChatOptimistically(a: *App) void {
     }
 }
 
-fn archiveSelectedChat(a: *App) void {
-    if (a.chat_count == 0 or a.selected_chat >= a.chat_count) return;
-    if (selectedChatIsTelegram(a)) {
+fn visibleChatIndex(a: *const App, jid: []const u8) ?usize {
+    for (a.chats[0..a.chat_count], 0..) |*chat, index| {
+        if (std.mem.eql(u8, chat.jid.slice(), jid)) return index;
+    }
+    return null;
+}
+
+/// Which messenger a chat id belongs to: the visible row's provider, else
+/// the Slack or Telegram cache, else WhatsApp.
+fn chatProvider(a: *App, jid: []const u8) transport.Provider {
+    if (visibleChatIndex(a, jid)) |index| return a.chats[index].provider;
+    if (slackChatById(a, jid) != null) return .slack;
+    if (std.fmt.parseInt(i64, jid, 10)) |id| {
+        for (a.tg_chats[0..a.tg_chat_count]) |*chat| if (chat.id == id) return .telegram;
+    } else |_| {}
+    return .whatsapp;
+}
+
+/// Queue the app's archive (or unarchive) action for one chat, the same
+/// wacli write Ctrl+E makes. Returns why it could not, or null once queued.
+/// Shared by Ctrl+E and wazigctl, so a later Slack "hide" lands here once.
+fn archiveChat(a: *App, jid: []const u8, unarchive: bool) ?[]const u8 {
+    switch (chatProvider(a, jid)) {
         // ponytail: no archive call until the exact TDLib archive method is
         // confirmed against the pinned scheme; upgrade path: add the verified
         // toggle and route it through the transport interface.
-        setStatus(a, "Archiving is not available for Telegram chats yet");
-        return;
-    }
-    if (selectedChatIsSlack(a)) {
+        .telegram => return "Archiving is not available for Telegram chats yet",
         // Archive/unarchive is a wacli WhatsApp-store call; a Slack channel
         // id must never reach it as a WhatsApp jid.
-        setStatus(a, "Archiving is not available for Slack channels yet");
-        return;
+        .slack => return "Archiving is not available for Slack channels yet",
+        .whatsapp => {},
     }
-    if (a.pending_archive_count >= a.pending_archives.len) {
-        setStatus(a, "Archive queue is full");
-        return;
+    // A real WhatsApp jid always has an @server part (see
+    // isUnresolvableChatEntry); anything else is an unknown id.
+    if (std.mem.indexOfScalar(u8, jid, '@') == null) return "Unknown chat id";
+    for (a.pending_archives[0..a.pending_archive_count]) |*pending| {
+        if (pending.should_unarchive == unarchive and std.mem.eql(u8, pending.jid.slice(), jid)) return null;
     }
-    const chat = &a.chats[a.selected_chat];
+    if (a.pending_archive_count >= a.pending_archives.len) return "Archive queue is full";
     const pending = &a.pending_archives[a.pending_archive_count];
-    pending.jid.set(chat.jid.slice());
-    pending.should_unarchive = a.show_archived or chat.archived;
+    pending.jid.set(jid);
+    pending.should_unarchive = unarchive;
     a.pending_archive_count += 1;
-    removeSelectedChatOptimistically(a);
-    setStatus(a, if (pending.should_unarchive) "Unarchive queued" else "Archive queued");
+    if (visibleChatIndex(a, pending.jid.slice())) |index| removeChatRow(a, index);
     startNextArchive(a);
+    return null;
+}
+
+fn archiveSelectedChat(a: *App) void {
+    if (a.chat_count == 0 or a.selected_chat >= a.chat_count) return;
+    const chat = &a.chats[a.selected_chat];
+    const unarchive = a.show_archived or chat.archived;
+    if (archiveChat(a, chat.jid.slice(), unarchive)) |problem| return setStatus(a, problem);
+    setStatus(a, if (unarchive) "Unarchive queued" else "Archive queued");
+}
+
+// --------------------------------------------------------- wazigctl control
+// wazigctl.exe talks to the app over a per-user named pipe
+// (control_pipe.zig). Pipe threads post each request here as wm_control, so
+// every App access happens on the UI thread, and they do any waiting
+// themselves (never the UI thread). HARD RULE: nothing in this section may
+// focus, show or activate a window; state changes are silent and repaint
+// through InvalidateRect only. No command sends a message.
+
+const control_call_posted: u8 = 0;
+const control_call_answered: u8 = 1;
+const control_call_abandoned: u8 = 2;
+// How long a pipe thread keeps asking while the UI says "not ready yet".
+const control_wait_ms: u64 = 8_000;
+// How long a pipe thread waits for the UI thread to handle one message.
+const control_ui_timeout_ms: u32 = 10_000;
+
+const ControlCall = struct {
+    parsed: std.json.Parsed(control_api.Request),
+    out: std.Io.Writer.Allocating,
+    event: win.HANDLE,
+    // posted -> answered by the UI, or posted -> abandoned by a pipe thread
+    // that gave up waiting; whoever loses the race frees the call.
+    state: std.atomic.Value(u8) = .init(control_call_posted),
+    // Set by the UI thread: not ready yet (a chat still loading, a search
+    // still refiltering), ask again shortly.
+    retry: bool = false,
+    // Set by the UI thread: the WhatsApp list it needs is not in memory; the
+    // pipe thread runs a read-only wacli chats read into whatsapp_raw.
+    need_whatsapp: bool = false,
+    whatsapp_raw: []u8 = &.{},
+    // `messages <id>` selects first; `search` sets the text, then waits.
+    phase: enum { select, main, wait } = .main,
+};
+
+fn controlThreadMain(a: *App) void {
+    control_pipe.serve(a.allocator, a, controlHandle);
+}
+
+fn controlCallDestroy(a: *App, call: *ControlCall) void {
+    call.parsed.deinit();
+    call.out.deinit();
+    _ = win.CloseHandle(call.event);
+    if (call.whatsapp_raw.len > 0) a.allocator.free(call.whatsapp_raw);
+    a.allocator.destroy(call);
+}
+
+/// Pipe thread: one request line in, one reply line out.
+fn controlHandle(context: *anyopaque, line: []const u8, out: *std.Io.Writer.Allocating) void {
+    const a: *App = @ptrCast(@alignCast(context));
+    const w = &out.writer;
+    const parsed = control_api.parseRequest(a.allocator, line) catch {
+        control_api.writeError(w, "bad request; run wazigctl --help") catch {};
+        return;
+    };
+    const event = win.CreateEventW(null, win.FALSE, win.FALSE, null) orelse {
+        parsed.deinit();
+        control_api.writeError(w, "could not create an event") catch {};
+        return;
+    };
+    const call = a.allocator.create(ControlCall) catch {
+        parsed.deinit();
+        _ = win.CloseHandle(event);
+        control_api.writeError(w, "out of memory") catch {};
+        return;
+    };
+    call.* = .{ .parsed = parsed, .out = .init(a.allocator), .event = event };
+    var owned = true;
+    defer if (owned) controlCallDestroy(a, call);
+    if (call.parsed.value.cmd == .messages and call.parsed.value.id.len > 0) {
+        call.phase = .select;
+        const outcome = controlRound(a, call);
+        if (outcome == .abandoned) owned = false;
+        if (outcome != .answered or !control_api.responseOk(call.out.written())) return controlFinish(call, outcome, w);
+        call.phase = .main;
+    }
+    const outcome = controlRound(a, call);
+    if (outcome == .abandoned) owned = false;
+    controlFinish(call, outcome, w);
+}
+
+const ControlOutcome = enum { answered, abandoned, gone, too_slow, wacli_failed };
+
+fn controlFinish(call: *ControlCall, outcome: ControlOutcome, w: *std.Io.Writer) void {
+    const problem = switch (outcome) {
+        // An abandoned call belongs to the UI thread now; never read it.
+        .answered => return w.writeAll(call.out.written()) catch {},
+        .abandoned => "Wazig did not answer within 10 s",
+        .gone => "Wazig is closing",
+        .too_slow => "timed out waiting for the app (chat still loading?)",
+        .wacli_failed => "could not read the WhatsApp chat list",
+    };
+    control_api.writeError(w, problem) catch {};
+}
+
+/// Post the call to the UI thread, asking again every 200 ms while it says
+/// "not ready yet", for up to control_wait_ms.
+fn controlRound(a: *App, call: *ControlCall) ControlOutcome {
+    const hwnd = a.hwnd orelse return .gone;
+    const deadline = win.GetTickCount64() + control_wait_ms;
+    while (true) {
+        call.out.clearRetainingCapacity();
+        call.retry = false;
+        call.need_whatsapp = false;
+        call.state.store(control_call_posted, .release);
+        switch (control_pipe.callUi(hwnd, wm_control, call, call.event, control_ui_timeout_ms)) {
+            .gone => return .gone,
+            .timeout => {
+                if (call.state.cmpxchgStrong(control_call_posted, control_call_abandoned, .acq_rel, .acquire) == null) return .abandoned;
+                // The UI answered as the wait ran out: take its signal so the
+                // next round does not see it.
+                control_pipe.waitForever(call.event);
+            },
+            .done => {},
+        }
+        if (call.need_whatsapp) {
+            if (call.whatsapp_raw.len > 0) return .wacli_failed;
+            call.whatsapp_raw = controlReadWhatsAppChats(a, call.parsed.value.archived) orelse return .wacli_failed;
+            continue;
+        }
+        if (!call.retry) return .answered;
+        if (win.GetTickCount64() >= deadline) return .too_slow;
+        win.Sleep(200);
+    }
+}
+
+/// Pipe thread: the same read-only chats read refreshChats queues, for a
+/// list the sidebar is not showing (another view, --all, --archived).
+fn controlReadWhatsAppChats(a: *App, archived: bool) ?[]u8 {
+    const run = std.process.run(a.allocator, a.io, .{
+        .argv = &.{ a.wacli_path, "--json", "--read-only", "chats", "list", "--limit", "250", if (archived) "--archived" else "--no-archived" },
+        .stdout_limit = .limited(8 * 1024 * 1024),
+        .stderr_limit = .limited(64 * 1024),
+        .create_no_window = true,
+    }) catch return null;
+    a.allocator.free(run.stderr);
+    const ok = switch (run.term) {
+        .exited => |code| code == 0,
+        else => false,
+    };
+    if (ok and run.stdout.len > 0) return run.stdout;
+    a.allocator.free(run.stdout);
+    return null;
+}
+
+/// UI thread (wm_control): answer into call.out, then hand the call back.
+fn controlOnUi(a: *App, call: *ControlCall) void {
+    controlDispatch(a, call) catch {
+        call.out.clearRetainingCapacity();
+        control_api.writeError(&call.out.writer, "out of memory") catch {};
+    };
+    if (call.state.cmpxchgStrong(control_call_posted, control_call_answered, .acq_rel, .acquire) == null) {
+        _ = win.SetEvent(call.event);
+    } else controlCallDestroy(a, call);
+}
+
+fn controlDispatch(a: *App, call: *ControlCall) !void {
+    const request = &call.parsed.value;
+    const w = &call.out.writer;
+    // A Ctrl+O image still downloading opens the viewer, which takes the
+    // foreground, as soon as its chat loads. Commands that load a chat drop
+    // that deferred open so they can never raise a window; the download
+    // itself carries on and Ctrl+O opens it later.
+    if (call.phase == .select or request.cmd == .select or request.cmd == .search or request.cmd == .view) {
+        a.pending_viewer_open_jid.set("");
+        a.pending_viewer_open_id.set("");
+    }
+    // Loading a chat marks it read only once the user picked a chat
+    // (user_viewed). A refilter, view switch or archive can move the
+    // selection to another chat: that chat must not be marked read, so these
+    // commands clear the flag until the next real selection (a click, a
+    // send, or wazigctl select).
+    switch (request.cmd) {
+        .search, .view, .archive, .unarchive, .@"archive-many" => a.user_viewed = false,
+        else => {},
+    }
+    if (call.phase == .select) return controlSelect(a, call);
+    switch (request.cmd) {
+        .status => try controlStatus(a, w),
+        .chats => try controlChats(a, call),
+        .search => try controlSearch(a, call),
+        .view => try controlView(a, w, request.messenger),
+        .select => try controlSelect(a, call),
+        .messages => try controlMessages(a, call),
+        .archive, .unarchive => {
+            if (request.id.len == 0) return control_api.writeError(w, "needs a chat id");
+            if (archiveChat(a, request.id, request.cmd == .unarchive)) |problem| return control_api.writeError(w, problem);
+            try w.writeAll("{\"ok\":true,\"result\":{\"id\":");
+            try control_api.writeString(w, request.id);
+            try w.print(",\"queued\":\"{s}\"}}}}\n", .{@tagName(request.cmd)});
+        },
+        .@"archive-many" => try controlArchiveMany(a, w, request.ids),
+    }
+}
+
+fn controlProvider(messenger: control_api.Messenger) transport.Provider {
+    return switch (messenger) {
+        .whatsapp => .whatsapp,
+        .slack => .slack,
+        .telegram => .telegram,
+    };
+}
+
+fn controlWriteChat(a: *const App, w: *std.Io.Writer, chat: *const Chat) !void {
+    try w.writeAll("{\"id\":");
+    try control_api.writeString(w, chat.jid.slice());
+    try w.writeAll(",\"name\":");
+    try control_api.writeStringUtf16(w, chat.name.slice());
+    try w.writeAll(",\"kind\":");
+    try control_api.writeStringUtf16(w, chat.kind.slice());
+    try w.print(",\"messenger\":\"{s}\",\"unread\":{},\"unread_count\":{d},\"pinned\":{},\"archived\":{},\"last_message_time\":", .{
+        @tagName(chat.provider),           chat.unread or chat.unread_count > 0, chat.unread_count,
+        isChatPinned(a, chat.jid.slice()), chat.archived,
+    });
+    try control_api.writeString(w, chat.timestamp.slice());
+    try w.writeByte('}');
+}
+
+/// The sidebar search text as UTF-8 (empty when unset or unconvertible).
+fn controlSearchText(a: *App, buffer: *[1024]u8) []const u8 {
+    const search = a.search orelse return "";
+    var wide: [256]u16 = undefined;
+    const len: usize = @intCast(win.GetWindowTextW(search, &wide, wide.len));
+    const bytes = std.unicode.utf16LeToUtf8(buffer, wide[0..len]) catch return "";
+    return buffer[0..bytes];
+}
+
+fn controlStatus(a: *App, w: *std.Io.Writer) !void {
+    const sync = if (a.accounts_maintenance) "maintenance" else if (a.sync_logged_out) "logged_out" else if (a.sync_child != null) "running" else "stopped";
+    const pending_sends = a.pending_send_count + wacliPendingGet(a, .slack_send) + wacliPendingGet(a, .slack_attach);
+    try w.print("{{\"ok\":true,\"result\":{{\"version\":\"{s}\",\"view\":\"{s}\",\"selected\":", .{ app_version, @tagName(activeChatView(a)) });
+    if (a.selected_chat < a.chat_count) try controlWriteChat(a, w, &a.chats[a.selected_chat]) else try w.writeAll("null");
+    var buffer: [1024]u8 = undefined;
+    try w.print(",\"sync\":\"{s}\",\"slack_connected\":{},\"pending_sends\":{d},\"pending_archives\":{d},\"slack_chat_count\":{d},\"chat_count\":{d},\"show_archived\":{},\"unread_only\":{},\"search\":", .{
+        sync,               a.slack_connected.load(.acquire), pending_sends,   a.pending_archive_count,
+        a.slack_chat_count, a.chat_count,                     a.show_archived, a.unread_only,
+    });
+    try control_api.writeString(w, controlSearchText(a, &buffer));
+    try w.writeAll("}}\n");
+}
+
+fn controlMatches(a: *App, chat: *const Chat, query: []const u8) bool {
+    if (query.len == 0) return true;
+    if (containsIgnoreCase(chat.jid.slice(), query)) return true;
+    const name = std.unicode.utf16LeToUtf8Alloc(a.allocator, chat.name.slice()) catch return false;
+    defer a.allocator.free(name);
+    return containsIgnoreCase(name, query);
+}
+
+fn controlChats(a: *App, call: *ControlCall) !void {
+    const request = &call.parsed.value;
+    const w = &call.out.writer;
+    const active = activeChatView(a);
+    const view = if (request.messenger) |messenger| controlProvider(messenger) else active;
+    var list: std.ArrayList(Chat) = .empty;
+    defer list.deinit(a.allocator);
+    var query_buffer: [1024]u8 = undefined;
+    const query = controlSearchText(a, &query_buffer);
+    var filtered = query.len > 0 and !request.all;
+    if (view == active and request.archived == a.show_archived and !request.all) {
+        // Exactly what the sidebar shows, in its order.
+        try list.appendSlice(a.allocator, a.chats[0..a.chat_count]);
+        filtered = filtered or a.unread_only;
+    } else {
+        const wanted = if (request.all) "" else query;
+        switch (view) {
+            // Slack and Telegram have no archive yet: their archived list is empty.
+            .slack => if (!request.archived) for (a.slack_chats[0..a.slack_chat_count]) |*chat| {
+                if (controlMatches(a, chat, wanted)) try list.append(a.allocator, chat.*);
+            },
+            .telegram => if (!request.archived and telegramReady(a)) for (a.tg_chats[0..a.tg_chat_count]) |*cached| {
+                var chat = Chat{ .name = cached.name, .unread = cached.unread_count > 0, .unread_count = cached.unread_count, .provider = .telegram };
+                var id_buffer: [24]u8 = undefined;
+                chat.jid.set(tgChatIdString(&id_buffer, cached.id));
+                chat.kind.set(a.allocator, cached.kind.slice());
+                chat.timestamp.set(cached.timestamp.slice());
+                if (controlMatches(a, &chat, wanted)) try list.append(a.allocator, chat);
+            },
+            .whatsapp => {
+                if (call.whatsapp_raw.len == 0) {
+                    call.need_whatsapp = true;
+                    return;
+                }
+                controlWhatsAppChats(a, call.whatsapp_raw, wanted, &list) catch |err| switch (err) {
+                    error.OutOfMemory => return err,
+                    else => return control_api.writeError(w, "could not parse the WhatsApp chat list"),
+                };
+            },
+        }
+        controlSortChats(a, list.items);
+    }
+    const shown = @min(list.items.len, request.limit orelse std.math.maxInt(u32));
+    try w.print("{{\"ok\":true,\"result\":{{\"messenger\":\"{s}\",\"archived\":{},\"filtered\":{},\"total\":{d},\"chats\":[", .{ @tagName(view), request.archived, filtered, list.items.len });
+    for (list.items[0..shown], 0..) |*chat, index| {
+        if (index > 0) try w.writeByte(',');
+        try controlWriteChat(a, w, chat);
+    }
+    try w.writeAll("]}}\n");
+}
+
+/// Rows of a wacli `chats list` answer, named and filtered the way
+/// applyChats does it.
+fn controlWhatsAppChats(a: *App, raw: []const u8, query: []const u8, list: *std.ArrayList(Chat)) !void {
+    var parsed = try std.json.parseFromSlice(std.json.Value, a.allocator, raw, .{});
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |object| object,
+        else => return error.BadChatList,
+    };
+    const data = switch (root.get("data") orelse return error.BadChatList) {
+        .array => |items| items,
+        else => return error.BadChatList,
+    };
+    for (data.items) |item| {
+        const object = switch (item) {
+            .object => |object| object,
+            else => continue,
+        };
+        const jid = getString(object, "jid");
+        const display_name = groupName(a, jid) orelse getString(object, "name");
+        if (isUnresolvableChatEntry(display_name, jid, getString(object, "kind"))) continue;
+        if (query.len > 0 and !containsIgnoreCase(display_name, query) and !containsIgnoreCase(jid, query)) continue;
+        var chat = Chat{};
+        chat.jid.set(jid);
+        chat.name.set(a.allocator, display_name);
+        chat.kind.set(a.allocator, if (std.mem.endsWith(u8, jid, "@g.us")) "Group" else getString(object, "kind"));
+        chat.timestamp.set(getString(object, "last_message_ts"));
+        chat.unread = getBool(object, "unread");
+        chat.unread_count = getInt(object, "unread_count");
+        chat.archived = getBool(object, "archived");
+        try list.append(a.allocator, chat);
+    }
+}
+
+/// Sidebar order: pinned first, then most recent, jid as the tie-break.
+fn controlSortChats(a: *const App, chats: []Chat) void {
+    var i: usize = 1;
+    while (i < chats.len) : (i += 1) {
+        var j = i;
+        while (j > 0) : (j -= 1) {
+            const by_time = std.mem.order(u8, chats[j - 1].timestamp.slice(), chats[j].timestamp.slice());
+            const jid_order = std.mem.order(u8, chats[j - 1].jid.slice(), chats[j].jid.slice());
+            if (!chat_order.shouldMoveUp(isChatPinned(a, chats[j - 1].jid.slice()), isChatPinned(a, chats[j].jid.slice()), by_time, jid_order)) break;
+            std.mem.swap(Chat, &chats[j - 1], &chats[j]);
+        }
+    }
+}
+
+fn controlSearch(a: *App, call: *ControlCall) !void {
+    const w = &call.out.writer;
+    const search = a.search orelse return control_api.writeError(w, "the search box is not ready");
+    if (call.phase == .main) {
+        const wide = std.unicode.utf8ToUtf16LeAllocZ(a.allocator, call.parsed.value.text) catch
+            return control_api.writeError(w, "search text is not valid UTF-8");
+        defer a.allocator.free(wide);
+        _ = win.SetWindowTextW(search, wide.ptr);
+        // SetWindowText fires EN_CHANGE, which arms the typing debounce:
+        // refilter now, as its timer would, and wait for the read to land.
+        if (a.hwnd) |hwnd| _ = win.KillTimer(hwnd, timer_search);
+        refreshChats(a);
+        refreshMessages(a);
+        call.phase = .wait;
+        call.retry = true;
+        return;
+    }
+    if (wacliPendingGet(a, .chats) > 0) {
+        call.retry = true;
+        return;
+    }
+    var buffer: [1024]u8 = undefined;
+    try w.writeAll("{\"ok\":true,\"result\":{\"search\":");
+    try control_api.writeString(w, controlSearchText(a, &buffer));
+    try w.print(",\"chat_count\":{d}}}}}\n", .{a.chat_count});
+}
+
+fn controlView(a: *App, w: *std.Io.Writer, messenger: ?control_api.Messenger) !void {
+    const view = controlProvider(messenger orelse return control_api.writeError(w, "view needs whatsapp, slack or telegram"));
+    if (messenger_view.effective(view, slackConfigured(a), telegramReady(a)) != view)
+        return control_api.writeError(w, if (view == .slack) "Slack is not set up" else "Telegram is not signed in");
+    switchChatView(a, view);
+    try w.print("{{\"ok\":true,\"result\":{{\"view\":\"{s}\"}}}}\n", .{@tagName(view)});
+}
+
+/// The chat-list click, minus the composer focus: select, load, repaint.
+fn controlSelectIndex(a: *App, index: usize) void {
+    if (index != a.selected_chat) {
+        clearReply(a);
+        discardStagedImage(a);
+    }
+    a.selected_chat = index;
+    a.user_viewed = true;
+    a.view_selected[@intFromEnum(a.chats[index].provider)].set(a.chats[index].jid.slice());
+    if (a.chats_hwnd) |list| _ = win.SendMessageW(list, win.LB_SETCURSEL, index, 0);
+    refreshMessages(a);
+    if (a.hwnd) |hwnd| _ = win.InvalidateRect(hwnd, null, win.TRUE);
+}
+
+fn controlSelect(a: *App, call: *ControlCall) !void {
+    const w = &call.out.writer;
+    const id = call.parsed.value.id;
+    if (id.len == 0) return control_api.writeError(w, "needs a chat id");
+    var index = visibleChatIndex(a, id);
+    if (index == null) {
+        const provider = chatProvider(a, id);
+        if (provider != activeChatView(a)) {
+            if (messenger_view.effective(provider, slackConfigured(a), telegramReady(a)) != provider)
+                return control_api.writeError(w, if (provider == .slack) "Slack is not set up" else "Telegram is not signed in");
+            // Switching restores the view's remembered chat: make it this one.
+            a.view_selected[@intFromEnum(provider)].set(id);
+            switchChatView(a, provider);
+            index = visibleChatIndex(a, id);
+        }
+    }
+    const found = index orelse {
+        // A WhatsApp list read may still be on its way.
+        if (wacliPendingGet(a, .chats) > 0) {
+            call.retry = true;
+            return;
+        }
+        return control_api.writeError(w, "chat is not in the sidebar list (clear the search with: wazigctl search \"\", or check it is not archived)");
+    };
+    controlSelectIndex(a, found);
+    try w.writeAll("{\"ok\":true,\"result\":{\"selected\":");
+    try controlWriteChat(a, w, &a.chats[found]);
+    try w.writeAll("}}\n");
+}
+
+fn controlMessages(a: *App, call: *ControlCall) !void {
+    const request = &call.parsed.value;
+    const w = &call.out.writer;
+    if (a.selected_chat >= a.chat_count) return control_api.writeError(w, "no chat is selected");
+    const chat = &a.chats[a.selected_chat];
+    const wrong_chat = request.id.len > 0 and !std.mem.eql(u8, chat.jid.slice(), request.id);
+    if (wrong_chat or !std.mem.eql(u8, a.displayed_jid.slice(), chat.jid.slice())) {
+        call.retry = true;
+        return;
+    }
+    const count = @min(a.message_count, request.limit orelse max_messages);
+    try w.writeAll("{\"ok\":true,\"result\":{\"chat\":");
+    try controlWriteChat(a, w, chat);
+    try w.writeAll(",\"messages\":[");
+    for (a.messages[a.message_count - count .. a.message_count], 0..) |*message, index| {
+        if (index > 0) try w.writeByte(',');
+        try w.writeAll("{\"id\":");
+        try control_api.writeString(w, message.id.slice());
+        try w.writeAll(",\"sender\":");
+        try control_api.writeStringUtf16(w, message.sender.slice());
+        try w.writeAll(",\"sender_id\":");
+        try control_api.writeString(w, message.sender_jid.slice());
+        try w.writeAll(",\"time\":");
+        try control_api.writeString(w, message.timestamp.slice());
+        try w.writeAll(",\"text\":");
+        try control_api.writeStringUtf16(w, message.text.slice());
+        try w.writeAll(",\"media_type\":");
+        try control_api.writeString(w, message.media_type.slice());
+        try w.print(",\"from_me\":{},\"revoked\":{},\"send_state\":\"{s}\"}}", .{ message.from_me, message.revoked, @tagName(message.send_state) });
+    }
+    try w.writeAll("]}}\n");
+}
+
+fn controlArchiveMany(a: *App, w: *std.Io.Writer, ids: []const []const u8) !void {
+    if (ids.len == 0) return control_api.writeError(w, "needs at least one chat id");
+    const problems = try a.allocator.alloc(?[]const u8, ids.len);
+    defer a.allocator.free(problems);
+    var failed: usize = 0;
+    for (ids, problems) |id, *problem| {
+        problem.* = archiveChat(a, id, false);
+        if (problem.* != null) failed += 1;
+    }
+    if (failed == 0) try w.writeAll("{\"ok\":true,\"result\":{\"results\":[") else try w.print("{{\"ok\":false,\"error\":\"{d} of {d} chats could not be archived\",\"result\":{{\"results\":[", .{ failed, ids.len });
+    for (ids, problems, 0..) |id, problem, index| {
+        if (index > 0) try w.writeByte(',');
+        try w.writeAll("{\"id\":");
+        try control_api.writeString(w, id);
+        if (problem) |text| {
+            try w.writeAll(",\"ok\":false,\"error\":");
+            try control_api.writeString(w, text);
+            try w.writeByte('}');
+        } else try w.writeAll(",\"ok\":true}");
+    }
+    try w.writeAll("]}}\n");
 }
 
 fn appendPalette(a: *App, label: []const u8, shortcut: []const u8, command: u16) void {
@@ -12480,6 +12994,10 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
             applyUnfurlResult(a, result);
             return 0;
         },
+        wm_control => {
+            controlOnUi(a, @ptrFromInt(@as(usize, @bitCast(lparam))));
+            return 0;
+        },
         win.WM_POWERBROADCAST => {
             // WAZI-60: catch up right after the machine wakes; the hourly
             // timer alone can go a whole sleep cycle without firing.
@@ -12551,6 +13069,10 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
                 a.wacli_thread = std.Thread.spawn(.{ .stack_size = 1024 * 1024 }, wacliWorkerMain, .{ a, false }) catch null;
             }
             if (a.wacli_thread == null) setStatus(a, "Background reader failed to start");
+            // wazigctl control pipe: its threads only ever post wm_control here.
+            if (std.Thread.spawn(.{ .stack_size = 256 * 1024 }, controlThreadMain, .{a})) |thread| {
+                thread.detach();
+            } else |_| appendLaunchLog(a, "control pipe: thread failed to start");
             // WAZI-61: a second lane for Slack HTTP so a 429 backoff sleep
             // cannot stall wacli work (and vice versa).
             if (a.wacli_slack_thread == null) {

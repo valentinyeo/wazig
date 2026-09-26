@@ -136,13 +136,30 @@ pub fn build(b: *std.Build) void {
     }
     b.installArtifact(exe);
 
+    // wazigctl.exe: console CLI that drives the running app over its
+    // per-user control pipe (src/control.zig). Shipped next to Messages.exe.
+    const ctl = b.addExecutable(.{
+        .name = "wazigctl",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/wazigctl.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    ctl.subsystem = .console;
+    ctl.root_module.link_libc = true;
+    ctl.root_module.linkSystemLibrary("kernel32", .{});
+    const install_ctl = b.addInstallArtifact(ctl, .{});
+    b.getInstallStep().dependOn(&install_ctl.step);
+    b.step("wazigctl", "Build only wazigctl.exe").dependOn(&install_ctl.step);
+
     b.installFile("assets/IBMPlexSans-Regular.ttf", "bin/IBMPlexSans-Regular.ttf");
     b.installFile("assets/IBMPlexSans-SemiBold.ttf", "bin/IBMPlexSans-SemiBold.ttf");
     b.installFile("assets/IBM-Plex-LICENSE.txt", "bin/IBM-Plex-LICENSE.txt");
 
     // Tests live in Windows-free modules so they run on any host.
     const test_step = b.step("test", "Run unit tests");
-    for ([_][]const u8{ "src/chat_order.zig", "src/emoji_picker.zig", "src/played.zig", "src/pending_reads.zig", "src/update.zig", "src/avatar_mask.zig", "src/compose_layout.zig", "src/scrollbar.zig", "src/message_scroll.zig", "src/media_age.zig", "src/paste_image.zig", "src/telegram_json.zig", "src/accounts.zig", "src/slack.zig", "src/message_filter.zig", "src/chat_cache.zig", "src/unfurl.zig", "src/auth_status.zig", "src/messenger_view.zig", "src/shortcuts.zig", "src/sidebar_nav.zig", "src/sync_gate.zig" }) |test_root| {
+    for ([_][]const u8{ "src/chat_order.zig", "src/emoji_picker.zig", "src/played.zig", "src/pending_reads.zig", "src/update.zig", "src/avatar_mask.zig", "src/compose_layout.zig", "src/scrollbar.zig", "src/message_scroll.zig", "src/media_age.zig", "src/paste_image.zig", "src/telegram_json.zig", "src/accounts.zig", "src/slack.zig", "src/message_filter.zig", "src/chat_cache.zig", "src/unfurl.zig", "src/auth_status.zig", "src/messenger_view.zig", "src/shortcuts.zig", "src/sidebar_nav.zig", "src/sync_gate.zig", "src/control.zig" }) |test_root| {
         const tests = b.addTest(.{
             .root_module = b.createModule(.{
                 .root_source_file = b.path(test_root),
