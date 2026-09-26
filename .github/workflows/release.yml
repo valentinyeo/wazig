@@ -161,6 +161,9 @@ jobs:
           # The app is not running here, so status must say so with exit 3.
           & $ctl status 2>$null | Out-Null
           if ($LASTEXITCODE -ne 3) { throw "wazigctl status without the app returned $LASTEXITCODE, expected 3" }
+          # The expected exit 3 above is still in $LASTEXITCODE; the step would
+          # report it as a failure without an explicit success exit.
+          exit 0
       - name: Headless Telegram smoke
         # Telegram is off for now (not in use); flip back to re-enable.
         if: false
