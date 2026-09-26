@@ -349,6 +349,161 @@ fn truncateInto(buffer: []u8, text: []const u8) []const u8 {
     return buffer[0..n];
 }
 
+/// A callback for resolving a Slack user id ("U123") to a display name, used
+/// by `convertMrkdwn` for `<@U123>` mentions. A plain function pointer can't
+/// close over the caller's user list, so the caller (the app, which owns the
+/// user table) is passed through as an opaque context.
+pub const UserLookup = struct {
+    context: *anyopaque,
+    lookupFn: *const fn (context: *anyopaque, user_id: []const u8) ?[]const u8,
+
+    pub fn find(self: UserLookup, user_id: []const u8) ?[]const u8 {
+        return self.lookupFn(self.context, user_id);
+    }
+};
+
+/// Convert raw Slack mrkdwn markup to the plain display text Wazig shows in
+/// a message bubble:
+///   `<url|label>`      -> the url (Wazig's link detection only recognizes
+///                         visible URL text, so the label is dropped in
+///                         favor of keeping the link clickable)
+///   `<url>`             -> the url, unchanged
+///   `<@U123>`           -> `@<name>`, resolved through `users`; falls back
+///   `<@U123|name>`         to `@<given name>`, then to the raw id
+///   `<#C123|name>`      -> `#<name>`
+///   `<!here>` etc.      -> `@here` / `@channel` / `@everyone`
+///   `<!subteam^ID|@g>`  -> `@g`
+///   `<!date^...|text>`  -> `text` (the fallback)
+/// HTML entities (`&amp;` `&lt;` `&gt;`) are decoded in a second pass, after
+/// the angle-bracket markup is resolved, so a literal `&lt;` in the source
+/// text can never be mistaken for the start of markup. Writes into `buffer`
+/// and returns the slice used; truncates rather than splitting a multi-byte
+/// UTF-8 character when the result does not fit.
+pub fn convertMrkdwn(buffer: []u8, text: []const u8, users: ?UserLookup) []const u8 {
+    var stage1: [max_text + 1]u8 = undefined;
+    var stage1_len: usize = 0;
+    var index: usize = 0;
+    while (index < text.len) {
+        if (text[index] == '<') {
+            if (std.mem.indexOfScalarPos(u8, text, index, '>')) |close| {
+                const token = text[index + 1 .. close];
+                var token_buffer: [max_text + 1]u8 = undefined;
+                const rendered = renderMrkdwnToken(&token_buffer, token, users);
+                stage1_len = appendClamped(&stage1, stage1_len, rendered);
+                index = close + 1;
+                continue;
+            }
+        }
+        const rune_len = @min(utf8RuneLen(text[index]), text.len - index);
+        stage1_len = appendClamped(&stage1, stage1_len, text[index..][0..rune_len]);
+        index += rune_len;
+    }
+    return decodeHtmlEntities(buffer, stage1[0..stage1_len]);
+}
+
+/// Render the content of a single `<...>` Slack markup token (excluding the
+/// angle brackets). Unrecognized or malformed tokens pass through as their
+/// raw content so nothing silently disappears.
+fn renderMrkdwnToken(dest: []u8, token: []const u8, users: ?UserLookup) []const u8 {
+    if (token.len == 0) return copyClamped(dest, "<>");
+    switch (token[0]) {
+        '@' => {
+            const rest = token[1..];
+            const pipe = std.mem.indexOfScalar(u8, rest, '|');
+            const user_id = if (pipe) |p| rest[0..p] else rest;
+            const given_name = if (pipe) |p| rest[p + 1 ..] else null;
+            if (users) |lookup| {
+                if (lookup.find(user_id)) |resolved_name| return copyClampedPrefixed(dest, "@", resolved_name);
+            }
+            if (given_name) |name| return copyClampedPrefixed(dest, "@", name);
+            return copyClamped(dest, user_id);
+        },
+        '#' => {
+            const rest = token[1..];
+            const pipe = std.mem.indexOfScalar(u8, rest, '|');
+            const shown = if (pipe) |p| rest[p + 1 ..] else rest;
+            return copyClampedPrefixed(dest, "#", shown);
+        },
+        '!' => {
+            const rest = token[1..];
+            const pipe = std.mem.indexOfScalar(u8, rest, '|');
+            const kind = if (pipe) |p| rest[0..p] else rest;
+            const label = if (pipe) |p| rest[p + 1 ..] else null;
+            if (std.mem.eql(u8, kind, "here")) return copyClamped(dest, "@here");
+            if (std.mem.eql(u8, kind, "channel")) return copyClamped(dest, "@channel");
+            if (std.mem.eql(u8, kind, "everyone")) return copyClamped(dest, "@everyone");
+            if (label) |l| return copyClamped(dest, l);
+            return copyClamped(dest, kind);
+        },
+        else => {
+            const pipe = std.mem.indexOfScalar(u8, token, '|');
+            const url = if (pipe) |p| token[0..p] else token;
+            return copyClamped(dest, url);
+        },
+    }
+}
+
+/// The byte length of the UTF-8 rune starting at `byte`. Falls back to 1 for
+/// an invalid lead byte so callers always make forward progress.
+fn utf8RuneLen(byte: u8) usize {
+    if (byte & 0x80 == 0) return 1;
+    if (byte & 0xE0 == 0xC0) return 2;
+    if (byte & 0xF0 == 0xE0) return 3;
+    if (byte & 0xF8 == 0xF0) return 4;
+    return 1;
+}
+
+fn copyClamped(dest: []u8, text: []const u8) []const u8 {
+    const n = utf8Boundary(text, @min(text.len, dest.len));
+    @memcpy(dest[0..n], text[0..n]);
+    return dest[0..n];
+}
+
+fn copyClampedPrefixed(dest: []u8, prefix: []const u8, text: []const u8) []const u8 {
+    if (prefix.len >= dest.len) return copyClamped(dest, prefix);
+    @memcpy(dest[0..prefix.len], prefix);
+    const remaining = dest[prefix.len..];
+    const n = utf8Boundary(text, @min(text.len, remaining.len));
+    @memcpy(remaining[0..n], text[0..n]);
+    return dest[0 .. prefix.len + n];
+}
+
+/// Append as much of `text` as fits after `dest[0..dest_len]`, without
+/// splitting a multi-byte UTF-8 character, and return the new length.
+fn appendClamped(dest: []u8, dest_len: usize, text: []const u8) usize {
+    if (dest_len >= dest.len) return dest_len;
+    const remaining = dest.len - dest_len;
+    const n = utf8Boundary(text, @min(text.len, remaining));
+    @memcpy(dest[dest_len..][0..n], text[0..n]);
+    return dest_len + n;
+}
+
+fn decodeHtmlEntities(buffer: []u8, text: []const u8) []const u8 {
+    var out_len: usize = 0;
+    var index: usize = 0;
+    while (index < text.len) {
+        if (std.mem.startsWith(u8, text[index..], "&amp;")) {
+            out_len = appendClamped(buffer, out_len, "&");
+            index += 5;
+            continue;
+        }
+        if (std.mem.startsWith(u8, text[index..], "&lt;")) {
+            out_len = appendClamped(buffer, out_len, "<");
+            index += 4;
+            continue;
+        }
+        if (std.mem.startsWith(u8, text[index..], "&gt;")) {
+            out_len = appendClamped(buffer, out_len, ">");
+            index += 4;
+            continue;
+        }
+        const rune_len = @min(utf8RuneLen(text[index]), text.len - index);
+        out_len = appendClamped(buffer, out_len, text[index..][0..rune_len]);
+        index += rune_len;
+    }
+    return buffer[0..out_len];
+}
+
 /// Pull {"ok":true,"url":"wss://..."} into connection parts. Slices borrow
 /// the response buffer.
 pub const WsEndpoint = struct { host: []const u8, path_query: []const u8 };
@@ -837,6 +992,83 @@ test "historyItemBody falls back from text to file name to attachment summary" {
     try std.testing.expectEqualStrings("report.pdf", historyItemBody(.{ .file_name = "report.pdf" }, &buffer));
     try std.testing.expectEqualStrings("Example Page: A short description", historyItemBody(.{ .link_title = "Example Page", .link_text = "A short description" }, &buffer));
     try std.testing.expectEqualStrings("", historyItemBody(.{}, &buffer));
+}
+
+const TestUser = struct { id: []const u8, name: []const u8 };
+
+fn testUserLookup(context: *anyopaque, user_id: []const u8) ?[]const u8 {
+    const table: *const [1]TestUser = @ptrCast(@alignCast(context));
+    for (table) |entry| {
+        if (std.mem.eql(u8, entry.id, user_id)) return entry.name;
+    }
+    return null;
+}
+
+test "convertMrkdwn shows the url instead of the label, since links are detected from visible url text" {
+    var buffer: [256]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "https://www.tempdrop.com/",
+        convertMrkdwn(&buffer, "<https://www.tempdrop.com/|tempdrop.com>", null),
+    );
+    try std.testing.expectEqualStrings(
+        "New device: https://www.tempdrop.com/",
+        convertMrkdwn(&buffer, "New device: <https://www.tempdrop.com/|tempdrop.com>", null),
+    );
+}
+
+test "convertMrkdwn keeps a bare url" {
+    var buffer: [256]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "https://www.linkedin.com/posts/x?utm_source=share&utm_medium=member_desktop&rcm=y",
+        convertMrkdwn(&buffer, "<https://www.linkedin.com/posts/x?utm_source=share&amp;utm_medium=member_desktop&amp;rcm=y>", null),
+    );
+}
+
+test "convertMrkdwn resolves a user mention, falls back to the given name, then the raw id" {
+    var buffer: [256]u8 = undefined;
+    var table = [1]TestUser{.{ .id = "U4A59H6UT", .name = "Jane Doe" }};
+    const lookup = UserLookup{ .context = @ptrCast(&table), .lookupFn = testUserLookup };
+    try std.testing.expectEqualStrings(
+        "@Jane Doe this guy finally finished...",
+        convertMrkdwn(&buffer, "<@U4A59H6UT> this guy finally finished...", lookup),
+    );
+    try std.testing.expectEqualStrings("@Bob", convertMrkdwn(&buffer, "<@U999|Bob>", lookup));
+    try std.testing.expectEqualStrings("U999", convertMrkdwn(&buffer, "<@U999>", lookup));
+    try std.testing.expectEqualStrings("U999", convertMrkdwn(&buffer, "<@U999>", null));
+}
+
+test "convertMrkdwn converts channel mentions, special mentions and subteam/date tokens" {
+    var buffer: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("#general", convertMrkdwn(&buffer, "<#C123|general>", null));
+    try std.testing.expectEqualStrings("@here", convertMrkdwn(&buffer, "<!here>", null));
+    try std.testing.expectEqualStrings("@channel", convertMrkdwn(&buffer, "<!channel>", null));
+    try std.testing.expectEqualStrings("@everyone", convertMrkdwn(&buffer, "<!everyone>", null));
+    try std.testing.expectEqualStrings("@dev-team", convertMrkdwn(&buffer, "<!subteam^S123|@dev-team>", null));
+    try std.testing.expectEqualStrings("Feb 18th, 2014", convertMrkdwn(&buffer, "<!date^1392734382^{date}|Feb 18th, 2014>", null));
+    // Slack's older clients send a label alongside here/channel/everyone too.
+    try std.testing.expectEqualStrings("@here", convertMrkdwn(&buffer, "<!here|here>", null));
+    try std.testing.expectEqualStrings("@channel", convertMrkdwn(&buffer, "<!channel|channel>", null));
+}
+
+test "convertMrkdwn never truncates within the app's max message length" {
+    var buffer: [max_text + 1]u8 = undefined;
+    var long_text: [2000]u8 = undefined;
+    @memset(&long_text, 'a');
+    const result = convertMrkdwn(&buffer, &long_text, null);
+    try std.testing.expectEqual(@as(usize, 2000), result.len);
+    try std.testing.expect(std.mem.allEqual(u8, result, 'a'));
+}
+
+test "convertMrkdwn decodes html entities only after angle-bracket markup is resolved" {
+    var buffer: [256]u8 = undefined;
+    // An escaped `&lt;` must never turn into a live `<...>` token.
+    try std.testing.expectEqualStrings("<@U1> is not a mention", convertMrkdwn(&buffer, "&lt;@U1&gt; is not a mention", null));
+    try std.testing.expectEqualStrings("Tom & Jerry", convertMrkdwn(&buffer, "Tom &amp; Jerry", null));
+}
+
+test "convertMrkdwn leaves bold, italic and code markers alone" {
+    var buffer: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("*bold* _italic_ `code`", convertMrkdwn(&buffer, "*bold* _italic_ `code`", null));
 }
 
 test "readHistoryItem reads a file with no text as the body via its name" {

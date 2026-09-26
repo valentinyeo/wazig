@@ -3103,6 +3103,15 @@ fn slackUserName(a: *App, user_id: []const u8) ?[]const u8 {
     return null;
 }
 
+fn slackUserLookupFn(context: *anyopaque, user_id: []const u8) ?[]const u8 {
+    const a: *App = @ptrCast(@alignCast(context));
+    return slackUserName(a, user_id);
+}
+
+fn slackUserLookup(a: *App) slack.UserLookup {
+    return .{ .context = a, .lookupFn = slackUserLookupFn };
+}
+
 fn slackChatById(a: *App, channel_id: []const u8) ?*Chat {
     for (a.slack_chats[0..a.slack_chat_count]) |*chat| {
         if (std.mem.eql(u8, chat.jid.slice(), channel_id)) return chat;
@@ -3397,14 +3406,18 @@ fn buildSlackMessage(a: *App, item: slack.HistoryItem) Message {
     message.from_me = from_me;
     const name = if (from_me) "You" else (slackUserName(a, item.user) orelse (if (item.user.len > 0) item.user else "Slack"));
     message.sender.set(a.allocator, name);
+    const lookup = slackUserLookup(a);
     // A shared/forwarded Slack message renders as a quote block; the
     // message's own text, if any, stays as the body.
     if (item.share_text.len > 0 or item.share_sender.len > 0) {
-        message.quote.set(a.allocator, item.share_text);
+        var quote_buffer: [slack.max_text + 1]u8 = undefined;
+        message.quote.set(a.allocator, slack.convertMrkdwn(&quote_buffer, item.share_text, lookup));
         message.quote_sender.set(a.allocator, item.share_sender);
     }
-    var body_buffer: [900]u8 = undefined;
-    const text = slack.historyItemBody(item, &body_buffer);
+    var raw_buffer: [900]u8 = undefined;
+    const raw_text = slack.historyItemBody(item, &raw_buffer);
+    var body_buffer: [slack.max_text + 1]u8 = undefined;
+    const text = slack.convertMrkdwn(&body_buffer, raw_text, lookup);
     const is_thread_reply = item.thread_ts.len > 0 and !std.mem.eql(u8, item.thread_ts, item.ts);
     if (is_thread_reply and text.len > 0 and text.len + 4 <= slack.max_text) {
         var threaded: [slack.max_text + 4]u8 = undefined;
