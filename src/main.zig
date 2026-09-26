@@ -15,6 +15,7 @@ const webp_detect = @import("webp.zig");
 const paste_image = @import("paste_image.zig");
 const scrollbar = @import("scrollbar.zig");
 const message_scroll = @import("message_scroll.zig");
+const sidebar_nav = @import("sidebar_nav.zig");
 const message_filter = @import("message_filter.zig");
 const chat_cache = @import("chat_cache.zig");
 const unfurl = @import("unfurl.zig");
@@ -94,6 +95,10 @@ const update_restart_delay_ms: u32 = 10 * 1000;
 const update_first_check_delay_ms: u32 = 20 * 1000;
 const scrollbar_width: i32 = 8; // 6px thumb + 1px inset on each side
 const scrollbar_min_thumb: i32 = 24;
+// Rows the chat list scrolls per full wheel notch (Windows' own default
+// "lines to scroll" value); sidebar_nav.wheelRows accumulates sub-notch
+// deltas from smooth/precision touchpads until they add up to a whole notch.
+const chat_wheel_lines_per_notch: i32 = 3;
 const SbDrag = enum { none, chats, compose, palette, canvas, emoji };
 const update_max_asset_bytes: usize = 256 * 1024 * 1024;
 const id_search = 1008;
@@ -723,6 +728,9 @@ const App = struct {
     transcribe_attempts: [512]u64 = [_]u64{0} ** 512,
     transcribe_attempt_count: usize = 0,
     last_alt_g_ms: u64 = 0,
+    // Chat list wheel-scroll accumulator; see sidebar_nav.zig for the pure
+    // wheel-notch math.
+    chat_wheel_accum: i32 = 0,
     avatars: [max_avatars]AvatarEntry = [_]AvatarEntry{.{}} ** max_avatars,
     avatar_count: usize = 0,
     avatar_active_index: ?usize = null,
@@ -2090,6 +2098,7 @@ fn refreshTelegramMessages(a: *App) void {
     const chat_id = tgSelectedChatId(a) orelse return;
     const snapshot = client.historySnapshot(a.allocator, chat_id);
     defer client.freeHistorySnapshot(a.allocator, snapshot);
+    const chat_changed = !std.mem.eql(u8, a.displayed_jid.slice(), a.chats[a.selected_chat].jid.slice());
     var selected_id = Utf8Text(191){};
     if (a.selected_message) |selected| {
         if (selected < a.message_count) selected_id.set(a.messages[selected].id.slice());
@@ -2144,7 +2153,11 @@ fn refreshTelegramMessages(a: *App) void {
             }
         }
     }
-    a.scroll_y = 0;
+    // Preserve the reading position; only jump to the newest message when a
+    // different chat was opened. A new incoming message otherwise re-runs
+    // this exact refresh path for the still-open chat (see the callers
+    // above) and used to snap a scrolled-up reader straight to the bottom.
+    if (chat_changed) a.scroll_y = 0;
     a.displayed_jid.set(a.chats[a.selected_chat].jid.slice());
     a.displayed_timestamp.set(a.chats[a.selected_chat].timestamp.slice());
     if (a.canvas) |canvas| _ = win.InvalidateRect(canvas, null, win.TRUE);
@@ -8578,7 +8591,7 @@ fn insertEmoji(a: *App, emoji: []const u8) void {
 
 fn closeEmojiPicker(a: *App) void {
     if (a.emoji_wnd) |picker| _ = win.DestroyWindow(picker);
-    if (a.chats_hwnd) |list| _ = win.SetFocus(list);
+    focusCompose(a);
 }
 
 fn openEmojiPicker(a: *App) void {
@@ -9233,7 +9246,7 @@ fn closePalette(a: *App) void {
     if (a.palette) |palette| {
         _ = win.DestroyWindow(palette);
     }
-    if (a.chats_hwnd) |list| _ = win.SetFocus(list);
+    focusCompose(a);
 }
 
 fn paletteActivate(a: *App) void {
@@ -11963,8 +11976,28 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
         win.WM_ACTIVATE => {
             // WAZI-60: a laptop that sleeps at night checks on the first
             // focus after waking even if no power broadcast arrived.
-            if (loword(wparam) != win.WA_INACTIVE) startUpdateCheck(hwnd, false);
+            // The caret must always be blinking in the composer: every
+            // shortcut relies on a modifier key rather than a focus mode, so
+            // reactivating the window (Alt+Tab, clicking the taskbar,
+            // restoring from minimize) sends focus straight back there.
+            if (loword(wparam) != win.WA_INACTIVE) {
+                startUpdateCheck(hwnd, false);
+                focusCompose(a);
+            }
             return win.DefWindowProcW(hwnd, message, wparam, lparam);
+        },
+        win.WM_ACTIVATEAPP => {
+            // Alt+Tab back into the app from another application: WM_ACTIVATE
+            // alone doesn't always fire in that case, so this catches it too.
+            if (wparam != 0) focusCompose(a);
+            return win.DefWindowProcW(hwnd, message, wparam, lparam);
+        },
+        win.WM_SETFOCUS => {
+            // Belt and braces: whatever handed the main window focus (the
+            // taskbar, the shell after restoring from minimize), keep it
+            // moving straight through to the composer.
+            focusCompose(a);
+            return 0;
         },
         win.WM_CREATE => {
             a.hwnd = hwnd;
@@ -12477,6 +12510,27 @@ fn handleKeyboard(a: *App, message: *const win.MSG) bool {
         }
         return true;
     }
+    // Chat list navigation: heavy modifier combos so they work no matter
+    // what has focus (the composer always does, see focusCompose) without
+    // colliding with typing or the composer's own Home/End/PgUp/PgDn.
+    // Ctrl+Shift+Home/End jump to the first/last chat; Ctrl+PgUp/PgDn move
+    // one visible page. Plain Page Up/Down keep scrolling the chat (below).
+    if (control and shift and !alt and (key == win.VK_HOME or key == win.VK_END)) {
+        if (a.chat_count > 0) {
+            const target: i32 = if (key == win.VK_HOME) 0 else @intCast(a.chat_count - 1);
+            selectChat(a, target - @as(i32, @intCast(a.selected_chat)), false);
+            focusCompose(a);
+        }
+        return true;
+    }
+    if (control and !shift and !alt and (key == win.VK_PRIOR or key == win.VK_NEXT)) {
+        if (a.chats_hwnd) |list| {
+            const info = listboxScrollInfo(list);
+            selectChat(a, if (key == win.VK_PRIOR) -info.page else info.page, false);
+            focusCompose(a);
+        }
+        return true;
+    }
     // Chat history from the keyboard: Page Up/Down a screen, Ctrl+End back to
     // the newest message. Same path as the wheel, so older messages load the
     // same way. Ctrl+Up/Down walk the message highlight instead (above).
@@ -12604,7 +12658,7 @@ fn handleKeyboard(a: *App, message: *const win.MSG) bool {
             const is_emoji_picker = std.mem.eql(u16, class_name[0..class_len], std.mem.span(lit("MessagesEmojiPicker")));
             if (is_palette or is_emoji_picker) {
                 _ = win.DestroyWindow(root);
-                if (a.chats_hwnd) |list| _ = win.SetFocus(list);
+                focusCompose(a);
                 return true;
             }
         }
@@ -12713,7 +12767,7 @@ fn handleKeyboard(a: *App, message: *const win.MSG) bool {
                     setStatus(a, "Pasted image discarded");
                     return true;
                 }
-                if (a.chats_hwnd) |list| _ = win.SetFocus(list);
+                focusCompose(a);
                 return true;
             }
             return false;
@@ -12726,7 +12780,7 @@ fn handleKeyboard(a: *App, message: *const win.MSG) bool {
                 return true;
             }
             if (key == win.VK_ESCAPE) {
-                if (a.chats_hwnd) |list| _ = win.SetFocus(list);
+                focusCompose(a);
                 return true;
             }
             return false;
@@ -13424,8 +13478,8 @@ pub fn main(init: std.process.Init) !void {
 
     var message: win.MSG = undefined;
     while (win.GetMessageW(&message, null, 0, 0) > 0) {
-        // Scroll the conversation when the cursor is over it, no matter
-        // which control holds keyboard focus.
+        // Scroll the conversation, or the chat list, when the cursor is over
+        // it, no matter which control holds keyboard focus.
         if (message.message == win.WM_MOUSEWHEEL and app.canvas != null) {
             const wheel_point = win.POINT{
                 .x = @as(i16, @bitCast(loword(@as(usize, @bitCast(message.lParam))))),
@@ -13439,6 +13493,22 @@ pub fn main(init: std.process.Init) !void {
                 _ = win.InvalidateRect(app.canvas.?, null, win.TRUE);
                 continue;
             }
+            if (app.chats_hwnd) |list| {
+                var list_rect: win.RECT = undefined;
+                _ = win.GetWindowRect(list, &list_rect);
+                if (wheel_point.x >= list_rect.left and wheel_point.x <= list_rect.right and wheel_point.y >= list_rect.top and wheel_point.y <= list_rect.bottom) {
+                    const wheel_delta: i16 = @bitCast(hiword(@as(usize, @bitCast(message.wParam))));
+                    const step = sidebar_nav.wheelRows(app.chat_wheel_accum, @as(i32, wheel_delta), @as(i32, win.WHEEL_DELTA), chat_wheel_lines_per_notch);
+                    app.chat_wheel_accum = step.remainder;
+                    if (step.rows != 0) {
+                        const info = listboxScrollInfo(list);
+                        const max_top = @max(0, info.total - info.page);
+                        setListboxTop(list, std.math.clamp(info.top - step.rows, 0, max_top));
+                        _ = win.InvalidateRect(list, null, win.TRUE);
+                    }
+                    continue;
+                }
+            }
         }
         // Telegram sign-in dialog first: Tab/Enter/Escape are dialog
         // navigation and IsDialogMessageW dispatches them itself.
@@ -13446,8 +13516,16 @@ pub fn main(init: std.process.Init) !void {
             if (win.IsDialogMessageW(login_wnd, &message) != 0) continue;
         }
         if (handleKeyboard(&app, &message)) continue;
+        // The chat list is a native listbox: clicking it (even to reselect
+        // the already-selected chat, which never fires LBN_SELCHANGE) sets
+        // native keyboard focus to it. The caret must always stay in the
+        // composer, so let the click do its job (select the chat) and then
+        // send focus straight back.
+        const clicked_chat_list = message.message == win.WM_LBUTTONDOWN and
+            app.chats_hwnd != null and message.hwnd == app.chats_hwnd.?;
         _ = win.TranslateMessage(&message);
         _ = win.DispatchMessageW(&message);
+        if (clicked_chat_list) focusCompose(&app);
     }
 }
 
