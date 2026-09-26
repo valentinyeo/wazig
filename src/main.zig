@@ -3408,7 +3408,7 @@ fn applySlackUsers(a: *App, raw: []const u8) bool {
     return true;
 }
 
-const slack_workspace_types = "public_channel,private_channel,im";
+const slack_workspace_types = "public_channel,private_channel,mpim,im";
 
 fn refreshSlackWorkspace(a: *App) void {
     if (!slackConfigured(a)) return;

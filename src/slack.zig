@@ -809,10 +809,19 @@ pub const WorkspaceChannel = struct {
     seconds: i64,
 };
 
-/// Read one conversations.list entry; null when it has no id.
+/// Read one conversations.list entry; null when it has no id, or when it is
+/// a channel the user has not joined. Unjoined public channels are most of a
+/// large workspace; listing them used to fill the chat table before the DMs,
+/// which Slack returns last, ever got a slot.
 pub fn workspaceChannel(object: std.json.ObjectMap) ?WorkspaceChannel {
     const id = objectStringField(object, "id");
     if (id.len == 0) return null;
+    if (id[0] != 'D') {
+        if (object.get("is_member")) |member| switch (member) {
+            .bool => |joined| if (!joined) return null,
+            else => {},
+        };
+    }
     return .{
         .id = id,
         .name = objectStringField(object, "name"),
@@ -1291,4 +1300,22 @@ test "failure line names kind, error and status only" {
     var buffer: [96]u8 = undefined;
     try std.testing.expectEqualStrings("slack: workspace failed: NetworkFailed (HTTP 200)", formatJobFailure(&buffer, "workspace", "NetworkFailed", 200));
     try std.testing.expectEqualStrings("slack: users failed: OutOfMemory", formatJobFailure(&buffer, "users", "OutOfMemory", 0));
+}
+
+test "workspaceChannel skips unjoined channels but keeps DMs and joined channels" {
+    const raw =
+        \\{"channels":[
+        \\{"id":"C1","name":"general","is_member":true},
+        \\{"id":"C2","name":"random","is_member":false},
+        \\{"id":"D1","user":"U1","is_im":true},
+        \\{"id":"G1","name":"mpdm-a--b-1","is_mpim":true,"is_member":true}
+        \\]}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, raw, .{});
+    defer parsed.deinit();
+    const items = parsed.value.object.get("channels").?.array.items;
+    try std.testing.expect(workspaceChannel(items[0].object) != null);
+    try std.testing.expect(workspaceChannel(items[1].object) == null);
+    try std.testing.expect(workspaceChannel(items[2].object).?.is_im);
+    try std.testing.expect(workspaceChannel(items[3].object) != null);
 }
