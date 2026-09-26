@@ -46,11 +46,11 @@ pub const help_text = blk: {
         \\
         \\Controls the running Wazig Messages app over a local pipe without
         \\focusing or showing its window. Output is one JSON line on stdout;
-        \\exit code 0 on success, 1 when the app reports an error, 2 on bad
-        \\usage, 3 when the app is not running.
+        \\exit code 0 on success, 1 when the app reports an error or does not
+        \\answer within 45 s, 2 on bad usage, 3 when the app is not running.
         \\
-        \\Nothing here sends messages, reactions or replies. Selecting a chat
-        \\marks it read, as clicking it in the app does.
+        \\Nothing here sends messages, reactions or replies. Only `select`
+        \\and `messages <id>` mark a chat read, as clicking it in the app does.
         \\
         \\Commands:
         \\

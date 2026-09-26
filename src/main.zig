@@ -9683,6 +9683,15 @@ fn controlDispatch(a: *App, call: *ControlCall) !void {
         a.pending_viewer_open_jid.set("");
         a.pending_viewer_open_id.set("");
     }
+    // Loading a chat marks it read only once the user picked a chat
+    // (user_viewed). A refilter, view switch or archive can move the
+    // selection to another chat: that chat must not be marked read, so these
+    // commands clear the flag until the next real selection (a click, a
+    // send, or wazigctl select).
+    switch (request.cmd) {
+        .search, .view, .archive, .unarchive, .@"archive-many" => a.user_viewed = false,
+        else => {},
+    }
     if (call.phase == .select) return controlSelect(a, call);
     switch (request.cmd) {
         .status => try controlStatus(a, w),
@@ -9928,7 +9937,7 @@ fn controlSelect(a: *App, call: *ControlCall) !void {
         }
         return control_api.writeError(w, "chat is not in the sidebar list (clear the search with: wazigctl search \"\", or check it is not archived)");
     };
-    if (found != a.selected_chat or !std.mem.eql(u8, a.displayed_jid.slice(), id)) controlSelectIndex(a, found);
+    controlSelectIndex(a, found);
     try w.writeAll("{\"ok\":true,\"result\":{\"selected\":");
     try controlWriteChat(a, w, &a.chats[found]);
     try w.writeAll("}}\n");

@@ -12,6 +12,7 @@ const exit_ok: u8 = 0;
 const exit_app_error: u8 = 1;
 const exit_usage: u8 = 2;
 const exit_not_running: u8 = 3;
+const answer_timeout_ms: win.DWORD = 45_000;
 
 pub fn main(init: std.process.Init.Minimal) u8 {
     var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -45,6 +46,9 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     control.writeRequest(&request_line.writer, request) catch return fail(exit_usage, "out of memory");
 
     const pipe = connect() orelse return exit_not_running;
+    // The app answers within ~20 s even when a chat is slow to load; a hung
+    // wacli read must still not hang the caller forever.
+    if (std.Thread.spawn(.{ .stack_size = 64 * 1024 }, watchdog, .{})) |thread| thread.detach() else |_| {}
     defer _ = win.CloseHandle(pipe);
     control_pipe.writeAll(pipe, request_line.written());
 
@@ -65,6 +69,12 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     printTo(win.STD_ERROR_HANDLE, control.responseError(line));
     printTo(win.STD_ERROR_HANDLE, "\n");
     return exit_app_error;
+}
+
+fn watchdog() void {
+    win.Sleep(answer_timeout_ms);
+    _ = fail(exit_app_error, "Wazig did not answer within 45 s");
+    win.ExitProcess(exit_app_error);
 }
 
 /// Open the app's pipe, waiting briefly while every instance is busy.
