@@ -7876,22 +7876,26 @@ fn removeFirstPendingSend(a: *App) void {
 /// checks for a duplicate before spawning that retry. After max_send_retries,
 /// mark its bubble failed, drop it, and hand the text back to the composer.
 /// The send is never silently lost.
-fn failHeadPendingSend(a: *App, code: u32, ambiguous: bool, detail: []const u8) void {
+/// `auth_failed` skips the retry entirely: the account is logged out, so
+/// every retry would hit the same error until the user reconnects.
+fn failHeadPendingSend(a: *App, code: u32, ambiguous: bool, detail: []const u8, auth_failed: bool) void {
     a.pending_sends[0].retries += 1;
     a.pending_sends[0].ambiguous = ambiguous;
     const retries = a.pending_sends[0].retries;
     var log_buffer: [320]u8 = undefined;
     const event = std.fmt.bufPrint(&log_buffer, "send: failed exit {d} retry {d}: {s}", .{ code, retries, detail }) catch "send: failed";
     appendLaunchLog(a, event);
-    if (sendRetryDelayMs(retries)) |delay_ms| {
-        a.pending_sends[0].not_before_ms = win.GetTickCount64() + delay_ms;
-        var retry_buffer: [80]u8 = undefined;
-        const status = std.fmt.bufPrint(&retry_buffer, "Sending, retry {d} of {d}", .{ retries, max_send_retries - 1 }) catch "Sending, retrying";
-        setStatus(a, status);
-        markPendingSendRetrying(a, &a.pending_sends[0]);
-        // A direct send had paused live sync; let it run during the backoff.
-        startSync(a);
-        return;
+    if (!auth_failed) {
+        if (sendRetryDelayMs(retries)) |delay_ms| {
+            a.pending_sends[0].not_before_ms = win.GetTickCount64() + delay_ms;
+            var retry_buffer: [80]u8 = undefined;
+            const status = std.fmt.bufPrint(&retry_buffer, "Sending, retry {d} of {d}", .{ retries, max_send_retries - 1 }) catch "Sending, retrying";
+            setStatus(a, status);
+            markPendingSendRetrying(a, &a.pending_sends[0]);
+            // A direct send had paused live sync; let it run during the backoff.
+            startSync(a);
+            return;
+        }
     }
     const failed = a.pending_sends[0];
     markPendingSendFailed(a, &failed);
@@ -7899,14 +7903,20 @@ fn failHeadPendingSend(a: *App, code: u32, ambiguous: bool, detail: []const u8) 
     removeFirstPendingSend(a);
     restoreFailedSendText(a, &failed);
     var status_buffer: [400]u8 = undefined;
-    const status = std.fmt.bufPrint(&status_buffer, "Message to {s} failed to send - text copied back to the box", .{failed.jid.slice()}) catch "Message failed to send - text copied back to the box";
+    const status = if (auth_failed)
+        "WhatsApp logged out. Press Ctrl+K to reconnect"
+    else
+        std.fmt.bufPrint(&status_buffer, "Message to {s} failed to send - text copied back to the box", .{failed.jid.slice()}) catch "Message failed to send - text copied back to the box";
     setStatus(a, status);
     // Do not refreshMessages here: a reload would wipe the failed bubble.
     if (a.pending_send_count > 0) {
         startNextSend(a);
     } else {
         drainMediaDownloads(a);
-        startSync(a);
+        // startSync's own success status ("Live sync running") would
+        // overwrite the auth message set above in the same tick, and sync is
+        // halted anyway once the account is known logged out (WAZI-82).
+        if (!auth_failed) startSync(a);
     }
 }
 
@@ -8050,7 +8060,7 @@ fn startNextSend(a: *App) void {
         .stderr = .pipe,
         .create_no_window = true,
     }) catch {
-        failHeadPendingSend(a, 1, false, "spawn failed");
+        failHeadPendingSend(a, 1, false, "spawn failed", false);
         return;
     };
     a.send_child = child;
@@ -8102,6 +8112,10 @@ fn checkSend(a: *App) void {
         // A store-lock failure never left the machine, so it isn't ambiguous.
         // A timeout, or any other nonzero exit, might have delivered anyway.
         const ambiguous = timed_out or !has_lock;
+        // Logged out never resolves itself: every retry would hit the same
+        // "not authenticated" error until the user reconnects, so don't
+        // retry.
+        const auth_failed = !sendFailureRetryable(a.sync_logged_out, stdout_output, stderr_output);
         var snippet_buffer: [send_log_snippet_len]u8 = undefined;
         // Log only wacli's error output (stderr), never stdout (its --json
         // result), and never anything that echoes the message text.
@@ -8118,8 +8132,9 @@ fn checkSend(a: *App) void {
         else
             "no error output";
         // Every failure (lock, timeout, or otherwise) stays queued and is
-        // retried, up to max_send_retries, with the next attempt spaced out.
-        failHeadPendingSend(a, code, ambiguous, detail);
+        // retried, up to max_send_retries, with the next attempt spaced out,
+        // unless the account is logged out (auth_failed): that fails once.
+        failHeadPendingSend(a, code, ambiguous, detail, auth_failed);
         return;
     }
     if (a.pending_send_count == 0) return;
@@ -8132,6 +8147,25 @@ fn outputHasStoreLock(output: ?[]const u8) bool {
     const text = output orelse return false;
     return std.mem.indexOf(u8, text, "store is locked") != null or
         std.mem.indexOf(u8, text, "store lock") != null;
+}
+
+/// True when wacli's error text says the WhatsApp account is logged out
+/// ("not authenticated; run `wacli auth`").
+fn isAuthFailureText(text: []const u8) bool {
+    return std.mem.indexOf(u8, text, "not authenticated") != null;
+}
+
+/// True when a send failure can be retried. False when the account is
+/// logged out: every retry would repeat the same "not authenticated" error
+/// until the user reconnects. `sync_logged_out` covers a disconnect live
+/// sync's own login probe already confirmed (WAZI-82); `stdout`/`stderr` are
+/// the send child's own output. Pure text/bool check with no App state, so
+/// the retry decision is directly testable.
+fn sendFailureRetryable(sync_logged_out: bool, stdout: ?[]const u8, stderr: ?[]const u8) bool {
+    if (sync_logged_out) return false;
+    if (stdout) |text| if (isAuthFailureText(text)) return false;
+    if (stderr) |text| if (isAuthFailureText(text)) return false;
+    return true;
 }
 
 fn deleteFileUtf8(path_utf8: []const u8) void {
@@ -15583,6 +15617,13 @@ test "a read that exhausts its retries backs off and restarts the counter" {
     try std.testing.expectEqual(@as(u8, 1), nextReadRetry(0));
     try std.testing.expectEqual(@as(u8, 2), nextReadRetry(1));
     try std.testing.expectEqual(@as(u8, 0), nextReadRetry(2));
+}
+
+test "a send failure is retryable unless the account is logged out" {
+    try std.testing.expect(sendFailureRetryable(false, null, null));
+    try std.testing.expect(sendFailureRetryable(false, "{\"success\":true}", "store is locked"));
+    try std.testing.expect(!sendFailureRetryable(false, "{\"success\":false,\"error\":\"not authenticated; run `wacli auth`\"}", null));
+    try std.testing.expect(!sendFailureRetryable(true, null, "store is locked"));
 }
 
 test "a send retries 3 times with a longer backoff each time, then gives up" {
