@@ -921,6 +921,15 @@ const App = struct {
     sync_heartbeat_restart_secs: i64 = 0,
     sync_heartbeat_unreadable: bool = false,
     sync_logged_out: bool = false,
+    // Set by the sync stderr reader thread when wacli says the session is
+    // gone ("logged_out" event or "not authenticated"); checkSync consumes
+    // it on the UI thread.
+    sync_auth_lost: std.atomic.Value(bool) = .init(false),
+    // The `wacli auth` pairing window. Sync stays off while it runs (it holds
+    // the store lock); when it exits, an auth status probe decides whether
+    // sync resumes (pairing_probe marks that probe).
+    pairing_process: ?win.HANDLE = null,
+    pairing_probe: bool = false,
     store_watch_path: WideText(519) = .{},
     last_store_write: u64 = 0,
     // WAZI-67: a chats read that fails on the first launch after an update
@@ -2022,7 +2031,8 @@ fn applyChats(a: *App, raw: []const u8) bool {
     if (a.chat_count != a.last_chat_count) {
         a.last_chat_count = a.chat_count;
         const status = std.fmt.bufPrint(&status_buffer, "{d} chats", .{a.chat_count}) catch "Chats loaded";
-        setStatus(a, status);
+        // Keep the logged-out hint visible over the first chat-list load.
+        setStatus(a, if (a.sync_logged_out) logged_out_status else status);
     }
     return true;
 }
@@ -5630,6 +5640,8 @@ fn avatarIndex(a: *const App, entry: *const AvatarEntry) usize {
 // answer (picture, no picture, failure) is cached on disk so a relaunch or
 // reinstall does not ask WhatsApp again (see avatarForChat).
 fn requestNextAvatar(a: *App) void {
+    // Picture fetches need a live session; failures would be cached on disk.
+    if (a.sync_logged_out or a.pairing_process != null) return;
     if (avatarBusy(a) or avatarBatchBlocked(a)) return;
     const now = win.GetTickCount64();
     if (!sync_gate.avatarBatchMayStart(a.last_sync_stop_ms, a.avatar_batch_end_ms, a.avatar_retry_after_ms, now)) return;
@@ -7631,7 +7643,11 @@ fn syncStderrMain(a: *App, stderr: std.Io.File) void {
             error.ReadFailed => return,
         };
         const line = std.mem.trimEnd(u8, raw orelse return, "\r");
-        if (line.len == 0 or logged >= sync_stderr_line_cap) continue;
+        if (line.len == 0) continue;
+        var parse_buffer: [16 * 1024]u8 = undefined;
+        var parse_allocator = std.heap.FixedBufferAllocator.init(&parse_buffer);
+        if (auth_status.syncLineLoggedOut(parse_allocator.allocator(), line)) a.sync_auth_lost.store(true, .release);
+        if (logged >= sync_stderr_line_cap) continue;
         logged += 1;
         const text = line[0..@min(line.len, sync_stderr_line_max_bytes)];
         var event_buffer: [6 + sync_stderr_line_max_bytes]u8 = undefined;
@@ -7641,6 +7657,9 @@ fn syncStderrMain(a: *App, stderr: std.Io.File) void {
 }
 
 fn startSync(a: *App) void {
+    // A logged-out session fails at once on every start, so nothing restarts
+    // sync until pairing succeeds or the user restarts it from the palette.
+    if (a.sync_logged_out or a.pairing_process != null) return;
     // Hold off while any write job is pending: they pause live sync and
     // serialize on the store lock, so don't fight them. checkSync restarts
     // sync once the last job finishes.
@@ -7710,7 +7729,6 @@ fn startSync(a: *App) void {
     a.sync_heartbeat_ticks = 0;
     a.sync_heartbeat_mtime = 0;
     a.sync_heartbeat_unreadable = false;
-    a.sync_logged_out = false;
     setStatus(a, "Live sync running");
 }
 
@@ -7778,7 +7796,54 @@ fn checkSyncHeartbeat(a: *App) void {
     stopSync(a, "heartbeat");
 }
 
+const logged_out_status = "WhatsApp logged out. Press Ctrl+K, Manage accounts, Reconnect WhatsApp";
+
+/// The WhatsApp session is gone (revoked, or never re-paired): stop sync,
+/// keep it stopped, and point the user at the pairing window.
+fn markWhatsAppLoggedOut(a: *App) void {
+    if (!a.sync_logged_out) appendLaunchLog(a, "sync: WhatsApp logged out, live sync halted");
+    a.sync_logged_out = true;
+    stopSync(a, "logged out");
+    setStatus(a, logged_out_status);
+    if (a.canvas) |canvas| _ = win.InvalidateRect(canvas, null, win.TRUE);
+}
+
+fn checkPairing(a: *App) void {
+    const handle = a.pairing_process orelse return;
+    if (win.WaitForSingleObject(handle, 0) != win.WAIT_OBJECT_0) return;
+    _ = win.CloseHandle(handle);
+    a.pairing_process = null;
+    appendLaunchLog(a, "accounts: pairing window closed");
+    // The account may differ now: keep the launch cache off until the probe
+    // verifies it (WAZI-67), and let its answer decide whether sync resumes.
+    a.cache_tag.set("");
+    a.pairing_probe = true;
+    enqueueCacheTagProbe(a);
+    setStatus(a, "Pairing window closed - checking WhatsApp login");
+}
+
+/// Answer of the auth probe that follows the pairing window.
+fn applyPairingProbe(a: *App, ok: bool, data: []const u8) void {
+    a.pairing_probe = false;
+    var parsed = std.json.parseFromSlice(std.json.Value, a.allocator, data, .{}) catch null;
+    defer if (parsed) |*value| value.deinit();
+    const unauthenticated = if (ok and parsed != null) auth_status.unauthenticated(parsed.?.value) else null;
+    if (unauthenticated == true) {
+        a.sync_logged_out = true;
+        setStatus(a, "WhatsApp is still not linked. Press Ctrl+K, Manage accounts, Reconnect WhatsApp");
+        return;
+    }
+    // Linked, or the probe could not tell: try sync once. A session that is
+    // still gone reports "not authenticated" and halts again without a loop.
+    a.sync_logged_out = false;
+    a.sync_fail_count = 0;
+    a.last_sync_refresh_ms = null;
+    startSync(a);
+}
+
 fn checkSync(a: *App) void {
+    checkPairing(a);
+    if (a.sync_auth_lost.swap(false, .acq_rel)) markWhatsAppLoggedOut(a);
     if (mediaBusy(a) or a.read_child != null or (a.send_child != null and a.send_direct) or a.archive_child != null or a.pending_archive_count > 0 or avatarBusy(a)) return;
     // WAZI-82: while halted after repeated fast deaths, stay stopped; only
     // the auth probe answer or an explicit palette command restarts sync.
@@ -7839,11 +7904,10 @@ fn applySyncAuthProbe(a: *App, ok: bool, data: []const u8) void {
         else => std.json.Value{ .bool = false },
     };
     if (authenticated != .bool or authenticated.bool == false) {
-        a.sync_logged_out = true;
-        setStatus(a, "WhatsApp is logged out - press Ctrl+K, Manage accounts, Reconnect WhatsApp");
-    } else {
-        setStatus(a, "Live sync keeps stopping - press Ctrl+K and pick Restart live sync");
+        markWhatsAppLoggedOut(a);
+        return;
     }
+    setStatus(a, "Live sync keeps stopping - press Ctrl+K and pick Restart live sync");
     if (a.canvas) |canvas| _ = win.InvalidateRect(canvas, null, win.TRUE);
 }
 
@@ -10682,26 +10746,44 @@ fn removeWhatsAppAccount(a: *App) void {
 }
 
 fn addWhatsAppAccount(a: *App) void {
+    if (a.pairing_process != null) {
+        setStatus(a, "Pairing window is already open - scan the QR code there");
+        return;
+    }
+    // wacli auth holds the store lock while it pairs and bootstraps.
+    stopSync(a, "pairing");
     // WAZI-82: pairing is the escape hatch from a halted sync loop, so it
     // must clear the halt or checkSync would stay stopped after a relink.
     a.sync_fail_count = 0;
-    a.sync_logged_out = false;
     const exe_wide = utf8ToWide(a.allocator, a.wacli_path) catch {
         setStatus(a, "Could not open the pairing window");
         return;
     };
     defer a.allocator.free(exe_wide);
+    // `auth` shows the QR; the default 30s idle exit closed it before most
+    // people could scan. CreateProcessW may write to the command line, so it
+    // is a heap copy, and argv[0] comes first or Go would drop `auth`.
+    const command_utf8 = std.fmt.allocPrint(a.allocator, "\"{s}\" auth --idle-exit 10m", .{a.wacli_path}) catch {
+        setStatus(a, "Could not open the pairing window");
+        return;
+    };
+    defer a.allocator.free(command_utf8);
+    const command_wide = utf8ToWide(a.allocator, command_utf8) catch {
+        setStatus(a, "Could not open the pairing window");
+        return;
+    };
+    defer a.allocator.free(command_wide);
     var startup: win.STARTUPINFOW = std.mem.zeroes(win.STARTUPINFOW);
     startup.cb = @sizeOf(win.STARTUPINFOW);
     var process: win.PROCESS_INFORMATION = std.mem.zeroes(win.PROCESS_INFORMATION);
     const create_new_console: win.DWORD = 0x00000010;
-    if (win.CreateProcessW(exe_wide.ptr, null, null, null, win.FALSE, create_new_console, null, null, &startup, &process) != 0) {
-        _ = win.CloseHandle(process.hProcess);
+    if (win.CreateProcessW(exe_wide.ptr, command_wide.ptr, null, null, win.FALSE, create_new_console, null, null, &startup, &process) != 0) {
         _ = win.CloseHandle(process.hThread);
-        // Gate sync off from here until pairing recreates the store:
-        // startSync clears the flag once wacli.db exists again.
-        a.accounts_maintenance = true;
-        setStatus(a, "Pairing window opened - scan the QR code there, then restart Messages");
+        // Sync stays off while the window is open; checkPairing probes the
+        // login when it closes and resumes sync if pairing worked.
+        a.pairing_process = process.hProcess;
+        appendLaunchLog(a, "accounts: pairing window opened");
+        setStatus(a, "Pairing window opened - scan the QR code, then close that window to start live sync");
     } else {
         setStatus(a, "Could not open the pairing window");
     }
@@ -11273,7 +11355,7 @@ fn runCommand(a: *App, command: u16) void {
             stopSync(a, "reconnect");
             // WAZI-82: a logged-out session cannot be fixed by restarting the
             // sync child; run the pairing window so the QR flow can relink.
-            if (a.sync_logged_out) {
+            if (a.sync_logged_out or a.pairing_process != null) {
                 addWhatsAppAccount(a);
             } else {
                 a.sync_fail_count = 0;
@@ -13098,6 +13180,7 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
                 .reaction => applyReaction(a, result),
                 .cache_tag => {
                     if (a.sync_auth_probe and result.gen == a.cache_tag_gen) applySyncAuthProbe(a, result.ok, result.data);
+                    if (a.pairing_probe and result.gen == a.cache_tag_gen) applyPairingProbe(a, result.ok, result.data);
                     if (result.ok and result.gen == a.cache_tag_gen) {
                         var parsed = std.json.parseFromSlice(std.json.Value, a.allocator, result.data, .{}) catch return 0;
                         defer parsed.deinit();
@@ -13302,6 +13385,7 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
             refreshMessages(a);
             _ = storeChanged(a);
             startSync(a);
+            if (a.sync_logged_out) setStatus(a, logged_out_status);
             startUpdateCheck(hwnd, false);
             loadSlackTokens(a);
             if (slackConfigured(a)) {
@@ -14373,7 +14457,7 @@ const cache_tag_timeout_ms: win.DWORD = 5000;
 /// is null and the launch cache stays disabled: a snapshot written for an
 /// unknown account must never be shown under the identity of a later
 /// unknown-or-different account.
-fn findCacheTag(init: std.process.Init, wacli_path: []u8, scratch_dir: []const u8) !?[]u8 {
+fn findCacheTag(init: std.process.Init, wacli_path: []u8, scratch_dir: []const u8, logged_out: *bool) !?[]u8 {
     const out_path = try std.fs.path.join(init.gpa, &.{ scratch_dir, "auth-status.tmp" });
     defer init.gpa.free(out_path);
     const cwd = std.Io.Dir.cwd();
@@ -14404,6 +14488,9 @@ fn findCacheTag(init: std.process.Init, wacli_path: []u8, scratch_dir: []const u
     deleteFileUtf8(out_path);
     var parsed = std.json.parseFromSlice(std.json.Value, init.gpa, data, .{}) catch return null;
     defer parsed.deinit();
+    // A revoked session keeps its store but answers authenticated:false;
+    // starting sync on it only loops on "not authenticated".
+    logged_out.* = auth_status.unauthenticated(parsed.value) == true;
     const jid = auth_status.linkedJid(parsed.value) orelse return null;
     if (jid.len == 0) return null;
     return try std.fmt.allocPrint(init.gpa, "{x:0>16}", .{std.hash.Wyhash.hash(0, jid)});
@@ -14503,7 +14590,8 @@ pub fn main(init: std.process.Init) !void {
     // Not freed: the detached sync-stderr reader thread may still log via
     // avatar_dir during teardown; the process reclaims it.
     const avatar_dir = try createAvatarDirectory(init, init.gpa);
-    const cache_tag = try findCacheTag(init, wacli_path, std.fs.path.dirname(avatar_dir) orelse return error.MissingMessagesDir);
+    var startup_logged_out = false;
+    const cache_tag = try findCacheTag(init, wacli_path, std.fs.path.dirname(avatar_dir) orelse return error.MissingMessagesDir, &startup_logged_out);
     defer if (cache_tag) |tag| init.gpa.free(tag);
     const slack_media_dir = try createSlackMediaDirectory(init, init.gpa);
     defer init.gpa.free(slack_media_dir);
@@ -14534,6 +14622,10 @@ pub fn main(init: std.process.Init) !void {
         app.cache_tag.set(tag);
         appendLaunchLog(&app, "startup: account tag found");
     } else appendLaunchLog(&app, "startup: no account tag (auth status failed or unlinked)");
+    if (startup_logged_out) {
+        app.sync_logged_out = true;
+        appendLaunchLog(&app, "startup: WhatsApp logged out, live sync halted");
+    }
     loadEmojiRecents(&app);
     if (init.environ_map.get("LOCALAPPDATA")) |local| {
         if (std.fs.path.join(init.gpa, &.{ local, "Messages", "telegram" })) |telegram_dir| {
