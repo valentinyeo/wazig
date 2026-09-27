@@ -13798,6 +13798,36 @@ fn restoreComposeCaret(a: *App) void {
     _ = win.SendMessageW(compose, win.EM_SETSEL, @bitCast(start), @bitCast(end));
 }
 
+fn isWordBreakChar(c: u16) bool {
+    return c == ' ' or c == '\t' or c == '\r' or c == '\n';
+}
+
+/// Ctrl+Backspace's word-delete: a plain EDIT control has none, and left to
+/// the default proc it turns into a WM_CHAR carrying the DEL control
+/// character, which the control shows as a small box glyph. With an active
+/// selection this instead deletes just that, matching plain Backspace.
+fn deleteWordBeforeCaret(edit: win.HWND) void {
+    var start: usize = 0;
+    var end: usize = 0;
+    _ = win.SendMessageW(edit, win.EM_GETSEL, @intFromPtr(&start), @bitCast(@intFromPtr(&end)));
+    if (start != end) {
+        _ = win.SendMessageW(edit, win.EM_REPLACESEL, win.TRUE, @bitCast(@intFromPtr(lit(""))));
+        return;
+    }
+    if (start == 0) return;
+    var wide_buffer: [4096]u16 = undefined;
+    const length: usize = @intCast(win.GetWindowTextW(edit, &wide_buffer, wide_buffer.len));
+    // GetWindowTextW truncates past the buffer; on text longer than that,
+    // bail rather than delete the wrong word. The keydown is still swallowed
+    // either way, so no box glyph appears.
+    if (start > length) return;
+    var word_start = start;
+    while (word_start > 0 and isWordBreakChar(wide_buffer[word_start - 1])) word_start -= 1;
+    while (word_start > 0 and !isWordBreakChar(wide_buffer[word_start - 1])) word_start -= 1;
+    _ = win.SendMessageW(edit, win.EM_SETSEL, @bitCast(word_start), @bitCast(start));
+    _ = win.SendMessageW(edit, win.EM_REPLACESEL, win.TRUE, @bitCast(@intFromPtr(lit(""))));
+}
+
 fn handleKeyboard(a: *App, message: *const win.MSG) bool {
     if (message.message != win.WM_KEYDOWN and message.message != win.WM_SYSKEYDOWN) return false;
     const key: u32 = @intCast(message.wParam);
@@ -13901,6 +13931,30 @@ fn handleKeyboard(a: *App, message: *const win.MSG) bool {
             _ = win.SendMessageW(search, win.EM_SETSEL, 0, @bitCast(@as(isize, -1)));
         }
         return true;
+    }
+    // Ctrl+A selects all text in whichever text field has focus: the
+    // composer, the sidebar search box, or the emoji picker's search field.
+    // Plain Win32 EDIT controls don't support this on their own.
+    if (control and !alt and !shift and key == 'A') {
+        const in_text_field = (a.compose != null and focus == a.compose.?) or
+            (a.search != null and focus == a.search.?) or
+            (a.emoji_edit != null and focus == a.emoji_edit.?);
+        if (in_text_field) {
+            _ = win.SendMessageW(focus.?, win.EM_SETSEL, 0, @bitCast(@as(isize, -1)));
+            return true;
+        }
+    }
+    // Ctrl+Backspace deletes the previous word in the same three fields:
+    // left to the default EDIT control it inserts a box glyph instead (see
+    // deleteWordBeforeCaret).
+    if (control and !alt and key == win.VK_BACK) {
+        const in_text_field = (a.compose != null and focus == a.compose.?) or
+            (a.search != null and focus == a.search.?) or
+            (a.emoji_edit != null and focus == a.emoji_edit.?);
+        if (in_text_field) {
+            deleteWordBeforeCaret(focus.?);
+            return true;
+        }
     }
     if (control and key == 'K') {
         openPalette(a);

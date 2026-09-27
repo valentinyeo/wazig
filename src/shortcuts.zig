@@ -45,6 +45,7 @@ pub const groups = [_]Group{
     .{ .name = "Composer", .items = &[_]Shortcut{
         .{ .key = "Enter", .desc = "Send the message, or focus the composer if it isn't focused" },
         .{ .key = "Shift+Enter", .desc = "Insert a new line" },
+        .{ .key = "Ctrl+A", .desc = "Select all text in the message box" },
         .{ .key = "C", .desc = "Focus the composer" },
         .{ .key = "Ctrl+V", .desc = "Paste a copied image to send" },
         .{ .key = "Esc", .desc = "Cancel the reply or discard a pasted image" },
