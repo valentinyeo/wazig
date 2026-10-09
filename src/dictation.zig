@@ -176,16 +176,23 @@ fn captureMicrophone(self: *Session) ![]u8 {
 }
 
 fn transcribe(allocator: std.mem.Allocator, api_key: []const u8, language: Language, content_type: []const u8, body: []const u8) ![]u8 {
+    return switch (language) {
+        // Detection can pick a language and return no words (a 72 s Spanish note did); multi still hears it.
+        .automatic => transcribeAt(allocator, api_key, lit("/v1/listen?model=nova-3&smart_format=true&detect_language=true"), content_type, body) catch |err| switch (err) {
+            error.NoSpeech => transcribeAt(allocator, api_key, lit("/v1/listen?model=nova-3&smart_format=true&language=multi"), content_type, body),
+            else => err,
+        },
+        .english => transcribeAt(allocator, api_key, lit("/v1/listen?model=nova-3&smart_format=true&language=en"), content_type, body),
+        .german => transcribeAt(allocator, api_key, lit("/v1/listen?model=nova-3&smart_format=true&language=de"), content_type, body),
+    };
+}
+
+fn transcribeAt(allocator: std.mem.Allocator, api_key: []const u8, request_path: [*:0]const u16, content_type: []const u8, body: []const u8) ![]u8 {
     const session = win.WinHttpOpen(lit("Wazig Messages/0.3"), win.WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, null, null, 0) orelse return error.NetworkFailed;
     defer _ = win.WinHttpCloseHandle(session);
     _ = win.WinHttpSetTimeouts(session, 10_000, 10_000, 30_000, 120_000);
     const connection = win.WinHttpConnect(session, lit("api.deepgram.com"), win.INTERNET_DEFAULT_HTTPS_PORT, 0) orelse return error.NetworkFailed;
     defer _ = win.WinHttpCloseHandle(connection);
-    const request_path = switch (language) {
-        .automatic => lit("/v1/listen?model=nova-3&smart_format=true&detect_language=true"),
-        .english => lit("/v1/listen?model=nova-3&smart_format=true&language=en"),
-        .german => lit("/v1/listen?model=nova-3&smart_format=true&language=de"),
-    };
     const request = win.WinHttpOpenRequest(connection, lit("POST"), request_path, null, null, null, win.WINHTTP_FLAG_SECURE) orelse return error.NetworkFailed;
     defer _ = win.WinHttpCloseHandle(request);
 
