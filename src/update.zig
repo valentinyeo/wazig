@@ -3,10 +3,12 @@
 //
 // Release contract with the live WAZI-26 release workflow: a release tagged
 // "vMAJOR.MINOR.PATCH" (no pre-release suffix) with one asset named
-// "Messages-<something>.zip" that contains the zig-out/bin contents.
+// "Messages-<something>.zip" that contains the zig-out/bin contents, plus
+// "Messages_arm64-<something>.zip" for Windows on ARM. The "_" keeps x64
+// builds from before the ARM zip existed from ever matching it.
 const std = @import("std");
 
-pub const zip_asset_prefix = "Messages-";
+pub const zip_asset_prefix = if (@import("builtin").cpu.arch == .aarch64) "Messages_arm64-" else "Messages-";
 
 pub fn isZipAssetName(name: []const u8) bool {
     return std.mem.startsWith(u8, name, zip_asset_prefix) and std.mem.endsWith(u8, name, ".zip");
@@ -312,6 +314,8 @@ test isZipAssetName {
     try std.testing.expect(!isZipAssetName("Messages-v0.0.0"));
     try std.testing.expect(!isZipAssetName("SHA256SUMS.txt"));
     try std.testing.expect(!isZipAssetName("Other-v1.0.0.zip"));
+    // An x64 install must never update itself to the ARM build.
+    if (@import("builtin").cpu.arch != .aarch64) try std.testing.expect(!isZipAssetName("Messages_arm64-v0.0.0.zip"));
 }
 
 /// WAZI-66: outcome of waiting on the global updater mutex. WAIT_ABANDONED
