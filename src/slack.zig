@@ -614,12 +614,12 @@ pub fn buildMarkBody(allocator: std.mem.Allocator, channel_id: []const u8, ts: [
     return std.fmt.allocPrint(allocator, "{{\"channel\":\"{s}\",\"ts\":\"{s}\"}}", .{ channel_id, ts });
 }
 
-/// A ts worth marking must be all digits with at most one dot; optimistic
-/// bubbles carry an empty id and a malformed value must never reach Slack.
+/// A ts worth marking has numeric seconds and a nonempty numeric fraction;
+/// optimistic bubbles carry an empty id and malformed values stay local.
 fn isMarkTs(ts: []const u8) bool {
     if (ts.len == 0) return false;
-    const dot = std.mem.indexOfScalar(u8, ts, '.') orelse ts.len;
-    if (dot == 0) return false;
+    const dot = std.mem.indexOfScalar(u8, ts, '.') orelse return false;
+    if (dot == 0 or dot + 1 == ts.len) return false;
     for (ts[0..dot]) |character| if (character < '0' or character > '9') return false;
     for (ts[dot + 1 ..]) |character| if (character < '0' or character > '9') return false;
     return true;
@@ -642,7 +642,7 @@ pub const MarkStep = enum { skip, arm, rearm };
 
 pub fn markDebounce(stored_channel: []const u8, stored_ts: []const u8, channel: []const u8, ts: []const u8) MarkStep {
     if (channel.len == 0 or !isMarkTs(ts)) return .skip;
-    if (std.mem.eql(u8, stored_channel, channel) and std.mem.eql(u8, stored_ts, ts)) return .skip;
+    if (std.mem.eql(u8, stored_channel, channel) and stored_ts.len > 0 and compareTs(ts, stored_ts) != .gt) return .skip;
     if (stored_ts.len == 0) return .arm;
     return .rearm;
 }
@@ -1388,6 +1388,19 @@ test "markDebounce arms a fresh target, skips a repeated one and re-arms a chang
     try std.testing.expectEqual(MarkStep.skip, markDebounce("", "", "C123", ""));
     try std.testing.expectEqual(MarkStep.skip, markDebounce("", "", "", "1740000000.000123"));
     try std.testing.expectEqual(MarkStep.skip, markDebounce("C123", "1740000000.000123", "C123", "garbage"));
+}
+
+test "mark timestamps require a nonempty numeric fraction" {
+    for ([_][]const u8{ "1740000000", "1740000000.", "1740000000..1", "1740000000.1x", "" }) |ts| {
+        try std.testing.expectEqualStrings("", newerMarkTs("", ts));
+        try std.testing.expectEqual(MarkStep.skip, markDebounce("", "", "C123", ts));
+    }
+    try std.testing.expectEqualStrings("1740000000.000124", newerMarkTs("1740000000.000123", "1740000000.000124"));
+}
+
+test "mark debounce never lowers the target when history omits a newer reply" {
+    try std.testing.expectEqual(MarkStep.skip, markDebounce("C123", "1740000000.000124", "C123", "1740000000.000123"));
+    try std.testing.expectEqual(MarkStep.rearm, markDebounce("C123", "1740000000.000124", "C456", "1740000000.000123"));
 }
 
 test "mark body carries channel and ts" {

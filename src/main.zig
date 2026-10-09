@@ -863,11 +863,11 @@ const App = struct {
     // Hash of the last applied bridge history answer; 0 after anything else
     // may have repainted the message list.
     slack_history_hash: u64 = 0,
-    // WAZI-104: debounced conversations.mark target for the viewed Slack
-    // chat. Stays stored after the mark fires, so an unchanged view never
-    // sends the same mark twice.
+    // UI-owned target, retained only within one view to suppress repeat polls.
     slack_mark_channel: Utf8Text(191) = .{},
     slack_mark_ts: Utf8Text(191) = .{},
+    slack_mark_gen: u64 = 0,
+    slack_mark_due_ms: u64 = 0,
     slack_stop: std.atomic.Value(bool) = .init(false),
     slack_connected: std.atomic.Value(bool) = .init(false),
     slack_event_pending: std.atomic.Value(usize) = .init(0),
@@ -1445,6 +1445,13 @@ fn wacliEnqueue(a: *App, job: WacliJob, urgent: bool) void {
     var dropped_emoji = Utf8Text(63){};
     a.wacli_mutex.lockUncancelable(a.io);
     if (a.wacli_queue_len >= a.wacli_queue.len) {
+        // A best-effort read receipt must never evict a send or reaction.
+        if (job.kind == .slack_mark) {
+            a.wacli_mutex.unlock(a.io);
+            cancelSlackMark(a);
+            logSlackFailure(a, job.kind, "QueueFull", 0);
+            return;
+        }
         // Superseded refreshes are droppable; reactions are dropped only as a
         // last resort: the victim's pending count drops to zero, so the
         // checkSync timer restarts live sync within a second either way.
@@ -4506,11 +4513,23 @@ fn markChatRead(a: *App) void {
 // call per view (WAZI-104).
 const slack_mark_debounce_ms: u32 = 750;
 
-/// Remembers the newest displayed ts of the open Slack chat as the debounce
-/// target and (re)starts the quiet-period timer; the timer expiry enqueues
-/// one conversations.mark (fireSlackMark). markChatRead's user_viewed gate
-/// has already run: startup and background refreshes never land here.
+fn cancelSlackMark(a: *App) void {
+    if (a.hwnd) |hwnd| _ = win.KillTimer(hwnd, timer_slack_mark);
+    a.slack_mark_channel.set("");
+    a.slack_mark_ts.set("");
+    a.slack_mark_gen += 1;
+    a.slack_mark_due_ms = 0;
+}
+
+fn slackMarkViewMatches(a: *App, channel: []const u8) bool {
+    if (!a.user_viewed or a.chat_selection_pending or !selectedChatIsSlack(a)) return false;
+    return std.mem.eql(u8, a.chats[a.selected_chat].jid.slice(), channel) and
+        std.mem.eql(u8, a.displayed_jid.slice(), channel);
+}
+
+/// Debounce only messages belonging to the explicitly selected, loaded chat.
 fn requestSlackMark(a: *App, channel: []const u8) void {
+    if (!slackMarkViewMatches(a, channel)) return;
     var newest: []const u8 = "";
     for (a.messages[0..a.message_count]) |*message| {
         newest = slack.newerMarkTs(newest, message.id.slice());
@@ -4518,24 +4537,41 @@ fn requestSlackMark(a: *App, channel: []const u8) void {
     if (slack.markDebounce(a.slack_mark_channel.slice(), a.slack_mark_ts.slice(), channel, newest) == .skip) return;
     a.slack_mark_channel.set(channel);
     a.slack_mark_ts.set(newest);
+    a.slack_mark_due_ms = win.GetTickCount64() + slack_mark_debounce_ms;
     if (a.hwnd) |hwnd| {
         _ = win.KillTimer(hwnd, timer_slack_mark);
-        _ = win.SetTimer(hwnd, timer_slack_mark, slack_mark_debounce_ms, null);
+        if (win.SetTimer(hwnd, timer_slack_mark, slack_mark_debounce_ms, null) == 0) {
+            cancelSlackMark(a);
+            logSlackFailure(a, .slack_mark, "TimerFailed", 0);
+        }
     }
 }
 
-/// The quiet period ended: send one mark for the stored target. The target
-/// stays stored so an unchanged view never repeats the request; a view that
-/// ended into search or another messenger (user_viewed false again) is not
-/// marked. Failures are best effort and land in the launch log.
+/// Keep a fired target only within this view; a canceled or failed target
+/// must not suppress a later attempt. Results correlate by generation and ts.
 fn fireSlackMark(a: *App) void {
     const channel = a.slack_mark_channel.slice();
     const ts = a.slack_mark_ts.slice();
-    if (channel.len == 0 or ts.len == 0) return;
-    if (!a.user_viewed) return;
-    if (!slackConfigured(a)) return;
-    var job = WacliJob{ .kind = .slack_mark };
+    if (channel.len == 0 or ts.len == 0 or a.slack_mark_due_ms == 0) return;
+    if (!slackMarkViewMatches(a, channel) or !slackConfigured(a)) {
+        cancelSlackMark(a);
+        return;
+    }
+    // KillTimer does not remove an already queued WM_TIMER from an older arm.
+    const now = win.GetTickCount64();
+    if (now < a.slack_mark_due_ms) {
+        if (a.hwnd) |hwnd| {
+            if (win.SetTimer(hwnd, timer_slack_mark, @intCast(a.slack_mark_due_ms - now), null) == 0) {
+                cancelSlackMark(a);
+                logSlackFailure(a, .slack_mark, "TimerFailed", 0);
+            }
+        }
+        return;
+    }
+    a.slack_mark_due_ms = 0;
+    var job = WacliJob{ .kind = .slack_mark, .gen = a.slack_mark_gen };
     job.jid.set(channel);
+    job.msg_id.set(ts);
     wacliJobArgs(&job, &.{ channel, ts });
     wacliEnqueue(a, job, false);
 }
@@ -7396,6 +7432,8 @@ fn advanceGifs(a: *App) void {
 }
 
 fn refreshMessages(a: *App) void {
+    // A fresh view must retry even if its previous receipt failed or was canceled.
+    cancelSlackMark(a);
     if (a.chat_count == 0 or a.selected_chat >= a.chat_count) {
         clearMessages(a);
         a.displayed_jid.set("");
@@ -8846,6 +8884,7 @@ fn selectChat(a: *App, delta: i32, wrap: bool) void {
         next = std.math.clamp(next, 0, count - 1);
     }
     if (next != a.selected_chat) discardStagedImage(a);
+    cancelSlackMark(a);
     a.selected_chat = @intCast(next);
     a.user_viewed = true;
     if (a.chats_hwnd) |list| {
@@ -13326,7 +13365,11 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
                         }
                     }
                 },
-                .slack_mark => {}, // Best effort: failures already hit the launch log above.
+                .slack_mark => {
+                    if (!result.ok and result.gen == a.slack_mark_gen and
+                        std.mem.eql(u8, result.jid.slice(), a.slack_mark_channel.slice()) and
+                        std.mem.eql(u8, result.msg_id.slice(), a.slack_mark_ts.slice())) cancelSlackMark(a);
+                },
             }
             return 0;
         },
