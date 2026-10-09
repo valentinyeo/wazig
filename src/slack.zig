@@ -606,6 +606,47 @@ pub fn buildCompleteUploadBody(allocator: std.mem.Allocator, file_id: []const u8
     return std.fmt.allocPrint(allocator, "{{\"files\":[{{\"id\":\"{s}\"}}],\"channel_id\":\"{s}\",\"thread_ts\":\"{s}\",\"initial_comment\":\"{s}\"}}", .{ file_id, channel_id, thread_ts, escaped_caption });
 }
 
+// --- conversations.mark (WAZI-104): mark the viewed Slack chat read ---
+
+/// Body for conversations.mark: the channel and the newest message ts the
+/// user has on screen.
+pub fn buildMarkBody(allocator: std.mem.Allocator, channel_id: []const u8, ts: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{{\"channel\":\"{s}\",\"ts\":\"{s}\"}}", .{ channel_id, ts });
+}
+
+/// A ts worth marking has numeric seconds and a nonempty numeric fraction;
+/// optimistic bubbles carry an empty id and malformed values stay local.
+fn isMarkTs(ts: []const u8) bool {
+    if (ts.len == 0) return false;
+    const dot = std.mem.indexOfScalar(u8, ts, '.') orelse return false;
+    if (dot == 0 or dot + 1 == ts.len) return false;
+    for (ts[0..dot]) |character| if (character < '0' or character > '9') return false;
+    for (ts[dot + 1 ..]) |character| if (character < '0' or character > '9') return false;
+    return true;
+}
+
+/// Fold step picking the ts to mark: the newest real message ts displayed.
+/// Empty or malformed candidates (queued sends, junk) never win.
+pub fn newerMarkTs(current: []const u8, candidate: []const u8) []const u8 {
+    if (!isMarkTs(candidate)) return current;
+    if (current.len == 0) return candidate;
+    return if (compareTs(candidate, current) == .gt) candidate else current;
+}
+
+/// One debounce decision for mark-as-read. The open chat keeps refreshing
+/// its history, and quick chat switches replace the pending target, so the
+/// caller stores the target and (re)starts one quiet-period timer on arm
+/// and rearm, fires when the timer expires, and keeps the target stored
+/// afterwards: an unchanged view must not send the same mark twice.
+pub const MarkStep = enum { skip, arm, rearm };
+
+pub fn markDebounce(stored_channel: []const u8, stored_ts: []const u8, channel: []const u8, ts: []const u8) MarkStep {
+    if (channel.len == 0 or !isMarkTs(ts)) return .skip;
+    if (std.mem.eql(u8, stored_channel, channel) and stored_ts.len > 0 and compareTs(ts, stored_ts) != .gt) return .skip;
+    if (stored_ts.len == 0) return .arm;
+    return .rearm;
+}
+
 pub const UploadGrant = struct { upload_url: []const u8, file_id: []const u8 };
 
 /// Read files.getUploadURLExternal response {upload_url, file_id}. Both
@@ -1318,4 +1359,52 @@ test "workspaceChannel skips unjoined channels but keeps DMs and joined channels
     try std.testing.expect(workspaceChannel(items[1].object) == null);
     try std.testing.expect(workspaceChannel(items[2].object).?.is_im);
     try std.testing.expect(workspaceChannel(items[3].object) != null);
+}
+
+test "newerMarkTs picks the newest real ts and skips bubbles without one" {
+    try std.testing.expectEqualStrings("", newerMarkTs("", ""));
+    try std.testing.expectEqualStrings("1740000000.000123", newerMarkTs("", "1740000000.000123"));
+    // A pending send bubble has no ts yet and must never win the fold.
+    try std.testing.expectEqualStrings("1740000000.000123", newerMarkTs("1740000000.000123", ""));
+    try std.testing.expectEqualStrings("1740000000.000123", newerMarkTs("1740000000.000123", "1740000000.000122"));
+    try std.testing.expectEqualStrings("1740000000.000123", newerMarkTs("1740000000.000123", "1739999999.999999"));
+    // Malformed values lose to every real ts and stay out of an empty fold.
+    try std.testing.expectEqualStrings("1740000000.000123", newerMarkTs("1740000000.000123", "garbage"));
+    try std.testing.expectEqualStrings("", newerMarkTs("", "garbage"));
+    try std.testing.expectEqualStrings("1740000000.000123", newerMarkTs("1740000000.000123", ".000123"));
+}
+
+test "markDebounce arms a fresh target, skips a repeated one and re-arms a changed one" {
+    try std.testing.expectEqual(MarkStep.arm, markDebounce("", "", "C123", "1740000000.000123"));
+    // A history refresh that finds the same newest ts must not restart the
+    // quiet-period timer: a re-arm per poll would starve it of ever firing.
+    try std.testing.expectEqual(MarkStep.skip, markDebounce("C123", "1740000000.000123", "C123", "1740000000.000123"));
+    // A new message in the open chat raises the target and restarts the wait.
+    try std.testing.expectEqual(MarkStep.rearm, markDebounce("C123", "1740000000.000123", "C123", "1740000000.000124"));
+    // Switching chats replaces the pending target; the quiet period restarts
+    // so one request covers the last chat the user looked at.
+    try std.testing.expectEqual(MarkStep.rearm, markDebounce("C123", "1740000000.000123", "C456", "1740000000.000123"));
+    // Nothing to mark: no displayed ts, or no channel.
+    try std.testing.expectEqual(MarkStep.skip, markDebounce("", "", "C123", ""));
+    try std.testing.expectEqual(MarkStep.skip, markDebounce("", "", "", "1740000000.000123"));
+    try std.testing.expectEqual(MarkStep.skip, markDebounce("C123", "1740000000.000123", "C123", "garbage"));
+}
+
+test "mark timestamps require a nonempty numeric fraction" {
+    for ([_][]const u8{ "1740000000", "1740000000.", "1740000000..1", "1740000000.1x", "" }) |ts| {
+        try std.testing.expectEqualStrings("", newerMarkTs("", ts));
+        try std.testing.expectEqual(MarkStep.skip, markDebounce("", "", "C123", ts));
+    }
+    try std.testing.expectEqualStrings("1740000000.000124", newerMarkTs("1740000000.000123", "1740000000.000124"));
+}
+
+test "mark debounce never lowers the target when history omits a newer reply" {
+    try std.testing.expectEqual(MarkStep.skip, markDebounce("C123", "1740000000.000124", "C123", "1740000000.000123"));
+    try std.testing.expectEqual(MarkStep.rearm, markDebounce("C123", "1740000000.000124", "C456", "1740000000.000123"));
+}
+
+test "mark body carries channel and ts" {
+    const body = try buildMarkBody(std.testing.allocator, "C123", "1740000000.000123");
+    defer std.testing.allocator.free(body);
+    try std.testing.expectEqualStrings("{\"channel\":\"C123\",\"ts\":\"1740000000.000123\"}", body);
 }

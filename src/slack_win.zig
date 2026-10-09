@@ -706,6 +706,7 @@ pub const JobKind = enum(u8) {
     send_image, // 3-step upload: args = [channel, thread_ts, file_path]
     download, // file to media cache: args = [url, file_id, filename, channel, ts]
     auth, // auth.test: no args
+    mark, // conversations.mark: args = [channel, ts] (WAZI-104)
 };
 
 pub const JobContext = struct {
@@ -791,6 +792,19 @@ pub fn runJob(allocator: std.mem.Allocator, ctx: JobContext, kind: JobKind, args
         },
         .auth => {
             var response = try callWithRetry(allocator, ctx.host, ctx.user_token, "/api/auth.test", null);
+            errdefer response.deinit(allocator);
+            if (response.status != 200) return error.HttpFailed;
+            if (!httpOk(allocator, response.body)) return error.SlackRejected;
+            return bodyOnly(allocator, response);
+        },
+        .mark => {
+            // WAZI-104: mark the viewed channel read at its newest displayed
+            // ts. Works in native and bridge mode: both ride ctx.host via
+            // slackContext, the bridge substitutes its own upstream.
+            if (args.len < 2) return error.BadArguments;
+            const body = try slack.buildMarkBody(allocator, args[0], args[1]);
+            defer allocator.free(body);
+            var response = try callWithRetry(allocator, ctx.host, ctx.user_token, "/api/conversations.mark", body);
             errdefer response.deinit(allocator);
             if (response.status != 200) return error.HttpFailed;
             if (!httpOk(allocator, response.body)) return error.SlackRejected;
