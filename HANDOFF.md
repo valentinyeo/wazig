@@ -2,7 +2,7 @@
 
 ## State of main
 - main = `8ccd8f9`. Merged today: #184 (automerge lists PR files again), #180 (media catch-up no longer spins the UI thread, WAZI-103), #181 (viewing a Slack chat calls conversations.mark, WAZI-104).
-- **Not released yet.** Last release is v0.9.84 (2026-09-27). `ci` on main was queued at 16:29 UTC; `auto-release` tags the next version when `ci` on main succeeds, then `release.yml` builds the zip.
+- **Released as v0.9.85** (contains #180, #181, #184). Not yet installed or tested on Valentin's PC: install it per the steps below.
 - **Not tested on the PC yet.** #180 and #181 were reviewed by Codex (gpt-6.1-sol) and pass `zig build test` (168+ tests) and the Windows release build, but nobody has run them in the real app.
 
 ## Open work (all on board 4874, "Wazig")
