@@ -50,7 +50,7 @@ jobs:
             # gh pr view truncates the file list at 100, which could hide a
             # gating workflow edit behind a big diff; list every file instead.
             gating='[".github/workflows/automerge.yml", ".github/workflows/ci.yml", ".github/workflows/release.yml", ".github/workflows/auto-release.yml"]'
-            files_json=$(gh api "repos/$REPO/pulls/$pr/files?per_page=100" --paginate --slurp --jq 'add | map(.filename)' 2>/dev/null) || files_json=""
+            files_json=$(gh api "repos/$REPO/pulls/$pr/files?per_page=100" --paginate --jq '.[].filename' 2>/dev/null | jq -R . | jq -cs .) || files_json=""
             reason=$(echo "$info" | jq -r '
               if .isDraft then "draft"
               elif ([.labels[].name] | index("hold")) then "hold label"
