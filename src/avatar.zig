@@ -1,5 +1,6 @@
 // Fetches one WhatsApp profile image through wacli and stores it on disk.
 const std = @import("std");
+const child_process = @import("child_process.zig");
 const sync_gate = @import("sync_gate.zig");
 const win = @cImport({
     @cDefine("WIN32_LEAN_AND_MEAN", "1");
@@ -76,7 +77,7 @@ fn workerMain(self: *Session, exe: []u8, jid: []u8, destination: []u8) void {
 }
 
 fn workerRun(self: *Session, exe: []const u8, jid: []const u8, destination: []const u8) !void {
-    const result = try std.process.run(self.allocator, self.io, .{
+    const result = try child_process.run(self.allocator, self.io, .{
         .argv = &.{ exe, "--json", "--lock-wait", "10s", "--timeout", "30s", "profile", "picture-info", "--jid", jid },
         .stdout_limit = .limited(64 * 1024),
         .stderr_limit = .limited(64 * 1024),
