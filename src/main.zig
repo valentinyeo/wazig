@@ -767,6 +767,8 @@ const App = struct {
     openrouter_key: []const u8 = "",
     openrouter_model: []const u8 = "openai/gpt-5.6-luna",
     openrouter_configured: bool = false,
+    // Anthropic workspace id for the formatting key; empty for workspace-scoped keys.
+    format_workspace: []const u8 = "",
     openrouter_attempts: [512]u64 = [_]u64{0} ** 512,
     openrouter_attempt_count: usize = 0,
     transcribe_active_id: Utf8Text(191) = .{},
@@ -6323,7 +6325,7 @@ fn scheduleNextFormatting(a: *App) void {
     const message = &a.messages[message_index];
     const transcript_utf8 = std.unicode.utf16LeToUtf8Alloc(a.allocator, message.transcript.slice()) catch return;
     defer a.allocator.free(transcript_utf8);
-    if (session.start(transcript_utf8, a.openrouter_key, a.openrouter_model)) {
+    if (session.start(transcript_utf8, a.openrouter_key, a.openrouter_model, a.format_workspace)) {
         a.openrouter_active_id.set(message.id.slice());
         appendDebugLog(a, "format schedule: queued len={d}", .{transcript_utf8.len});
     }
@@ -14895,7 +14897,15 @@ pub fn main(init: std.process.Init) !void {
         }
     }
     if (openrouter_model.len == 0) openrouter_model = "openai/gpt-5.6-luna";
-    var app = App{ .allocator = init.gpa, .io = init.io, .instance = instance, .wacli_path = wacli_path, .avatar_dir = avatar_dir, .slack_media_dir = slack_media_dir, .deepgram_configured = deepgram_key.len > 0, .deepgram_key = deepgram_key, .openrouter_key = openrouter_key, .openrouter_model = openrouter_model, .openrouter_configured = openrouter_key.len > 0, .dictation_language = loadDictationLanguage(), .font_scale = loadFontScale(), .chat_view = loadChatView() };
+    // A dedicated Anthropic key (registry only, so an env key meant for other tools is ignored)
+    // takes over transcript formatting: Haiku without reasoning answers in seconds.
+    var format_workspace: []const u8 = "";
+    if (loadRegistryString(init.gpa, lit("AnthropicApiKey"))) |anthropic_key| {
+        openrouter_key = anthropic_key;
+        openrouter_model = "claude-haiku-5-5";
+        format_workspace = loadRegistryString(init.gpa, lit("AnthropicWorkspaceId")) orelse "";
+    }
+    var app = App{ .allocator = init.gpa, .io = init.io, .instance = instance, .wacli_path = wacli_path, .avatar_dir = avatar_dir, .slack_media_dir = slack_media_dir, .deepgram_configured = deepgram_key.len > 0, .deepgram_key = deepgram_key, .openrouter_key = openrouter_key, .openrouter_model = openrouter_model, .openrouter_configured = openrouter_key.len > 0, .format_workspace = format_workspace, .dictation_language = loadDictationLanguage(), .font_scale = loadFontScale(), .chat_view = loadChatView() };
     app.wacli_dir.set(wacli_dir);
     if (cache_tag) |tag| {
         app.cache_tag.set(tag);

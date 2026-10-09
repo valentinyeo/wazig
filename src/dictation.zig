@@ -1,5 +1,6 @@
 // Native Windows microphone capture and Deepgram transcription.
 const std = @import("std");
+const format_request = @import("format_request.zig");
 const win = @cImport({
     @cDefine("WIN32_LEAN_AND_MEAN", "1");
     @cDefine("COBJMACROS", "1");
@@ -328,7 +329,7 @@ fn fileWorker(self: *FileSession, path: []u8, api_key: []u8, language: Language)
     self.state_value.store(@intFromEnum(State.ready), .release);
 }
 
-// Formats a transcript through OpenRouter for easier reading.
+// Formats a transcript for easier reading, through Anthropic (sk-ant- key) or OpenRouter.
 pub const TextSession = struct {
     allocator: std.mem.Allocator,
     thread: ?std.Thread = null,
@@ -351,7 +352,7 @@ pub const TextSession = struct {
         return @enumFromInt(self.state_value.load(.acquire));
     }
 
-    pub fn start(self: *TextSession, text: []const u8, api_key: []const u8, model: []const u8) bool {
+    pub fn start(self: *TextSession, text: []const u8, api_key: []const u8, model: []const u8, workspace: []const u8) bool {
         if (self.state() == .recording or self.state() == .transcribing) return false;
         if (self.thread) |thread| {
             thread.join();
@@ -367,12 +368,19 @@ pub const TextSession = struct {
             self.allocator.free(key);
             return false;
         };
-        self.result_len = 0;
-        self.state_value.store(@intFromEnum(State.recording), .release);
-        self.thread = std.Thread.spawn(.{ .stack_size = 1024 * 1024 }, formatWorker, .{ self, text_copy, key, model_copy }) catch {
+        const workspace_copy = self.allocator.dupe(u8, workspace) catch {
             self.allocator.free(text_copy);
             self.allocator.free(key);
             self.allocator.free(model_copy);
+            return false;
+        };
+        self.result_len = 0;
+        self.state_value.store(@intFromEnum(State.recording), .release);
+        self.thread = std.Thread.spawn(.{ .stack_size = 1024 * 1024 }, formatWorker, .{ self, text_copy, key, model_copy, workspace_copy }) catch {
+            self.allocator.free(text_copy);
+            self.allocator.free(key);
+            self.allocator.free(model_copy);
+            self.allocator.free(workspace_copy);
             self.state_value.store(@intFromEnum(State.failed), .release);
             return false;
         };
@@ -392,31 +400,13 @@ pub const TextSession = struct {
     }
 };
 
-fn appendJsonEscaped(list: *std.ArrayList(u8), allocator: std.mem.Allocator, text: []const u8) !void {
-    for (text) |character| {
-        switch (character) {
-            '"' => try list.appendSlice(allocator, "\\\""),
-            '\\' => try list.appendSlice(allocator, "\\\\"),
-            '\n' => try list.appendSlice(allocator, "\\n"),
-            '\r' => try list.appendSlice(allocator, "\\r"),
-            '\t' => try list.appendSlice(allocator, "\\t"),
-            else => {
-                if (character < 0x20) {
-                    try list.appendSlice(allocator, " ");
-                } else {
-                    try list.append(allocator, character);
-                }
-            },
-        }
-    }
-}
-
-fn formatWorker(self: *TextSession, text: []u8, api_key: []u8, model: []u8) void {
+fn formatWorker(self: *TextSession, text: []u8, api_key: []u8, model: []u8, workspace: []u8) void {
     defer self.allocator.free(text);
     defer self.allocator.free(api_key);
     defer self.allocator.free(model);
+    defer self.allocator.free(workspace);
     self.state_value.store(@intFromEnum(State.transcribing), .release);
-    const formatted = formatTranscript(self.allocator, text, api_key, model) catch {
+    const formatted = formatTranscript(self.allocator, text, api_key, model, workspace) catch {
         self.state_value.store(@intFromEnum(State.failed), .release);
         return;
     };
@@ -426,7 +416,7 @@ fn formatWorker(self: *TextSession, text: []u8, api_key: []u8, model: []u8) void
     self.state_value.store(@intFromEnum(State.ready), .release);
 }
 
-fn formatTranscript(allocator: std.mem.Allocator, transcript: []const u8, api_key: []const u8, model: []const u8) ![]u8 {
+fn formatTranscript(allocator: std.mem.Allocator, transcript: []const u8, api_key: []const u8, model: []const u8, workspace: []const u8) ![]u8 {
     const system_prompt =
         \\You format raw voice-message transcripts for a reader with ADHD.
         \\
@@ -455,29 +445,28 @@ fn formatTranscript(allocator: std.mem.Allocator, transcript: []const u8, api_ke
         \\
         \\If you are ever unsure whether a change is allowed: it is not. Keep the words.
     ;
-    var body: std.ArrayList(u8) = .empty;
-    defer body.deinit(allocator);
-    try body.appendSlice(allocator, "{\"model\":\"");
-    try appendJsonEscaped(&body, allocator, model);
-    try body.appendSlice(allocator, "\",\"reasoning\":{\"effort\":\"medium\"},\"temperature\":0.2,\"messages\":[{\"role\":\"system\",\"content\":\"");
-    try appendJsonEscaped(&body, allocator, system_prompt);
-    try body.appendSlice(allocator, "\"},{\"role\":\"user\",\"content\":\"");
-    try appendJsonEscaped(&body, allocator, transcript);
-    try body.appendSlice(allocator, "\"}]}");
+    const anthropic = std.mem.startsWith(u8, api_key, "sk-ant-");
+    const body = try format_request.formatRequestBody(allocator, anthropic, model, system_prompt, transcript);
+    defer allocator.free(body);
 
     const session = win.WinHttpOpen(lit("Wazig Messages/0.9"), win.WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, null, null, 0) orelse return error.NetworkFailed;
     defer _ = win.WinHttpCloseHandle(session);
     _ = win.WinHttpSetTimeouts(session, 10_000, 10_000, 30_000, 180_000);
-    const connection = win.WinHttpConnect(session, lit("openrouter.ai"), win.INTERNET_DEFAULT_HTTPS_PORT, 0) orelse return error.NetworkFailed;
+    const host = if (anthropic) lit("api.anthropic.com") else lit("openrouter.ai");
+    const path = if (anthropic) lit("/v1/messages") else lit("/api/v1/chat/completions");
+    const connection = win.WinHttpConnect(session, host, win.INTERNET_DEFAULT_HTTPS_PORT, 0) orelse return error.NetworkFailed;
     defer _ = win.WinHttpCloseHandle(connection);
-    const request = win.WinHttpOpenRequest(connection, lit("POST"), lit("/api/v1/chat/completions"), null, null, null, win.WINHTTP_FLAG_SECURE) orelse return error.NetworkFailed;
+    const request = win.WinHttpOpenRequest(connection, lit("POST"), path, null, null, null, win.WINHTTP_FLAG_SECURE) orelse return error.NetworkFailed;
     defer _ = win.WinHttpCloseHandle(request);
 
-    const headers_utf8 = try std.fmt.allocPrint(allocator, "Authorization: Bearer {s}\r\nContent-Type: application/json\r\n", .{api_key});
+    const headers_utf8 = if (anthropic)
+        try std.fmt.allocPrint(allocator, "x-api-key: {s}\r\nanthropic-version: 2023-06-01\r\nContent-Type: application/json\r\n{s}{s}{s}", .{ api_key, if (workspace.len > 0) "anthropic-workspace-id: " else "", workspace, if (workspace.len > 0) "\r\n" else "" })
+    else
+        try std.fmt.allocPrint(allocator, "Authorization: Bearer {s}\r\nContent-Type: application/json\r\n", .{api_key});
     defer allocator.free(headers_utf8);
     const headers = try std.unicode.utf8ToUtf16LeAllocZ(allocator, headers_utf8);
     defer allocator.free(headers);
-    if (win.WinHttpSendRequest(request, headers.ptr, @intCast(headers_utf8.len), @ptrCast(@constCast(body.items.ptr)), @intCast(body.items.len), @intCast(body.items.len), 0) == 0) return error.NetworkFailed;
+    if (win.WinHttpSendRequest(request, headers.ptr, @intCast(headers_utf8.len), @ptrCast(@constCast(body.ptr)), @intCast(body.len), @intCast(body.len), 0) == 0) return error.NetworkFailed;
     if (win.WinHttpReceiveResponse(request, null) == 0) return error.NetworkFailed;
     var status_code: win.DWORD = 0;
     var status_size: win.DWORD = @sizeOf(win.DWORD);
@@ -496,32 +485,7 @@ fn formatTranscript(allocator: std.mem.Allocator, transcript: []const u8, api_ke
         response.shrinkRetainingCapacity(old_len + read);
     }
 
-    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.items, .{});
-    defer parsed.deinit();
-    const root = switch (parsed.value) {
-        .object => |value| value,
-        else => return error.BadResponse,
-    };
-    const choices = switch (root.get("choices") orelse return error.BadResponse) {
-        .array => |value| value,
-        else => return error.BadResponse,
-    };
-    if (choices.items.len == 0) return error.BadResponse;
-    const choice = switch (choices.items[0]) {
-        .object => |value| value,
-        else => return error.BadResponse,
-    };
-    const message_value = switch (choice.get("message") orelse return error.BadResponse) {
-        .object => |value| value,
-        else => return error.BadResponse,
-    };
-    const content = switch (message_value.get("content") orelse return error.BadResponse) {
-        .string => |value| value,
-        else => return error.BadResponse,
-    };
-    const trimmed = std.mem.trim(u8, content, " \r\n\t");
-    if (trimmed.len == 0) return error.BadResponse;
-    return allocator.dupe(u8, trimmed);
+    return format_request.formatResponseText(allocator, anthropic, response.items);
 }
 
 fn readSmallFile(allocator: std.mem.Allocator, path_utf8: []const u8, max_bytes: usize) ?[]u8 {
