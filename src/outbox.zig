@@ -143,6 +143,11 @@ pub fn parseLine(allocator: std.mem.Allocator, line: []const u8, out: *Entry) bo
     if (value.text.len > max_text_len or value.file.len > max_file_len or
         value.reply_to.len > max_jid_len or value.reply_sender.len > max_jid_len or
         value.client_msg_id.len > max_client_msg_id_len) return false;
+    if (value.queued_unix < 0) return false;
+    // Win32 command lines and file APIs would silently stop at an embedded NUL.
+    for ([_][]const u8{ value.jid, value.text, value.file, value.reply_to, value.reply_sender, value.client_msg_id }) |field| {
+        if (std.mem.indexOfScalar(u8, field, 0) != null) return false;
+    }
     out.* = .{ .provider = provider, .queued_unix = value.queued_unix };
     @memcpy(&out.id, value.id);
     out.jid.set(value.jid);
@@ -315,4 +320,37 @@ test "evictionVictim never evicts a write and gives up when only writes remain" 
     try std.testing.expectEqual(@as(?usize, 1), evictionVictim(&.{ true, false, true, true }));
     try std.testing.expectEqual(@as(?usize, 0), evictionVictim(&.{ false, true, true, true }));
     try std.testing.expectEqual(@as(?usize, null), evictionVictim(&.{}));
+}
+
+test "parse rejects NUL fields and negative enqueue times before Win32 use" {
+    const allocator = std.testing.allocator;
+    for ([_][]const u8{ "jid", "text", "file", "reply_to", "reply_sender", "client_msg_id" }) |field| {
+        const line = try std.fmt.allocPrint(allocator, "{{\"id\":\"0123456789abcdef0123456789abcdef\",\"provider\":\"whatsapp\",\"{s}\":\"before\\u0000after\",{s}}}", .{ field, if (std.mem.eql(u8, field, "jid")) "\"text\":\"synthetic\"" else if (std.mem.eql(u8, field, "text")) "\"jid\":\"synthetic\"" else "\"jid\":\"synthetic\",\"text\":\"synthetic\"" });
+        defer allocator.free(line);
+        var parsed = Entry{};
+        try std.testing.expect(!parseLine(allocator, line, &parsed));
+    }
+    var parsed = Entry{};
+    try std.testing.expect(!parseLine(allocator, "{\"id\":\"0123456789abcdef0123456789abcdef\",\"provider\":\"whatsapp\",\"jid\":\"synthetic\",\"text\":\"synthetic\",\"queued_unix\":-9223372036854775808}", &parsed));
+}
+
+test "maximum escaped fields round trip and oversized fields are rejected" {
+    const allocator = std.testing.allocator;
+    var entry = Entry{};
+    entry.jid.set(&([_]u8{'\t'} ** max_jid_len));
+    entry.text.set(&([_]u8{1} ** max_text_len));
+    entry.file.set(&([_]u8{'\t'} ** max_file_len));
+    entry.reply_to = entry.jid;
+    entry.reply_sender = entry.jid;
+    entry.client_msg_id.set(&([_]u8{'\t'} ** max_client_msg_id_len));
+    var writer = std.Io.Writer.Allocating.init(allocator);
+    defer writer.deinit();
+    try writeLine(&writer.writer, &entry);
+    try std.testing.expect(writer.written().len <= max_line_len);
+    var parsed = Entry{};
+    try std.testing.expect(parseLine(allocator, writer.written(), &parsed));
+    try std.testing.expectEqualStrings(entry.text.slice(), parsed.text.slice());
+    const oversized = try std.fmt.allocPrint(allocator, "{{\"id\":\"0123456789abcdef0123456789abcdef\",\"provider\":\"whatsapp\",\"jid\":\"synthetic\",\"text\":\"{s}\"}}", .{[_]u8{'x'} ** (max_text_len + 1)});
+    defer allocator.free(oversized);
+    try std.testing.expect(!parseLine(allocator, oversized, &parsed));
 }
