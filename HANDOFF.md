@@ -8,7 +8,7 @@
 ## Open work (all on board 4874, "Wazig")
 | Ticket | PR | State |
 |---|---|---|
-| WAZI-79 open chat misses newest messages | #182 (branch `agent/wazig-dev-4-wazi-79-fresh`) | Codex review fixes in. Was being rebased onto main by a Codex helper when I stopped; check the branch for a force-push after 16:35 UTC. Then wait for green checks and merge. Includes `.gitattributes` (`*.zig text eol=lf`) so the build.zig source harness matches on Windows CI. |
+| WAZI-79 open chat misses newest messages | #182 (branch `agent/wazig-dev-4-wazi-79-fresh`) | Rebased onto main at `4784e9f` (183/183 tests, Windows build ok), MERGEABLE. No hand edits to workflows, so automerge takes it once checks are green. Includes `.gitattributes` (`*.zig text eol=lf`) so the build.zig source harness matches on Windows CI. |
 | WAZI-100 outbox: sends never lost or doubled | #183 (branch `agent/wazig-dev-1-wazi-100`) | Biggest change (journal in `%LOCALAPPDATA%\Messages\outbox.jsonl`, `src/outbox.zig`). Codex fixed ~15 defects and says it builds and tests clean, but is only safe after a Windows run: queue many sends, kill and restart, check order and no duplicates. It edits `.github/workflows/ci.yml`, so automerge skips it on purpose: merge by hand. The `code-review` check (OCR on GLM) keeps crashing on this diff (malformed tool calls); rerun it or merge on the other green checks. Needs a rebase after #182. |
 | WAZI-101 Slack paste goes to WhatsApp + account-qualified ids | none | Not started. Do after #183 (same send path). |
 | WAZI-102 one provider interface incl. archive | none | Not started. Groundwork for the wa-bridge provider. |
