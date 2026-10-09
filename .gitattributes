@@ -1,0 +1,3 @@
+# Keep LF on Windows checkouts too: build.zig test harnesses match main.zig text
+# across line breaks.
+*.zig text eol=lf
