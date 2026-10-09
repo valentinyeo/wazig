@@ -101,6 +101,12 @@ jobs:
         run: |
           cd zig-out/bin
           zip -r "${GITHUB_WORKSPACE}/Messages-${GITHUB_REF_NAME}.zip" Messages.exe wazigctl.exe *.ttf *LICENSE*
+      - name: Build and package ARM64
+        # Native build for Windows on ARM laptops (e.g. the X13s); its updater only picks Messages_arm64-*.zip.
+        run: |
+          zig build -Dtarget=aarch64-windows-gnu --release=small -Dversion="${GITHUB_REF_NAME#v}" -p zig-out-arm64
+          cd zig-out-arm64/bin
+          zip -r "${GITHUB_WORKSPACE}/Messages_arm64-${GITHUB_REF_NAME}.zip" Messages.exe wazigctl.exe *.ttf *LICENSE*
       - name: Package MSI
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq wixl wixl-data
@@ -112,13 +118,14 @@ jobs:
             -o "Messages-${GITHUB_REF_NAME}.msi" assets/installer.wxs
       - name: Checksums
         run: |
-          sha256sum "Messages-${GITHUB_REF_NAME}.zip" "Messages-${GITHUB_REF_NAME}.msi" > SHA256SUMS.txt
+          sha256sum "Messages-${GITHUB_REF_NAME}.zip" "Messages_arm64-${GITHUB_REF_NAME}.zip" "Messages-${GITHUB_REF_NAME}.msi" > SHA256SUMS.txt
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: release-bundle
           path: |
             Messages-*.zip
+            Messages_arm64-*.zip
             Messages-*.msi
             SHA256SUMS.txt
 
@@ -207,5 +214,5 @@ jobs:
         run: |
           # Re-run safe: first create publishes with assets attached (atomic);
           # on a re-run create fails because the release exists, so clobber-upload instead.
-          gh release create "${GITHUB_REF_NAME}" Messages-*.zip Messages-*.msi SHA256SUMS.txt --repo "${GITHUB_REPOSITORY}" --verify-tag --generate-notes \
-            || gh release upload "${GITHUB_REF_NAME}" Messages-*.zip Messages-*.msi SHA256SUMS.txt --repo "${GITHUB_REPOSITORY}" --clobber
+          gh release create "${GITHUB_REF_NAME}" Messages-*.zip Messages_arm64-*.zip Messages-*.msi SHA256SUMS.txt --repo "${GITHUB_REPOSITORY}" --verify-tag --generate-notes \
+            || gh release upload "${GITHUB_REF_NAME}" Messages-*.zip Messages_arm64-*.zip Messages-*.msi SHA256SUMS.txt --repo "${GITHUB_REPOSITORY}" --clobber
