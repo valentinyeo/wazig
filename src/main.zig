@@ -9,6 +9,7 @@ const slack_win = @import("slack_win.zig");
 const played = @import("played.zig");
 const pending_reads = @import("pending_reads.zig");
 const chat_order = @import("chat_order.zig");
+const chat_reconcile = @import("chat_reconcile.zig");
 const compose_layout = @import("compose_layout.zig");
 const media_age = @import("media_age.zig");
 const media_drain = @import("media_drain.zig");
@@ -901,6 +902,12 @@ const App = struct {
     messages_gen: u64 = 0,
     chats_gen: u64 = 0,
     chats_pending_flags: u8 = 0,
+    // WAZI-79: retry budget for a failed or empty messages read. Tied to the
+    // chat it was granted for, so failures on one chat never consume the
+    // retries of the chat the user opens next.
+    msg_read_retry_ticks: u32 = 0,
+    msg_read_attempts: u32 = 0,
+    msg_read_last_jid: Utf8Text(191) = .{},
     msg_cache: [max_msg_cache]MsgCacheEntry = [_]MsgCacheEntry{.{}} ** max_msg_cache,
     msg_cache_len: usize = 0,
     // Hashed linked WhatsApp account: cache files are scoped to it, so a
@@ -7471,10 +7478,20 @@ fn refreshMessages(a: *App) void {
         clearMessages(a);
         a.displayed_jid.set("");
         a.displayed_timestamp.set("");
+        a.msg_read_last_jid.set("");
+        a.msg_read_attempts = 0;
+        a.msg_read_retry_ticks = 0;
         return;
     }
     const chat = &a.chats[a.selected_chat];
     a.slack_history_hash = 0;
+    // Leaving WhatsApp also ends the retry cycle, even if the next WhatsApp
+    // chat has the same jid as before the provider switch.
+    if (chat.provider != .whatsapp or !std.mem.eql(u8, a.msg_read_last_jid.slice(), chat.jid.slice())) {
+        a.msg_read_last_jid.set(chat.jid.slice());
+        a.msg_read_attempts = 0;
+        a.msg_read_retry_ticks = 0;
+    }
     if (chat.provider == .telegram) return refreshTelegramMessages(a);
     if (chat.provider == .slack) return refreshSlackHistory(a);
     const chat_changed = !std.mem.eql(u8, a.displayed_jid.slice(), chat.jid.slice());
@@ -7485,10 +7502,10 @@ fn refreshMessages(a: *App) void {
     // first open of a chat after a relaunch, before the in-memory cache
     // has been warmed.
     if (msgCacheGet(a, chat.jid.slice())) |cached| {
-        applyMessageData(a, cached, false);
+        _ = applyMessageData(a, cached, false);
     } else if (loadMsgCacheDisk(a, chat.jid.slice())) |cached| {
         defer a.allocator.free(cached);
-        applyMessageData(a, cached, false);
+        _ = applyMessageData(a, cached, false);
     }
     a.messages_gen += 1;
     var job = WacliJob{ .kind = .messages, .gen = a.messages_gen };
@@ -7497,6 +7514,35 @@ fn refreshMessages(a: *App) void {
         a.wacli_path, "--json", "--read-only", "messages", "list", "--chat", chat.jid.slice(), "--limit", "80",
     });
     wacliEnqueue(a, job, true);
+}
+
+/// WAZI-79: the WAL tick that starts a chats read compares the open
+/// conversation against the chat row it loaded before, so a message that
+/// arrives while that read is in flight only shows up in the row once the
+/// read lands, and nothing re-reads the conversation then. When the fresh
+/// row's last-message stamp is newer than what the conversation on screen
+/// was painted from, queue one read for it: coalesced with any read already
+/// queued, and generation-guarded like every other messages read (a chat
+/// the user opens meanwhile supersedes it).
+fn reconcileOpenChat(a: *App) void {
+    if (!a.user_viewed or a.chat_selection_pending) return;
+    if (a.selected_chat >= a.chat_count) return;
+    const chat = &a.chats[a.selected_chat];
+    if (chat.provider != .whatsapp) return;
+    if (wacliPendingGet(a, .messages) > 0) return;
+    if (!chat_reconcile.openChatStale(chat.jid.slice(), chat.timestamp.slice(), a.displayed_jid.slice(), a.displayed_timestamp.slice())) return;
+    refreshMessages(a);
+}
+
+/// WAZI-79: a failed or empty messages read gets one or two further tries
+/// with a growing backoff (chat_reconcile.retryDelayTicks); a successful
+/// read clears the budget. When the budget is spent the failure stands
+/// until something else refreshes the chat.
+fn scheduleMessageReadRetry(a: *App) void {
+    const attempt = a.msg_read_attempts + 1;
+    const delay = chat_reconcile.retryDelayTicks(attempt) orelse return;
+    a.msg_read_attempts = attempt;
+    a.msg_read_retry_ticks = delay;
 }
 
 fn youSender(allocator: std.mem.Allocator) WideText(159) {
@@ -7557,25 +7603,30 @@ fn avatarEntryForSender(a: *App, sender_jid: []const u8) ?*AvatarEntry {
     return avatarForParticipant(a, sender_jid);
 }
 
-fn applyMessageData(a: *App, raw: []const u8, final: bool) void {
-    var parsed = std.json.parseFromSlice(std.json.Value, a.allocator, raw, .{}) catch return;
+/// Paints the parsed payload into the conversation pane. Returns false when
+/// the payload carried no messages list at all (unparseable, wrong shape),
+/// so the caller can treat a 0-exit but empty read like a failed one and
+/// retry (WAZI-79); a valid `{"data":{"messages":[]}}` paints an empty
+/// conversation and counts as a real answer.
+fn applyMessageData(a: *App, raw: []const u8, final: bool) bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, a.allocator, raw, .{}) catch return false;
     defer parsed.deinit();
-    if (a.chat_count == 0 or a.selected_chat >= a.chat_count) return;
+    if (a.chat_count == 0 or a.selected_chat >= a.chat_count) return false;
     const chat = &a.chats[a.selected_chat];
     const chat_changed = !std.mem.eql(u8, a.displayed_jid.slice(), chat.jid.slice());
     const root = switch (parsed.value) {
         .object => |o| o,
-        else => return,
+        else => return false,
     };
-    const data_value = root.get("data") orelse return;
+    const data_value = root.get("data") orelse return false;
     const data_object = switch (data_value) {
         .object => |o| o,
-        else => return,
+        else => return false,
     };
-    const list_value = data_object.get("messages") orelse return;
+    const list_value = data_object.get("messages") orelse return false;
     const list = switch (list_value) {
         .array => |items| items,
-        else => return,
+        else => return false,
     };
     var selected_id = Utf8Text(191){};
     if (a.selected_message) |selected| {
@@ -7708,6 +7759,7 @@ fn applyMessageData(a: *App, raw: []const u8, final: bool) void {
     }
     if (a.canvas) |canvas| _ = win.InvalidateRect(canvas, null, win.TRUE);
     if (final) markChatRead(a);
+    return true;
 }
 
 // Re-verify the linked account after the store was replaced, so the launch
@@ -13275,6 +13327,9 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
                             var log_buffer: [64]u8 = undefined;
                             const log_line = std.fmt.bufPrint(&log_buffer, "chats-read: ok {d} bytes, {d} chats", .{ result.data.len, a.chat_count }) catch "chats-read: ok";
                             appendLaunchLog(a, log_line);
+                            // WAZI-79: the fresh row may be newer than the
+                            // conversation on screen; read it if so.
+                            reconcileOpenChat(a);
                         } else if (a.chats_read_attempts < 3) {
                             a.chats_read_attempts += 1;
                             a.chats_read_retry_ticks = 2;
@@ -13283,25 +13338,46 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
                     }
                 },
                 .messages => {
+                    // Chat kind + error only, never the message payload.
+                    var kind: []const u8 = "unknown";
+                    for (a.chats[0..a.chat_count]) |*chat| {
+                        if (std.mem.eql(u8, chat.jid.slice(), result.jid.slice())) {
+                            kind = @tagName(chat.provider);
+                            break;
+                        }
+                    }
                     if (!result.ok) {
                         setStatus(a, "Unable to read messages from wacli");
-                        // Chat kind + error only, never the message payload.
-                        var kind: []const u8 = "unknown";
-                        for (a.chats[0..a.chat_count]) |*chat| {
-                            if (std.mem.eql(u8, chat.jid.slice(), result.jid.slice())) {
-                                kind = @tagName(chat.provider);
-                                break;
-                            }
-                        }
                         var fail_buffer: [128]u8 = undefined;
                         const fail_line = std.fmt.bufPrint(&fail_buffer, "messages-read: fail, chat={s} err={s}", .{ kind, result.extra.slice() }) catch "messages-read: fail";
                         appendLaunchLog(a, fail_line);
+                        // WAZI-79: a fresh read that failed (the store lock
+                        // was held, say) retries after a short backoff; a
+                        // stale answer belongs to a chat the user has already
+                        // left and the newer read covers it.
+                        if (result.gen == a.messages_gen and a.selected_chat < a.chat_count and
+                            std.mem.eql(u8, a.chats[a.selected_chat].jid.slice(), result.jid.slice()))
+                        {
+                            scheduleMessageReadRetry(a);
+                        }
                     } else if (a.selected_chat < a.chat_count and
                         std.mem.eql(u8, a.chats[a.selected_chat].jid.slice(), result.jid.slice()) and
                         result.gen == a.messages_gen)
                     {
-                        applyMessageData(a, result.data, true);
-                        msgCacheStore(a, result.jid.slice(), result.data);
+                        // WAZI-79: a 0-exit read without a messages list is
+                        // as useless as a failed one; a valid empty
+                        // conversation paints and clears the retry budget.
+                        if (applyMessageData(a, result.data, true)) {
+                            msgCacheStore(a, result.jid.slice(), result.data);
+                            a.msg_read_attempts = 0;
+                            a.msg_read_retry_ticks = 0;
+                        } else {
+                            setStatus(a, "Unable to read messages from wacli");
+                            var fail_buffer: [128]u8 = undefined;
+                            const fail_line = std.fmt.bufPrint(&fail_buffer, "messages-read: empty payload, chat={s}", .{kind}) catch "messages-read: empty payload";
+                            appendLaunchLog(a, fail_line);
+                            scheduleMessageReadRetry(a);
+                        }
                     }
                 },
                 .reaction => applyReaction(a, result),
@@ -13742,6 +13818,18 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
                 if (a.chats_read_retry_ticks > 0) {
                     a.chats_read_retry_ticks -= 1;
                     if (a.chats_read_retry_ticks == 0) refreshChats(a);
+                }
+                // WAZI-79: a failed or empty messages read retries after its
+                // backoff, but only while the same chat is still open and no
+                // read for it is queued or running.
+                if (a.msg_read_retry_ticks > 0) {
+                    a.msg_read_retry_ticks -= 1;
+                    if (a.msg_read_retry_ticks == 0 and wacliPendingGet(a, .messages) == 0 and
+                        a.selected_chat < a.chat_count and
+                        std.mem.eql(u8, a.chats[a.selected_chat].jid.slice(), a.msg_read_last_jid.slice()))
+                    {
+                        refreshMessages(a);
+                    }
                 }
                 if (changed and !a.chat_selection_pending) {
                     refreshChats(a);
