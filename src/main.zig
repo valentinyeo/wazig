@@ -632,7 +632,7 @@ const App = struct {
     accounts_maintenance: bool = false,
     last_refresh_unix: i64 = 0,
     wacli_dir: Utf8Text(259) = .{},
-    font_scale: i32 = 80,
+    font_scale: i32 = 82,
     // Physical DPI of the window's monitor; 96 until WM_CREATE reads it.
     dpi: u32 = 96,
     brush_bg: ?win.HBRUSH = null,
@@ -1134,10 +1134,10 @@ fn loadRegistryString(allocator: std.mem.Allocator, name: [*:0]const u16) ?[]con
 }
 
 fn loadFontScale() i32 {
-    var value: win.DWORD = 80;
+    var value: win.DWORD = 82;
     var size: win.DWORD = @sizeOf(win.DWORD);
     const result = win.RegGetValueW(winHandle(win.HKEY, 0x80000001), lit("Software\\Messages"), lit("FontScale"), win.RRF_RT_REG_DWORD, null, &value, &size);
-    if (result != win.ERROR_SUCCESS) return 80;
+    if (result != win.ERROR_SUCCESS) return 82;
     return std.math.clamp(@as(i32, @intCast(value)), 60, 160);
 }
 
@@ -11400,10 +11400,10 @@ fn runCommand(a: *App, command: u16) void {
         },
         command_font_larger => changeFontScale(a, 10),
         command_font_reset => {
-            a.font_scale = 80;
+            a.font_scale = 82;
             recreateFonts(a);
             saveFontScale(a.font_scale);
-            setStatus(a, "Font size 80%");
+            setStatus(a, "Font size 82%");
         },
         command_refresh => {
             refreshGroups(a);
