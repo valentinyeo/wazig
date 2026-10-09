@@ -29,7 +29,7 @@ pub fn formatRequestBody(allocator: std.mem.Allocator, anthropic: bool, model: [
     try body.appendSlice(allocator, "{\"model\":\"");
     try appendJsonEscaped(&body, allocator, model);
     if (anthropic) {
-        try body.appendSlice(allocator, "\",\"max_tokens\":8192,\"temperature\":0.2,\"system\":\"");
+        try body.appendSlice(allocator, "\",\"max_tokens\":8192,\"thinking\":{\"type\":\"disabled\"},\"system\":\"");
         try appendJsonEscaped(&body, allocator, system_prompt);
         try body.appendSlice(allocator, "\",\"messages\":[{\"role\":\"user\",\"content\":\"");
     } else {
@@ -53,11 +53,16 @@ pub fn formatResponseText(allocator: std.mem.Allocator, anthropic: bool, respons
         .array => |value| value,
         else => return error.BadResponse,
     };
-    if (items.items.len == 0) return error.BadResponse;
-    const first = switch (items.items[0]) {
-        .object => |value| value,
-        else => return error.BadResponse,
-    };
+    // Anthropic can put thinking blocks before the answer, so take the first text block.
+    const first = for (items.items) |item| {
+        const object = switch (item) {
+            .object => |value| value,
+            else => return error.BadResponse,
+        };
+        if (!anthropic) break object;
+        const kind = object.get("type") orelse continue;
+        if (kind == .string and std.mem.eql(u8, kind.string, "text")) break object;
+    } else return error.BadResponse;
     const holder = if (anthropic) first else switch (first.get("message") orelse return error.BadResponse) {
         .object => |value| value,
         else => return error.BadResponse,
@@ -80,6 +85,10 @@ test "anthropic format request uses a system field and no reasoning" {
     try std.testing.expectEqualStrings("sys \"x\"", root.get("system").?.string);
     try std.testing.expect(root.get("reasoning") == null);
     try std.testing.expect(root.get("max_tokens") != null);
+    // Haiku 5.5 rejects temperature ("deprecated for this model"), which failed every summary.
+    try std.testing.expect(root.get("temperature") == null);
+    // Haiku 5.5 thinks by default; summaries want speed.
+    try std.testing.expectEqualStrings("disabled", root.get("thinking").?.object.get("type").?.string);
     try std.testing.expectEqualStrings("hi\nthere", root.get("messages").?.array.items[0].object.get("content").?.string);
 }
 
@@ -97,6 +106,9 @@ test "format response text reads both providers and rejects empty output" {
     const a = try formatResponseText(std.testing.allocator, true, "{\"content\":[{\"type\":\"text\",\"text\":\"  1. gist\\n\"}]}");
     defer std.testing.allocator.free(a);
     try std.testing.expectEqualStrings("1. gist", a);
+    const t = try formatResponseText(std.testing.allocator, true, "{\"content\":[{\"type\":\"thinking\",\"thinking\":\"hm\"},{\"type\":\"text\",\"text\":\"1. after thinking\"}]}");
+    defer std.testing.allocator.free(t);
+    try std.testing.expectEqualStrings("1. after thinking", t);
     const o = try formatResponseText(std.testing.allocator, false, "{\"choices\":[{\"message\":{\"content\":\"ok\"}}]}");
     defer std.testing.allocator.free(o);
     try std.testing.expectEqualStrings("ok", o);
