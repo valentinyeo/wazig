@@ -2014,6 +2014,13 @@ fn applyChats(a: *App, raw: []const u8) bool {
             }
         }
     }
+    // A Slack sidebar refilter can select a different chat without a click.
+    if (view == .slack and (a.selected_chat >= a.chat_count or
+        !std.mem.eql(u8, selected_jid[0..selected_len], a.chats[a.selected_chat].jid.slice())))
+    {
+        a.user_viewed = false;
+        cancelSlackMark(a);
+    }
     if (a.selected_chat < a.chat_count) a.view_selected[@intFromEnum(view)].set(a.chats[a.selected_chat].jid.slice());
     updateSearchCue(a, view);
     if (a.chats_hwnd) |list| {
