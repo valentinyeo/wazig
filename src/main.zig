@@ -7478,19 +7478,22 @@ fn refreshMessages(a: *App) void {
         clearMessages(a);
         a.displayed_jid.set("");
         a.displayed_timestamp.set("");
+        a.msg_read_last_jid.set("");
+        a.msg_read_attempts = 0;
+        a.msg_read_retry_ticks = 0;
         return;
     }
     const chat = &a.chats[a.selected_chat];
     a.slack_history_hash = 0;
-    if (chat.provider == .telegram) return refreshTelegramMessages(a);
-    if (chat.provider == .slack) return refreshSlackHistory(a);
-    // WAZI-79: the retry budget belongs to the chat it was granted for; a
-    // chat the user opens next starts with a fresh budget.
-    if (!std.mem.eql(u8, a.msg_read_last_jid.slice(), chat.jid.slice())) {
+    // Leaving WhatsApp also ends the retry cycle, even if the next WhatsApp
+    // chat has the same jid as before the provider switch.
+    if (chat.provider != .whatsapp or !std.mem.eql(u8, a.msg_read_last_jid.slice(), chat.jid.slice())) {
         a.msg_read_last_jid.set(chat.jid.slice());
         a.msg_read_attempts = 0;
         a.msg_read_retry_ticks = 0;
     }
+    if (chat.provider == .telegram) return refreshTelegramMessages(a);
+    if (chat.provider == .slack) return refreshSlackHistory(a);
     const chat_changed = !std.mem.eql(u8, a.displayed_jid.slice(), chat.jid.slice());
     if (chat_changed) stopAudio(a);
     // Instant first paint: render the chat's last known response from the

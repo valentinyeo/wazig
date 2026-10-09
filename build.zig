@@ -1,5 +1,13 @@
 const std = @import("std");
 
+fn sourceSection(start: []const u8, end: []const u8) []const u8 {
+    const source = @embedFile("src/main.zig");
+    const first = std.mem.indexOf(u8, source, start) orelse std.debug.panic("Missing read harness start: {s}", .{start});
+    const rest = source[first..];
+    const last = std.mem.indexOf(u8, rest, end) orelse std.debug.panic("Missing read harness end: {s}", .{end});
+    return rest[0..last];
+}
+
 // Files of the vendored libwebp 1.4.0 subset that decodes WebP (see vendor/libwebp).
 const libwebp_sources = [_][]const u8{
     "src/dec/alpha_dec.c",
@@ -165,6 +173,37 @@ pub fn build(b: *std.Build) void {
         const run_tests = b.addRunArtifact(tests);
         test_step.dependOn(&run_tests.step);
     }
+    // Compile the actual UI decisions with host stubs, rather than testing
+    // another copy of the state machine that can drift from main.zig.
+    const read_harness_source = std.mem.concat(b.allocator, u8, &.{
+        @embedFile("src/chat_reconcile_test.zig"),
+        sourceSection("fn refreshMessages(", "/// WAZI-79: the WAL tick"),
+        sourceSection("fn reconcileOpenChat(", "fn youSender("),
+        "fn resultFor(job: WacliJob) WacliResult { var storage = WacliResult{}; const result = &storage;\n",
+        sourceSection("    result.* = .{ .kind = job.kind", "    switch (job.kind)"),
+        "return storage; }\nfn deliverChats(a: *App, result: *const WacliResult) void {\n",
+        sourceSection("                    // A stale failure must not restart", "                },\n                .messages =>"),
+        "}\nfn deliver(a: *App, result: *WacliResult) void { a.pending -= 1;\n",
+        sourceSection("                    // Chat kind + error only", "                },\n                .reaction =>"),
+        "}\nfn tick(a: *App) void {\n",
+        sourceSection("                if (a.msg_read_retry_ticks > 0)", "                if (changed and"),
+        "}\n",
+        sourceSection("fn applyMessageData(", "    var selected_id = Utf8Text(191){};"),
+        "_ = list; _ = chat_changed; a.painted += 1;\n",
+        sourceSection("    a.displayed_jid.set(chat.jid.slice());\n    //", "    // Optimistic bubbles"),
+        "return true; }\n",
+    }) catch @panic("Out of memory building read harness");
+    const read_harness = b.addWriteFiles().add("chat_reconcile_test.zig", read_harness_source);
+    const read_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = read_harness,
+        .target = b.resolveTargetQuery(.{}),
+        .imports = &.{.{ .name = "chat_reconcile", .module = b.createModule(.{
+            .root_source_file = b.path("src/chat_reconcile.zig"),
+            .target = b.resolveTargetQuery(.{}),
+        }) }},
+    }) });
+    test_step.dependOn(&b.addRunArtifact(read_tests).step);
+
     // webp.zig tests use the host target: they must run on the CI machine
     // even when the exe is cross-compiled for Windows.
     const webp_tests = b.addTest(.{
