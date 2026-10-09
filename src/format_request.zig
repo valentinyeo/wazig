@@ -37,8 +37,10 @@ pub fn formatRequestBody(allocator: std.mem.Allocator, anthropic: bool, model: [
         try appendJsonEscaped(&body, allocator, system_prompt);
         try body.appendSlice(allocator, "\"},{\"role\":\"user\",\"content\":\"");
     }
+    // Tagged so the model formats a note that greets "Valentin" instead of answering it.
+    try body.appendSlice(allocator, "<transcript>\\n");
     try appendJsonEscaped(&body, allocator, transcript);
-    try body.appendSlice(allocator, "\"}]}");
+    try body.appendSlice(allocator, "\\n</transcript>\"}]}");
     return body.toOwnedSlice(allocator);
 }
 
@@ -89,7 +91,7 @@ test "anthropic format request uses a system field and no reasoning" {
     try std.testing.expect(root.get("temperature") == null);
     // Haiku 5.5 thinks by default; summaries want speed.
     try std.testing.expectEqualStrings("disabled", root.get("thinking").?.object.get("type").?.string);
-    try std.testing.expectEqualStrings("hi\nthere", root.get("messages").?.array.items[0].object.get("content").?.string);
+    try std.testing.expectEqualStrings("<transcript>\nhi\nthere\n</transcript>", root.get("messages").?.array.items[0].object.get("content").?.string);
 }
 
 test "openrouter format request keeps the system message and reasoning" {
