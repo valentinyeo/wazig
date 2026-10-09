@@ -36,6 +36,9 @@ jobs:
       - name: Test
         run: zig build test
 
+      - name: Outbox lifecycle and regression controls
+        run: python3 tools/test_outbox_runtime.py --zig "$(command -v zig)" --negative-controls
+
       - name: Stretch tests
         run: zig test src/stretch.zig
 
