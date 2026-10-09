@@ -74,6 +74,7 @@ const timer_update_check = 5;
 const timer_update_restart = 6;
 const timer_update_first_check = 8;
 const timer_telegram = 7;
+const timer_slack_mark = 9;
 // Telegram-specific commands live past the shared palette command block.
 const command_telegram_login = 2025;
 const command_telegram_logout = 2026;
@@ -484,7 +485,7 @@ const PendingReaction = struct {
     retry_at_ms: u64 = 0,
 };
 
-const WacliJobKind = enum(u8) { chats, groups, messages, reaction, slack_workspace, slack_users, slack_history, slack_replies, slack_send, slack_attach, slack_download, slack_auth, cache_tag };
+const WacliJobKind = enum(u8) { chats, groups, messages, reaction, slack_workspace, slack_users, slack_history, slack_replies, slack_send, slack_attach, slack_download, slack_auth, slack_mark, cache_tag };
 const wacli_kind_count = @typeInfo(WacliJobKind).@"enum".fields.len;
 
 const WacliJob = struct {
@@ -862,6 +863,11 @@ const App = struct {
     // Hash of the last applied bridge history answer; 0 after anything else
     // may have repainted the message list.
     slack_history_hash: u64 = 0,
+    // WAZI-104: debounced conversations.mark target for the viewed Slack
+    // chat. Stays stored after the mark fires, so an unchanged view never
+    // sends the same mark twice.
+    slack_mark_channel: Utf8Text(191) = .{},
+    slack_mark_ts: Utf8Text(191) = .{},
     slack_stop: std.atomic.Value(bool) = .init(false),
     slack_connected: std.atomic.Value(bool) = .init(false),
     slack_event_pending: std.atomic.Value(usize) = .init(0),
@@ -1537,7 +1543,7 @@ fn wacliShutdown(a: *App) void {
 /// sleep then stalls only Slack work, never wacli reads/writes.
 fn jobIsSlack(kind: WacliJobKind) bool {
     return switch (kind) {
-        .slack_workspace, .slack_users, .slack_history, .slack_replies, .slack_send, .slack_attach, .slack_download, .slack_auth => true,
+        .slack_workspace, .slack_users, .slack_history, .slack_replies, .slack_send, .slack_attach, .slack_download, .slack_auth, .slack_mark => true,
         else => false,
     };
 }
@@ -1590,7 +1596,7 @@ fn wacliRunJob(a: *App, job: WacliJob) void {
     };
     result.* = .{ .kind = job.kind, .gen = job.gen, .jid = job.jid, .msg_id = job.msg_id, .extra = job.extra, .started_ms = job.started_ms };
     switch (job.kind) {
-        .slack_workspace, .slack_users, .slack_history, .slack_replies, .slack_send, .slack_attach, .slack_download, .slack_auth => {
+        .slack_workspace, .slack_users, .slack_history, .slack_replies, .slack_send, .slack_attach, .slack_download, .slack_auth, .slack_mark => {
             var slack_args: [max_wacli_args][]const u8 = undefined;
             var slack_count: usize = 0;
             while (slack_count < job.arg_count) : (slack_count += 1) slack_args[slack_count] = job.args[slack_count].slice();
@@ -1602,6 +1608,7 @@ fn wacliRunJob(a: *App, job: WacliJob) void {
                 .slack_send => .send_text,
                 .slack_attach => .send_image,
                 .slack_auth => .auth,
+                .slack_mark => .mark,
                 else => .download,
             };
             slack_win.last_status = 0;
@@ -3643,6 +3650,10 @@ fn applySlackHistory(a: *App, raw: []const u8) void {
     }
     if (a.canvas) |canvas| _ = win.InvalidateRect(canvas, null, win.TRUE);
     if (a.chats_hwnd) |chats_list| _ = win.InvalidateRect(chats_list, null, win.TRUE);
+    // Fresh history for the chat on screen: clear the badge and queue the
+    // debounced conversations.mark. markChatRead's user_viewed gate keeps
+    // startup and background refreshes from marking anything.
+    markChatRead(a);
 }
 
 /// Merge conversations.replies (parent + children) into the open chat.
@@ -3672,6 +3683,9 @@ fn applySlackReplies(a: *App, raw: []const u8) void {
         insertSlackMessageSorted(a, message);
     }
     if (a.canvas) |canvas| _ = win.InvalidateRect(canvas, null, win.TRUE);
+    // A thread reply can be the newest displayed message; raise the mark
+    // target to it through the same debounced request (WAZI-104).
+    if (a.user_viewed) requestSlackMark(a, chat.jid.slice());
 }
 
 fn insertSlackMessageSorted(a: *App, message: Message) void {
@@ -4189,6 +4203,9 @@ fn applySlackEvent(a: *App, event: *slack_win.Event) void {
         if (from_me) dropPendingForEcho(a, event);
         const message = buildSlackMessage(a, item);
         insertSlackMessageSorted(a, message);
+        // WAZI-104: the chat is on screen, so a message arriving while it is
+        // open becomes read through the same debounced mark as a fresh view.
+        if (a.user_viewed) requestSlackMark(a, channel);
         if (item.file_url.len > 0) requestSlackDownload(a, channel, item);
         if (a.canvas) |canvas| _ = win.InvalidateRect(canvas, null, win.TRUE);
     } else {
@@ -4450,8 +4467,6 @@ fn markChatRead(a: *App) void {
         return;
     }
     if (chat.provider == .slack) {
-        // v1 ceiling: Slack read state is local-only; upgrade path adds
-        // conversations.mark via the socket-connected app token.
         chat.unread = false;
         chat.unread_count = 0;
         // The list is rebuilt from the cache on every reload: clear it there too.
@@ -4460,6 +4475,7 @@ fn markChatRead(a: *App) void {
             cached.unread_count = 0;
         }
         if (a.chats_hwnd) |list| _ = win.InvalidateRect(list, null, win.TRUE);
+        requestSlackMark(a, chat.jid.slice());
         return;
     }
     if (!chat.unread and chat.unread_count == 0) return;
@@ -4483,6 +4499,45 @@ fn markChatRead(a: *App) void {
         if (a.chats_hwnd) |list| _ = win.InvalidateRect(list, null, win.TRUE);
     }
     startNextMarkRead(a);
+}
+
+// Quiet period before one conversations.mark goes out for the viewed Slack
+// chat: quick chat switches replace the pending target instead of firing a
+// call per view (WAZI-104).
+const slack_mark_debounce_ms: u32 = 750;
+
+/// Remembers the newest displayed ts of the open Slack chat as the debounce
+/// target and (re)starts the quiet-period timer; the timer expiry enqueues
+/// one conversations.mark (fireSlackMark). markChatRead's user_viewed gate
+/// has already run: startup and background refreshes never land here.
+fn requestSlackMark(a: *App, channel: []const u8) void {
+    var newest: []const u8 = "";
+    for (a.messages[0..a.message_count]) |*message| {
+        newest = slack.newerMarkTs(newest, message.id.slice());
+    }
+    if (slack.markDebounce(a.slack_mark_channel.slice(), a.slack_mark_ts.slice(), channel, newest) == .skip) return;
+    a.slack_mark_channel.set(channel);
+    a.slack_mark_ts.set(newest);
+    if (a.hwnd) |hwnd| {
+        _ = win.KillTimer(hwnd, timer_slack_mark);
+        _ = win.SetTimer(hwnd, timer_slack_mark, slack_mark_debounce_ms, null);
+    }
+}
+
+/// The quiet period ended: send one mark for the stored target. The target
+/// stays stored so an unchanged view never repeats the request; a view that
+/// ended into search or another messenger (user_viewed false again) is not
+/// marked. Failures are best effort and land in the launch log.
+fn fireSlackMark(a: *App) void {
+    const channel = a.slack_mark_channel.slice();
+    const ts = a.slack_mark_ts.slice();
+    if (channel.len == 0 or ts.len == 0) return;
+    if (!a.user_viewed) return;
+    if (!slackConfigured(a)) return;
+    var job = WacliJob{ .kind = .slack_mark };
+    job.jid.set(channel);
+    wacliJobArgs(&job, &.{ channel, ts });
+    wacliEnqueue(a, job, false);
 }
 
 fn removeFirstPendingRead(a: *App) void {
@@ -13271,6 +13326,7 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
                         }
                     }
                 },
+                .slack_mark => {}, // Best effort: failures already hit the launch log above.
             }
             return 0;
         },
@@ -13643,6 +13699,11 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
                 _ = win.KillTimer(hwnd, timer_chat_select);
                 a.chat_selection_pending = false;
                 refreshMessages(a);
+            } else if (wparam == timer_slack_mark) {
+                // WAZI-104: the viewed Slack chat stayed still long enough;
+                // one conversations.mark goes out for its newest displayed ts.
+                _ = win.KillTimer(hwnd, timer_slack_mark);
+                fireSlackMark(a);
             } else if (wparam == timer_update_first_check) {
                 _ = win.KillTimer(hwnd, timer_update_first_check);
                 startUpdateCheck(hwnd, false);
