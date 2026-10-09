@@ -1,4 +1,5 @@
 const std = @import("std");
+const child_process = @import("child_process.zig");
 const auth_status = @import("auth_status.zig");
 const audio = @import("audio.zig");
 const avatar = @import("avatar.zig");
@@ -1644,7 +1645,7 @@ fn wacliRunJob(a: *App, job: WacliJob) void {
         },
         else => {},
     }
-    const run = std.process.run(a.allocator, a.io, .{
+    const run = child_process.run(a.allocator, a.io, .{
         .argv = argv[0..count],
         .stdout_limit = .limited(8 * 1024 * 1024),
         .stderr_limit = .limited(256 * 1024),
@@ -4759,7 +4760,7 @@ fn startNextMarkRead(a: *App) void {
     // With sync stopped, the read takes the store lock itself.
     const delegated = a.sync_child != null;
     if (delegated and nowUnixSeconds() - a.sync_started_secs < sync_gate.delegate_warmup_secs) return;
-    const child = std.process.spawn(a.io, .{
+    const child = child_process.spawn(a.io, .{
         .argv = &.{ a.wacli_path, "--json", "--lock-wait", if (delegated) "0s" else "70s", "chats", "mark-read", "--receipts", "--chat", a.pending_reads[0].slice() },
         .stdin = .ignore,
         .stdout = .ignore,
@@ -5479,7 +5480,7 @@ fn startMediaDownload(a: *App, chat_jid: []const u8, message_id: []const u8) boo
     slot.id.set(message_id);
     stopSync(a, "media");
     const args = [_][]const u8{ a.wacli_path, "--json", "--lock-wait", "10s", "--timeout", "60s", "media", "download", "--chat", slot.jid.slice(), "--id", slot.id.slice() };
-    const child = std.process.spawn(a.io, .{
+    const child = child_process.spawn(a.io, .{
         .argv = &args,
         .stdin = .ignore,
         .stdout = .ignore,
@@ -7865,7 +7866,7 @@ fn startSync(a: *App) void {
     const refresh = sync_gate.gapElapsed(a.last_sync_refresh_ms, now_ms, sync_gate.sync_refresh_gap_ms);
     const base_argv = [_][]const u8{ a.wacli_path, "--events", "sync", "--follow", "--max-reconnect", "0", "--stale-threshold", "1m", "--download-media" };
     const refresh_argv = base_argv ++ [_][]const u8{ "--refresh-contacts", "--refresh-groups" };
-    const child = std.process.spawn(a.io, .{
+    const child = child_process.spawn(a.io, .{
         .argv = if (refresh) &refresh_argv else &base_argv,
         .stdin = .ignore,
         .stdout = .ignore,
@@ -8297,7 +8298,7 @@ fn startNextSend(a: *App) void {
             count += 2;
         }
     }
-    const child = std.process.spawn(a.io, .{
+    const child = child_process.spawn(a.io, .{
         .argv = args[0..count],
         .stdin = .ignore,
         .stdout = .pipe,
@@ -9853,7 +9854,7 @@ fn startNextArchive(a: *App) void {
     if (mediaBusy(a) or a.send_child != null or sendReadyPending(a) or avatarBusy(a)) return;
     stopSync(a, "archive");
     const pending = &a.pending_archives[0];
-    const child = std.process.spawn(a.io, .{
+    const child = child_process.spawn(a.io, .{
         .argv = &.{ a.wacli_path, "--json", "--lock-wait", "10s", "chats", if (pending.should_unarchive) "unarchive" else "archive", "--chat", pending.jid.slice() },
         .stdin = .ignore,
         .stdout = .ignore,
@@ -10087,7 +10088,7 @@ fn controlRound(a: *App, call: *ControlCall) ControlOutcome {
 /// Pipe thread: the same read-only chats read refreshChats queues, for a
 /// list the sidebar is not showing (another view, --all, --archived).
 fn controlReadWhatsAppChats(a: *App, archived: bool) ?[]u8 {
-    const run = std.process.run(a.allocator, a.io, .{
+    const run = child_process.run(a.allocator, a.io, .{
         .argv = &.{ a.wacli_path, "--json", "--read-only", "chats", "list", "--limit", "250", if (archived) "--archived" else "--no-archived" },
         .stdout_limit = .limited(8 * 1024 * 1024),
         .stderr_limit = .limited(64 * 1024),
@@ -14743,7 +14744,7 @@ fn findCacheTag(init: std.process.Init, wacli_path: []u8, scratch_dir: []const u
     defer init.gpa.free(out_path);
     const cwd = std.Io.Dir.cwd();
     var out_file = cwd.createFile(init.io, out_path, .{}) catch return null;
-    const child = std.process.spawn(init.io, .{
+    const child = child_process.spawn(init.io, .{
         .argv = &.{ wacli_path, "--json", "--read-only", "auth", "status" },
         .stdin = .ignore,
         .stdout = .{ .file = out_file },
