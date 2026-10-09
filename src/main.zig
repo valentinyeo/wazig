@@ -11,6 +11,7 @@ const pending_reads = @import("pending_reads.zig");
 const chat_order = @import("chat_order.zig");
 const compose_layout = @import("compose_layout.zig");
 const media_age = @import("media_age.zig");
+const media_drain = @import("media_drain.zig");
 const sync_gate = @import("sync_gate.zig");
 const webp_detect = @import("webp.zig");
 const paste_image = @import("paste_image.zig");
@@ -4738,7 +4739,7 @@ fn retryPendingDownload(a: *App) void {
     }
     a.pending_download_jid.set("");
     a.pending_download_id.set("");
-    if (found) |index| downloadMedia(a, index, false);
+    if (found) |index| _ = downloadMedia(a, index, false);
 }
 
 fn clearMessages(a: *App) void {
@@ -4887,7 +4888,7 @@ fn advanceAudio(a: *App, after_id: []const u8) bool {
             startAudioPlayback(a, message);
             return true;
         } else if (freeMediaSlot(a) != null or mediaDownloading(a, message.id.slice())) {
-            downloadMedia(a, index, true);
+            _ = downloadMedia(a, index, true);
             // Arm only if the download actually started; a failed spawn just
             // ends the chain instead of leaking a stale trigger.
             if (mediaDownloading(a, message.id.slice())) {
@@ -5393,20 +5394,24 @@ fn startMediaDownload(a: *App, chat_jid: []const u8, message_id: []const u8) boo
     return true;
 }
 
-fn downloadMedia(a: *App, message_index: usize, automatic: bool) void {
-    if (message_index >= a.message_count or a.selected_chat >= a.chat_count) return;
+/// Starts a download for one message. Returns true only when state actually
+/// changed: a child spawned, or a manual click was queued for when a slot
+/// frees up. Every false answer means "nothing happened", which is what the
+/// drain loop keys on so a startable-looking candidate can never spin it.
+fn downloadMedia(a: *App, message_index: usize, automatic: bool) bool {
+    if (message_index >= a.message_count or a.selected_chat >= a.chat_count) return false;
     const message = &a.messages[message_index];
-    if (message.media_type.len == 0 or message.id.len == 0) return;
+    if (message.media_type.len == 0 or message.id.len == 0) return false;
     // Already on disk (e.g. a parallel download finished since the request):
     // a retry must not re-download.
-    if (message.local_path.len > 0) return;
+    if (message.local_path.len > 0) return false;
     const chat = &a.chats[a.selected_chat];
     // wacli media download is a WhatsApp-store call. Slack attachments fetch
     // through requestSlackDownload and Telegram ones through the TDLib
     // client; neither may reach here with their chat id as a WhatsApp jid.
-    if (chat.provider != .whatsapp) return;
+    if (chat.provider != .whatsapp) return false;
     // Already downloading in another slot: nothing to queue.
-    if (mediaDownloading(a, message.id.slice())) return;
+    if (mediaDownloading(a, message.id.slice())) return false;
     if (freeMediaSlot(a) == null) {
         // Slots full: remember one manual click and retry it when a slot
         // frees up; automatic requests just wait for their next timer tick.
@@ -5414,14 +5419,16 @@ fn downloadMedia(a: *App, message_index: usize, automatic: bool) void {
             a.pending_download_jid.set(chat.jid.slice());
             a.pending_download_id.set(message.id.slice());
             setStatus(a, "Attachment download queued");
+            return true;
         }
-        return;
+        return false;
     }
     // The only failure left here is a spawn failure, which sets its own
     // status and must not register a pending retry.
-    if (!startMediaDownload(a, chat.jid.slice(), message.id.slice())) return;
+    if (!startMediaDownload(a, chat.jid.slice(), message.id.slice())) return false;
     setStatus(a, if (automatic) "Downloading media..." else "Downloading attachment...");
     if (a.hwnd) |hwnd| _ = win.UpdateWindow(hwnd);
+    return true;
 }
 
 // Pure membership check: the attempt ring records downloads that finished
@@ -5508,33 +5515,42 @@ fn autoDownloadNextMedia(a: *App) bool {
     // mark-read handed to the sync child finishes first.
     if (a.sync_child != null and (a.read_child != null or
         !sync_gate.gapElapsed(a.last_sync_stop_ms, win.GetTickCount64(), sync_gate.media_stop_gap_ms))) return false;
+    // wacli media download only serves WhatsApp: scanning Slack or Telegram
+    // attachments would name a candidate whose download always returns
+    // without starting one, and the drain would spin forever (WAZI-103).
+    if (a.selected_chat >= a.chat_count or a.chats[a.selected_chat].provider != .whatsapp) return false;
     // Newest first: the media the user is looking at arrives first.
+    const now = nowUnixSeconds();
+    const chat_jid = a.chats[a.selected_chat].jid.slice();
+    var candidates: [max_messages]media_drain.Candidate = undefined;
+    var count: usize = 0;
     var index = a.message_count;
     while (index > 0) {
         index -= 1;
         const message = &a.messages[index];
-        if (!isDownloadableMedia(message) or message.local_path.len > 0 or message.id.len == 0 or
-            mediaDownloading(a, message.id.slice())) continue;
-        // Skip attachments older than the cache cutoff; the store's
-        // LocalPath (kept across restarts) already holds anything fetched.
-        if (!media_age.withinDays(message.timestamp.slice(), nowUnixSeconds(), media_cache_days)) continue;
-        // Live sync runs with --download-media and fetches what arrives
-        // while it runs: pausing it for those would restart sync on every
-        // incoming photo in the open chat.
-        if (a.sync_child != null) {
-            if (media_age.unixSeconds(message.timestamp.slice())) |sent| {
-                if (sent >= a.sync_started_secs) continue;
-            }
-        }
-        if (mediaAttempted(a, message.id.slice())) continue;
-        // The persistent fetched index: anything downloaded before (even in
-        // an earlier session) is never re-checked or re-downloaded. A manual
-        // click bypasses this, so a lost file is still recoverable.
-        if (mediaWasFetched(a, a.chats[a.selected_chat].jid.slice(), message.id.slice())) continue;
-        downloadMedia(a, index, true);
-        return true;
+        const id = message.id.slice();
+        candidates[count] = .{
+            .index = index,
+            .downloadable = isDownloadableMedia(message),
+            .has_id = id.len > 0,
+            .has_local_path = message.local_path.len > 0,
+            .in_flight = mediaDownloading(a, id),
+            .within_age = media_age.withinDays(message.timestamp.slice(), now, media_cache_days),
+            // Live sync runs with --download-media and fetches what arrives
+            // while it runs: pausing it for those would restart sync on every
+            // incoming photo in the open chat.
+            .newer_than_sync_start = a.sync_child != null and
+                (media_age.unixSeconds(message.timestamp.slice()) orelse 0) >= a.sync_started_secs,
+            .attempted = mediaAttempted(a, id),
+            .fetched = mediaWasFetched(a, chat_jid, id),
+            .whatsapp_store = true,
+        };
+        count += 1;
     }
-    return false;
+    const pick = media_drain.selectNext(candidates[0..count]) orelse return false;
+    // A started download is the only progress the drain may count on; a
+    // spawn failure or a slot snatched away reports false and stops it.
+    return downloadMedia(a, pick, true);
 }
 
 // One stopSync/startSync per media burst, not per wave of downloads: refill
@@ -5543,7 +5559,17 @@ fn autoDownloadNextMedia(a: *App) bool {
 // once the burst has nothing left to download.
 fn drainMediaDownloads(a: *App) void {
     retryPendingDownload(a);
-    while (freeMediaSlot(a) != null and autoDownloadNextMedia(a)) {}
+    // WAZI-103: a turn that starts no download ends the drain, so a
+    // candidate that can never start (send child holding the store, spawn
+    // failure) cannot spin this loop on the UI thread; the step bound is a
+    // hard backstop on top. The entry event (a finished download) counts as
+    // the first change of state.
+    var steps: usize = 0;
+    var started = true;
+    while (media_drain.mayDrainStep(steps, started) and freeMediaSlot(a) != null) {
+        started = autoDownloadNextMedia(a);
+        steps += 1;
+    }
 }
 
 fn ensureAvatarSession(a: *App) ?*avatar.Session {
@@ -6722,7 +6748,7 @@ fn openImageInViewerOrQueue(a: *App, index: usize, message: *const Message) void
     if (a.selected_chat < a.chat_count and a.chats[a.selected_chat].provider == .whatsapp) {
         a.pending_viewer_open_jid.set(a.chats[a.selected_chat].jid.slice());
         a.pending_viewer_open_id.set(message.id.slice());
-        downloadMedia(a, index, false);
+        _ = downloadMedia(a, index, false);
     } else {
         setStatus(a, "Still downloading");
     }
@@ -8987,7 +9013,7 @@ fn handleCanvasClick(a: *App, hwnd: win.HWND, x: i32, y: i32) void {
         if (x >= media.left and x <= media.right and y >= media.top and y <= media.bottom) {
             a.selected_message = index;
             if (item.local_path.len == 0) {
-                downloadMedia(a, index, false);
+                _ = downloadMedia(a, index, false);
             } else if (isAudio(item)) {
                 handleAudioClick(a, item, x);
             } else if (std.ascii.eqlIgnoreCase(item.media_type.slice(), "video")) {
@@ -9047,7 +9073,7 @@ fn handleCanvasDoubleClick(a: *App, x: i32, y: i32) bool {
         a.selected_message = index;
         if (item.local_path.len == 0) {
             setStatus(a, "Downloading image...");
-            downloadMedia(a, index, false);
+            _ = downloadMedia(a, index, false);
             return true;
         }
         // A downloaded still image already opened on the first half of this
@@ -10543,7 +10569,7 @@ fn paletteActivate(a: *App) void {
         // Slack and Telegram fetch their own media; only WhatsApp goes
         // through wacli. downloadMedia sets its own status.
         if (a.selected_chat < a.chat_count and a.chats[a.selected_chat].provider == .whatsapp) {
-            downloadMedia(a, index, false);
+            _ = downloadMedia(a, index, false);
         } else setStatus(a, "Still downloading");
         return;
     }
@@ -13759,7 +13785,7 @@ fn playSelectedAudio(a: *App) void {
                 } else if (audio_item.local_path.len > 0) {
                     startAudioPlayback(a, audio_item);
                 } else {
-                    downloadMedia(a, selected, false);
+                    _ = downloadMedia(a, selected, false);
                 }
                 return;
             }
