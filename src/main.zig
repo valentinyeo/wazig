@@ -83,6 +83,8 @@ const timer_update_first_check = 8;
 const timer_telegram = 7;
 const timer_slack_mark = 9;
 const timer_voice = 10;
+// Repaints the update card's progress bar while a download runs.
+const timer_update_card = 60;
 // Telegram-specific commands live past the shared palette command block.
 const command_telegram_login = 2025;
 const command_telegram_logout = 2026;
@@ -686,6 +688,16 @@ const App = struct {
     // True when the running check came from the Ctrl+K command, so its
     // result installs in the foreground with its own status line.
     update_check_manual: bool = false,
+    // Update card (bottom-left of the sidebar). The release is downloaded and
+    // verified in the background; the card's click does only the swap and
+    // restart. Nothing restarts the app on its own.
+    update_staged: bool = false, // the pending tag is downloaded, verified and extracted
+    update_card_busy: bool = false, // the user clicked; waiting for stage and swap
+    update_click_wait: bool = false, // click arrived while staging still ran
+    update_card_error: [96]u8 = undefined,
+    update_card_error_len: usize = 0,
+    update_dismissed: [32]u8 = undefined,
+    update_dismissed_len: usize = 0,
     chats: [max_chats]Chat = [_]Chat{.{}} ** max_chats,
     chat_count: usize = 0,
     telegram: ?*tg.Client = null,
@@ -9998,6 +10010,18 @@ fn emojiProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.
         win.WM_LBUTTONDOWN => {
             const x: i32 = @as(i16, @bitCast(loword(@as(usize, @bitCast(lparam)))));
             const y: i32 = @as(i16, @bitCast(hiword(@as(usize, @bitCast(lparam)))));
+            switch (updateCardHit(a, x, y)) {
+                .button => {
+                    updateCardClick(a);
+                    return 0;
+                },
+                .close => {
+                    updateCardDismiss(a);
+                    return 0;
+                },
+                .body => return 0,
+                .none => {},
+            }
             if (a.emoji_list) |list| {
                 const strip = stripRightOf(list, hwnd);
                 if (hitStrip(strip, x, y)) {
@@ -12004,10 +12028,7 @@ fn runCommand(a: *App, command: u16) void {
             if (a.hwnd) |hwnd| startUpdateCheck(hwnd, true);
         },
         command_update_install => {
-            if (a.update_pending == null) return;
-            a.update_install_auto = false;
-            setStatus(a, "Downloading update...");
-            if (a.hwnd) |hwnd| startUpdateInstall(hwnd);
+            updateCardClick(a);
         },
         command_telegram_login => {
             startTelegramAdd(a);
@@ -12191,7 +12212,7 @@ fn layout(a: *App, width: i32, height: i32) void {
             if (win.SetWindowRgn(hwnd, rgn, win.TRUE) == 0) _ = win.DeleteObject(rgn);
         }
     }
-    if (a.chats_hwnd) |hwnd| _ = win.MoveWindow(hwnd, 0, header_height + search_height, left_width - scrollbar_width, height - header_height - search_height - status_height, win.TRUE);
+    if (a.chats_hwnd) |hwnd| _ = win.MoveWindow(hwnd, 0, header_height + search_height, left_width - scrollbar_width, height - header_height - search_height - status_height - updateCardSpan(a), win.TRUE);
     if (a.status) |hwnd| _ = win.MoveWindow(hwnd, px(a, 12), height - status_height, left_width - px(a, 24), status_height, win.TRUE);
     if (a.canvas) |hwnd| _ = win.MoveWindow(hwnd, left_width + 1, header_height, width - left_width - 1, height - header_height - sizes.strip_height, win.TRUE);
     if (a.emoji_btn) |hwnd| _ = win.MoveWindow(hwnd, width - px(a, 236), height - px(a, 55), px(a, 44), px(a, 44), win.TRUE);
@@ -13850,8 +13871,11 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
                 1 => {
                     a.update_installed = true;
                     a.update_failures = 0;
-                    setStatus(a, "Update installed - restarting in 10 seconds");
-                    _ = win.SetTimer(hwnd, timer_update_restart, update_restart_delay_ms, null);
+                    setStatus(a, "Update installed - restarting");
+                    // Only the card click starts an install, so the restart is wanted now;
+                    // the timer still waits out unsent typing and sends in flight.
+                    _ = win.SetTimer(hwnd, timer_update_restart, update_card_restart_delay_ms, null);
+                    updateCardRefresh(a);
                 },
                 2 => {
                     const upd: *UpdateAvailable = @ptrFromInt(@as(usize, @bitCast(lparam)));
@@ -13873,24 +13897,41 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
                     }
                     a.update_pending = upd;
                     if (is_new_offer) a.update_failures = 0;
-                    // An install already in flight reaches the newest tag
-                    // itself; keep this one pending instead of stacking a
-                    // second install over it.
-                    if (a.update_install_running.load(.acquire)) return 0;
-                    a.update_install_auto = !a.update_check_manual;
-                    // Updates install without a click: every hit, new or
-                    // re-found, starts the download right away. The install
-                    // guard refuses a second concurrent run.
-                    var install_buf: [128]u8 = undefined;
-                    setStatus(a, std.fmt.bufPrint(&install_buf, "Installing update {s}...", .{upd.tag}) catch "Installing update...");
-                    var install_log_buf: [160]u8 = undefined;
-                    appendLaunchLog(a, std.fmt.bufPrint(&install_log_buf, "update: installing {s}", .{upd.tag}) catch "update: installing");
-                    startUpdateInstall(hwnd);
+                                    // A new release resets the card; a click already in flight
+                    // keeps going on its own.
+                    if (is_new_offer) {
+                        a.update_staged = false;
+                        a.update_card_error_len = 0;
+                    }
+                    if (a.update_card_busy or a.update_install_running.load(.acquire)) {
+                        updateCardRefresh(a);
+                        return 0;
+                    }
+                    a.update_install_auto = true;
+                    // Download and verify quietly now; the card click only swaps
+                    // and restarts. Nothing installs on its own.
+                    if (!a.update_staged) startUpdateInstall(hwnd, true);
+                    var offer_buf: [128]u8 = undefined;
+                    setStatus(a, std.fmt.bufPrint(&offer_buf, "New version {s} is available - use the card to update", .{upd.tag}) catch "New version available");
+                    var offer_log_buf: [160]u8 = undefined;
+                    appendLaunchLog(a, std.fmt.bufPrint(&offer_log_buf, "update: card offered {s}", .{upd.tag}) catch "update: card offered");
+                    updateCardRefresh(a);
                 },
                 3 => {
                     a.update_failures = 0;
                     var none_buf: [96]u8 = undefined;
                     setStatus(a, std.fmt.bufPrint(&none_buf, "You are on v{s} - this is the newest version", .{app_version}) catch "No updates found");
+                },
+                9 => {
+                    // Downloaded and verified in the background. If the user
+                    // already clicked, finish with the swap now.
+                    a.update_staged = true;
+                    a.update_failures = 0;
+                    if (a.update_click_wait) {
+                        a.update_click_wait = false;
+                        startUpdateInstall(hwnd, false);
+                    }
+                    updateCardRefresh(a);
                 },
                 6 => {
                     if (a.update_install_auto) {
@@ -13899,8 +13940,20 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
                         a.update_failures = 0;
                     }
                     if (!a.update_install_auto or a.update_failures >= 2) setStatus(a, "Update blocked: another copy of Messages is running - close other copies and try again");
+                    updateCardFail(a, "Another copy of Messages is running");
                 },
                 8 => {
+                    a.update_click_wait = false;
+                    if (a.update_card_busy) {
+                        // The release is no longer newer than this copy: nothing to offer.
+                        a.update_card_busy = false;
+                        if (a.update_pending) |old| {
+                            old.deinit(std.heap.page_allocator);
+                            std.heap.page_allocator.destroy(old);
+                            a.update_pending = null;
+                        }
+                        updateCardRefresh(a);
+                    }
                     if (a.update_install_auto) {
                         a.update_failures += 1;
                     } else {
@@ -13921,6 +13974,9 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
                     // when the failure repeats.
                     const auto = wparam == 4 or (wparam == 7 and a.update_install_auto);
                     if (!auto or a.update_failures >= 2) setStatus(a, text);
+                    // A failed background download stays quiet on the card (the
+                    // next check retries it); a failed click shows the error.
+                    if (wparam == 7 and (a.update_card_busy or a.update_click_wait)) updateCardFail(a, std.mem.span(name));
                 },
                 else => {},
             }
@@ -14315,6 +14371,7 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
             }
             if (a.chats_hwnd) |list| drawScrollbar(hdc, stripRightOf(list, hwnd), listboxScrollInfo(list), a.brush_muted.?);
             if (a.compose) |edit| drawScrollbar(hdc, stripRightOf(edit, hwnd), composeScrollInfo(a, edit), a.brush_muted.?);
+            paintUpdateCard(a, hdc);
             _ = win.EndPaint(hwnd, &paint);
             return 0;
         },
@@ -14535,9 +14592,16 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
                 fireSlackMark(a);
             } else if (wparam == timer_update_first_check) {
                 _ = win.KillTimer(hwnd, timer_update_first_check);
+                removeLeftoverOldExe();
                 startUpdateCheck(hwnd, false);
             } else if (wparam == timer_update_check) {
                 startUpdateCheck(hwnd, false);
+            } else if (wparam == timer_update_card) {
+                if (updateCardVisible(a)) {
+                    var card_rc = updateCardRect(a);
+                    _ = win.InvalidateRect(hwnd, &card_rc, win.FALSE);
+                }
+                if (!a.update_card_busy and !a.update_install_running.load(.acquire)) _ = win.KillTimer(hwnd, timer_update_card);
             } else if (wparam == timer_update_restart) {
                 // Never throw away unsent typing or a message still on its
                 // way to WhatsApp: keep pushing the restart back until the
@@ -15973,9 +16037,29 @@ const UpdateContext = struct {
     hwnd: win.HWND,
     manual: bool,
     install: bool,
+    // With install: download and verify only; the swap waits for the card click.
+    stage_only: bool = false,
 };
 
-const UpdateOutcome = enum { none, blocked, installed };
+const UpdateOutcome = enum { none, blocked, installed, staged };
+
+// Download progress for the update card: written by the worker, read by the UI.
+var update_dl_done: std.atomic.Value(u64) = .init(0);
+var update_dl_total: std.atomic.Value(u64) = .init(0);
+var update_dl_active: std.atomic.Value(bool) = .init(false);
+
+/// WAZIG_FAKE_VERSION (test hook): names an OLDER version the app should
+/// believe it is on, so the update card can be shown for real. A value that
+/// is not older is ignored, so it can only ever offer the latest release.
+fn currentVersion() ?update.Version {
+    const real = update.parseVersion(app_version) orelse return null;
+    var buf: [32]u16 = undefined;
+    const len: usize = @intCast(win.GetEnvironmentVariableW(lit("WAZIG_FAKE_VERSION"), &buf, buf.len));
+    if (len == 0 or len >= buf.len) return real;
+    var text: [32]u8 = undefined;
+    for (buf[0..len], 0..) |c, i| text[i] = if (c < 128) @intCast(c) else '?';
+    return update.effectiveCurrent(real, text[0..len]);
+}
 
 /// A newer release found by a check: enough to ask the user, nothing more.
 /// The install path re-checks, so a stale download URL is never used.
@@ -15988,6 +16072,190 @@ const UpdateAvailable = struct {
         allocator.free(self.notes);
     }
 };
+
+// ---------------------------------------------------------------------------
+// Update card: a small card in the bottom left of the sidebar (above the
+// status line) announces a newer release. The release is downloaded and
+// verified in the background; "Update now" does only the fast swap and
+// restart. Layout, look and wording follow zigshell's in-app update card.
+// ---------------------------------------------------------------------------
+const update_card_restart_delay_ms: u32 = 600;
+const UpdateCardHit = enum { none, body, button, close };
+
+fn updateCardVisible(a: *const App) bool {
+    const pending = a.update_pending orelse return false;
+    if (a.update_installed or a.update_card_busy or a.update_card_error_len > 0) return true;
+    const dismissed = a.update_dismissed[0..a.update_dismissed_len];
+    return !std.mem.eql(u8, pending.tag[0..@min(pending.tag.len, a.update_dismissed.len)], dismissed);
+}
+
+fn updateCardHeight(a: *const App) i32 {
+    return px(a, 78);
+}
+
+/// Height the chat list gives up for the card (card plus gaps); 0 when hidden.
+fn updateCardSpan(a: *const App) i32 {
+    if (!updateCardVisible(a)) return 0;
+    return updateCardHeight(a) + px(a, 10);
+}
+
+fn updateCardRect(a: *const App) win.RECT {
+    const left_width = std.math.clamp(@divTrunc(a.compose_client_width, 3), px(a, 280), px(a, 390));
+    const bottom = a.compose_client_height - px(a, 26) - px(a, 6);
+    return .{ .left = px(a, 12), .top = bottom - updateCardHeight(a), .right = left_width - px(a, 12), .bottom = bottom };
+}
+
+fn updateCardButtonRect(a: *const App, card: win.RECT) win.RECT {
+    return .{ .left = card.left + px(a, 12), .top = card.bottom - px(a, 36), .right = card.left + px(a, 124), .bottom = card.bottom - px(a, 10) };
+}
+
+fn updateCardCloseRect(a: *const App, card: win.RECT) win.RECT {
+    return .{ .left = card.right - px(a, 28), .top = card.top + px(a, 4), .right = card.right - px(a, 4), .bottom = card.top + px(a, 28) };
+}
+
+fn updateCardPtIn(r: win.RECT, x: i32, y: i32) bool {
+    return x >= r.left and x < r.right and y >= r.top and y < r.bottom;
+}
+
+fn updateCardHit(a: *const App, x: i32, y: i32) UpdateCardHit {
+    if (!updateCardVisible(a)) return .none;
+    const card = updateCardRect(a);
+    if (!updateCardPtIn(card, x, y)) return .none;
+    const idle = !a.update_card_busy and !a.update_installed;
+    if (idle and updateCardPtIn(updateCardCloseRect(a, card), x, y)) return .close;
+    if (idle and updateCardPtIn(updateCardButtonRect(a, card), x, y)) return .button;
+    return .body;
+}
+
+/// Re-lays out the sidebar (the chat list shrinks or grows by the card) and
+/// keeps the progress timer running only while something is in flight.
+fn updateCardRefresh(a: *App) void {
+    const hwnd = a.hwnd orelse return;
+    layout(a, a.compose_client_width, a.compose_client_height);
+    if (a.update_card_busy or a.update_install_running.load(.acquire)) {
+        _ = win.SetTimer(hwnd, timer_update_card, 400, null);
+    } else {
+        _ = win.KillTimer(hwnd, timer_update_card);
+    }
+}
+
+fn updateCardFail(a: *App, text: []const u8) void {
+    a.update_card_busy = false;
+    a.update_click_wait = false;
+    const n = @min(text.len, a.update_card_error.len);
+    @memcpy(a.update_card_error[0..n], text[0..n]);
+    a.update_card_error_len = @max(n, 1);
+    var log_buf: [160]u8 = undefined;
+    appendLaunchLog(a, std.fmt.bufPrint(&log_buf, "update: card install failed: {s}", .{text}) catch "update: card install failed");
+    updateCardRefresh(a);
+}
+
+/// "Update now" and "Retry": the swap and restart happen on this click only.
+fn updateCardClick(a: *App) void {
+    if (a.update_pending == null or a.update_installed or a.update_card_busy) return;
+    const hwnd = a.hwnd orelse return;
+    a.update_card_error_len = 0;
+    a.update_install_auto = false;
+    a.update_card_busy = true;
+    appendLaunchLog(a, "update: card clicked");
+    // A background download still running finishes first; its completion
+    // message then starts the swap.
+    if (a.update_install_running.load(.acquire)) {
+        a.update_click_wait = true;
+    } else {
+        startUpdateInstall(hwnd, false);
+    }
+    updateCardRefresh(a);
+}
+
+/// Hides the card until a newer version than the dismissed one is found.
+fn updateCardDismiss(a: *App) void {
+    const pending = a.update_pending orelse return;
+    const n = @min(pending.tag.len, a.update_dismissed.len);
+    @memcpy(a.update_dismissed[0..n], pending.tag[0..n]);
+    a.update_dismissed_len = n;
+    updateCardRefresh(a);
+}
+
+/// A copy of this exe that an earlier in-app swap renamed aside cannot be
+/// deleted while that process runs; the restarted app removes it.
+fn removeLeftoverOldExe() void {
+    var buf: [530]u16 = undefined;
+    const len: usize = @intCast(win.GetModuleFileNameW(null, &buf, 519));
+    if (len == 0 or len >= 519) return;
+    for (".old", 0..) |c, i| buf[len + i] = c;
+    buf[len + 4] = 0;
+    _ = win.DeleteFileW(buf[0 .. len + 4 :0].ptr);
+}
+
+fn paintUpdateCard(a: *App, hdc: win.HDC) void {
+    if (!updateCardVisible(a)) return;
+    const pending = a.update_pending orelse return;
+    const card = updateCardRect(a);
+    paintRoundedButton(hdc, card, color_raised, color_text, a.font.?, color_selected, &[_]u16{});
+    _ = win.SetBkMode(hdc, win.TRANSPARENT);
+
+    // Title.
+    var title_buf: [64]u8 = undefined;
+    const tag = if (pending.tag.len > 0 and pending.tag[0] == 'v') pending.tag[1..] else pending.tag;
+    const failed = a.update_card_error_len > 0;
+    const title: []const u8 = if (a.update_installed)
+        "Restarting..."
+    else if (failed)
+        "Update failed"
+    else if (a.update_card_busy)
+        "Updating..."
+    else
+        std.fmt.bufPrint(&title_buf, "New version v{s}", .{tag}) catch "New version available";
+    _ = win.SelectObject(hdc, @ptrCast(a.font_bold.?));
+    _ = win.SetTextColor(hdc, color_text);
+    var title_rc = win.RECT{ .left = card.left + px(a, 12), .top = card.top + px(a, 8), .right = card.right - px(a, 32), .bottom = card.top + px(a, 30) };
+    drawAscii(hdc, &title_rc, title, win.DT_SINGLELINE | win.DT_VCENTER | win.DT_NOPREFIX | win.DT_END_ELLIPSIS);
+
+    // Second line: state, or a progress bar while updating.
+    _ = win.SelectObject(hdc, @ptrCast(a.font_small.?));
+    var line_buf: [112]u8 = undefined;
+    const pct: u32 = if (a.update_staged or a.update_installed) 100 else update.percent(update_dl_done.load(.acquire), update_dl_total.load(.acquire));
+    const busy = a.update_card_busy or a.update_installed;
+    const line: []const u8 = if (failed)
+        a.update_card_error[0..a.update_card_error_len]
+    else if (busy and pct >= 100)
+        "Installing..."
+    else if (busy)
+        std.fmt.bufPrint(&line_buf, "Downloading {d}%", .{pct}) catch "Downloading..."
+    else if (a.update_staged)
+        "Ready to install"
+    else
+        "Downloading in the background...";
+    _ = win.SetTextColor(hdc, color_muted);
+    var line_rc = win.RECT{ .left = card.left + px(a, 12), .top = card.top + px(a, 30), .right = card.right - px(a, 12), .bottom = card.top + px(a, 50) };
+    drawAscii(hdc, &line_rc, line, win.DT_SINGLELINE | win.DT_VCENTER | win.DT_NOPREFIX | win.DT_END_ELLIPSIS);
+
+    if (busy) {
+        const bar = win.RECT{ .left = card.left + px(a, 12), .top = card.bottom - px(a, 22), .right = card.right - px(a, 12), .bottom = card.bottom - px(a, 14) };
+        var track = bar;
+        if (win.CreateSolidBrush(color_selected)) |brush| {
+            _ = win.FillRect(hdc, &track, brush);
+            _ = win.DeleteObject(brush);
+        }
+        var fill = bar;
+        fill.right = bar.left + @divTrunc((bar.right - bar.left) * @as(i32, @intCast(pct)), 100);
+        if (win.CreateSolidBrush(color_accent)) |brush| {
+            _ = win.FillRect(hdc, &fill, brush);
+            _ = win.DeleteObject(brush);
+        }
+        return;
+    }
+
+    // Dismiss x.
+    var close_rc = updateCardCloseRect(a, card);
+    _ = win.SetTextColor(hdc, color_muted);
+    drawAscii(hdc, &close_rc, "x", win.DT_SINGLELINE | win.DT_VCENTER | win.DT_CENTER | win.DT_NOPREFIX);
+
+    // Button.
+    const label: []const u16 = if (failed) std.unicode.utf8ToUtf16LeStringLiteral("Retry") else std.unicode.utf8ToUtf16LeStringLiteral("Update now");
+    paintRoundedButton(hdc, updateCardButtonRect(a, card), color_accent, rgb(255, 255, 255), a.font_bold.?, null, label);
+}
 
 fn startUpdateCheck(hwnd: win.HWND, manual: bool) void {
     const a = app_ptr orelse return;
@@ -16009,18 +16277,18 @@ fn startUpdateCheck(hwnd: win.HWND, manual: bool) void {
     a.update_last_check_ms = now;
 }
 
-fn startUpdateInstall(hwnd: win.HWND) void {
+fn startUpdateInstall(hwnd: win.HWND, stage_only: bool) void {
     const a = app_ptr orelse return;
     // WAZI-81: a concurrent read-only check must never swallow an explicit
     // install request — activation fires checks constantly, so this guard
     // used to turn the update button into a silent no-op. performUpdate
     // re-checks and serializes on the update mutex itself.
     if (a.update_install_running.load(.acquire)) {
-        setStatus(a, "An update install is already running");
+        if (!stage_only) setStatus(a, "An update install is already running");
         return;
     }
     const ctx = std.heap.page_allocator.create(UpdateContext) catch return;
-    ctx.* = .{ .io = a.io, .hwnd = hwnd, .manual = true, .install = true };
+    ctx.* = .{ .io = a.io, .hwnd = hwnd, .manual = true, .install = true, .stage_only = stage_only };
     // Claim the slot before spawning: the worker may post its completion
     // (and free the slot) as soon as it starts, so claiming afterwards
     // could leave a stale claim behind.
@@ -16060,7 +16328,7 @@ fn updateThreadMain(ctx: *UpdateContext) void {
         // ponytail: updates are authenticated only by HTTPS plus GitHub's own asset
         // digest; a code-signing certificate would be needed to authenticate the
         // publisher itself. Upgrade path: verify an Authenticode signature here.
-        const outcome = performUpdate(ctx.io) catch |err| {
+        const outcome = performUpdate(ctx.io, ctx.stage_only) catch |err| {
             logUpdateFailure(@errorName(err));
             // 7 is install-only: a concurrent check posting 4/5 must never
             // look like the install finished and free its slot.
@@ -16074,6 +16342,7 @@ fn updateThreadMain(ctx: *UpdateContext) void {
             .blocked => 6,
             // 8 is install-only, same reason as 7.
             .none => 8,
+            .staged => 9,
         }, 0);
         return;
     }
@@ -16102,7 +16371,7 @@ fn updateThreadMain(ctx: *UpdateContext) void {
 
 /// Asks GitHub Releases whether a newer version exists. Downloads nothing.
 fn checkForUpdate(allocator: std.mem.Allocator) !?UpdateAvailable {
-    const current = update.parseVersion(app_version) orelse return error.UpdateBadVersion;
+    const current = currentVersion() orelse return error.UpdateBadVersion;
     const api_headers = try utf8ToWide(allocator, "User-Agent: Messages updater\r\nAccept: application/vnd.github+json\r\n");
     defer allocator.free(api_headers);
     const json = try httpGet(allocator, lit("api.github.com"), lit("/repos/valentinyeo/wazig/releases/latest"), api_headers.ptr, 4 * 1024 * 1024);
@@ -16207,6 +16476,7 @@ fn httpGet(allocator: std.mem.Allocator, host: [*:0]const u16, path: [*:0]const 
         if (read == 0) break;
         if (body.items.len + read > max_bytes) return error.UpdateTooLarge;
         try body.appendSlice(allocator, chunk[0..read]);
+        if (update_dl_active.load(.acquire)) update_dl_done.store(body.items.len, .release);
     }
     return body.toOwnedSlice(allocator);
 }
@@ -16380,9 +16650,11 @@ fn eqlWideIgnoreCase(a: []const u16, b: []const u16) bool {
     return true;
 }
 
-fn performUpdate(io: std.Io) !UpdateOutcome {
+/// `stage_only`: download, verify and extract, then stop (marker file written);
+/// otherwise install: swap an already staged release, or download one first.
+fn performUpdate(io: std.Io, stage_only: bool) !UpdateOutcome {
     const allocator = std.heap.page_allocator;
-    const current = update.parseVersion(app_version) orelse return error.UpdateBadVersion;
+    const current = currentVersion() orelse return error.UpdateBadVersion;
 
     // One updater at a time across every running copy of the app.
     const mutex = win.CreateMutexW(null, win.FALSE, lit("Local\\MessagesUpdateMutex")) orelse return error.UpdateMutexFailed;
@@ -16420,8 +16692,7 @@ fn performUpdate(io: std.Io) !UpdateOutcome {
     defer allocator.free(update_root);
 
     const cwd = std.Io.Dir.cwd();
-    // Fresh staging area; also clears leftovers from any earlier attempt.
-    cwd.deleteTree(io, update_root) catch {};
+    // The staging area persists between the background download and the card click.
     const root = try cwd.createDirPathOpen(io, update_root, .{});
     defer root.close(io);
 
@@ -16479,6 +16750,18 @@ fn performUpdate(io: std.Io) !UpdateOutcome {
         _ = win.DeleteFileW(exe_new_wide.ptr); // stale replacement debris
     }
 
+    // A release downloaded earlier in the background (marker file written only
+    // after verify and extract) installs without touching the network.
+    const marker_text: ?[]u8 = root.readFileAlloc(io, "ready.txt", allocator, .limited(512)) catch null;
+    defer if (marker_text) |text| allocator.free(text);
+    const marker = if (marker_text) |text| update.parseStageMarker(text) else null;
+    const staged = if (marker) |m| update.isNewer(m.tag, current) else false;
+    if (staged and !stage_only) {
+        const stage = try root.createDirPathOpen(io, "stage", .{ .open_options = .{ .iterate = true } });
+        defer stage.close(io);
+        return swapStaged(io, allocator, root, stage, update_root, exe_path, exe_dir, exe_name, marker.?.inner_root);
+    }
+
     const api_headers = try utf8ToWide(allocator, "User-Agent: Messages updater\r\nAccept: application/vnd.github+json\r\n");
     defer allocator.free(api_headers);
     const json = try httpGet(allocator, lit("api.github.com"), lit("/repos/valentinyeo/wazig/releases/latest"), api_headers.ptr, 4 * 1024 * 1024);
@@ -16489,12 +16772,24 @@ fn performUpdate(io: std.Io) !UpdateOutcome {
     defer parsed.deinit();
     const asset = maybe_asset orelse return .none;
     if (!update.isNewer(asset.tag, current)) return .none;
+    // The same release is already staged: nothing to download again.
+    if (stage_only and staged and std.mem.eql(u8, marker.?.tag, asset.tag)) return .staged;
+    // A stale or half-made stage must never be mistaken for a ready one.
+    root.deleteFile(io, "ready.txt") catch {};
+    root.deleteTree(io, "stage") catch {};
 
     const asset_url = try utf8ToWide(allocator, asset.url);
     defer allocator.free(asset_url);
     const download_headers = try utf8ToWide(allocator, "User-Agent: Messages updater\r\n");
     defer allocator.free(download_headers);
-    const body = try httpGetUrl(allocator, asset_url, download_headers.ptr, update_max_asset_bytes);
+    update_dl_done.store(0, .release);
+    update_dl_total.store(asset.size, .release);
+    update_dl_active.store(true, .release);
+    const body = httpGetUrl(allocator, asset_url, download_headers.ptr, update_max_asset_bytes) catch |err| {
+        update_dl_active.store(false, .release);
+        return err;
+    };
+    update_dl_active.store(false, .release);
     defer allocator.free(body);
     if (asset.size != 0 and body.len != asset.size) return error.UpdateSizeMismatch;
     if (!update.digestMatches(body, asset.digest)) return error.UpdateDigestMismatch;
@@ -16543,6 +16838,28 @@ fn performUpdate(io: std.Io) !UpdateOutcome {
     }
 
     const inner_root = if (diagnostics.root_dir.len > 0) diagnostics.root_dir else "";
+    if (stage_only) {
+        const marker_line = try std.fmt.allocPrint(allocator, "{s}\n{s}\n", .{ asset.tag, inner_root });
+        defer allocator.free(marker_line);
+        try root.writeFile(io, .{ .sub_path = "ready.txt", .data = marker_line });
+        return .staged;
+    }
+    return swapStaged(io, allocator, root, stage, update_root, exe_path, exe_dir, exe_name, inner_root);
+}
+
+/// Second half of an install: copies the staged files beside their targets and
+/// swaps them in (the exe last), then forgets the stage.
+fn swapStaged(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    root: std.Io.Dir,
+    stage: std.Io.Dir,
+    update_root: []const u8,
+    exe_path: []const u8,
+    exe_dir: []const u8,
+    exe_name: []const u8,
+    inner_root: []const u8,
+) !UpdateOutcome {
     const new_exe_rel = if (inner_root.len > 0)
         try std.fmt.allocPrint(allocator, "{s}/{s}", .{ inner_root, exe_name })
     else
@@ -16628,6 +16945,10 @@ fn performUpdate(io: std.Io) !UpdateOutcome {
         }
     }
     _ = win.DeleteFileW(exe_old_wide.ptr); // best effort; a leftover is removed on the next update attempt
+    // The staged files are in place; drop the stage so it is never reused.
+    root.deleteFile(io, "ready.txt") catch {};
+    root.deleteTree(io, "stage") catch {};
+    root.deleteFile(io, "Messages.zip") catch {};
     return .installed;
 }
 
