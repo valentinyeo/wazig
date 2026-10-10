@@ -10,6 +10,8 @@ const format_request = @import("format_request.zig");
 const slack = @import("slack.zig");
 const slack_win = @import("slack_win.zig");
 const played = @import("played.zig");
+const voice_pos = @import("voice_pos.zig");
+const mic_choice = @import("mic_choice.zig");
 const pending_reads = @import("pending_reads.zig");
 const chat_order = @import("chat_order.zig");
 const chat_reconcile = @import("chat_reconcile.zig");
@@ -24,6 +26,7 @@ const message_scroll = @import("message_scroll.zig");
 const sidebar_nav = @import("sidebar_nav.zig");
 const archive_rules = @import("archive_rules.zig");
 const message_filter = @import("message_filter.zig");
+const voice_sent = @import("voice_sent.zig");
 const chat_cache = @import("chat_cache.zig");
 const unfurl = @import("unfurl.zig");
 const shortcuts = @import("shortcuts.zig");
@@ -189,6 +192,7 @@ const command_show_slack = 2058;
 const command_show_telegram = 2059;
 const command_shortcuts_help = 2060;
 const command_keep_archived = 2061;
+const command_mic_default = 2400; // + 1..16: input devices listed by mic_choice
 const reaction_like = 3001;
 const reaction_love = 3002;
 const reaction_laugh = 3003;
@@ -737,6 +741,14 @@ const App = struct {
     audio_player: ?*audio.Player = null,
     audio_state: enum { empty, ready, playing, paused } = .empty,
     audio_playing_id: Utf8Text(191) = .{},
+    audio_playing_jid: Utf8Text(191) = .{},
+    // Saved position to jump to once the player knows the duration.
+    audio_resume_ms: i64 = 0,
+    // Last playback position per voice note (voice_pos.zig).
+    voice_pos: voice_pos.Store = .{},
+    // Input devices shown in the palette, so a pick maps back to a name.
+    mic_names: [mic_choice.max_devices]mic_choice.Name = undefined,
+    mic_count: usize = 0,
     audio_position_ms: i64 = 0,
     audio_duration_ms: i64 = 0,
     audio_auto_advance: bool = false,
@@ -777,6 +789,10 @@ const App = struct {
     // most max_failed_sends, the oldest dropped first.
     failed_sends: [max_failed_sends]FailedSend = [_]FailedSend{.{}} ** max_failed_sends,
     failed_send_count: usize = 0,
+    // Voice notes recorded here and already sent: their OGG stays on disk so
+    // they play and transcribe at once (voice_sent.zig).
+    sent_voice: [voice_sent.max_entries]voice_sent.Entry = [_]voice_sent.Entry{.{}} ** voice_sent.max_entries,
+    sent_voice_count: usize = 0,
     staged_image: StagedImage = .{},
     media_attempts: [512]u64 = [_]u64{0} ** 512,
     media_attempt_count: usize = 0,
@@ -3930,6 +3946,11 @@ fn appendWhatsAppPending(a: *App, pending: *const PendingSend, from_reload: bool
     if (from_reload) {
         for (a.messages[0..a.message_count]) |*message| {
             if (!message.from_me or message.send_state != .none) continue;
+            if (pending.ptt) {
+                const row_unix = media_age.unixSeconds(message.timestamp.slice()) orelse continue;
+                if (voice_sent.rowMatchesEntry(true, message.media_type.slice(), row_unix, pending.queued_unix)) return;
+                continue;
+            }
             const text = std.unicode.utf16LeToUtf8Alloc(a.allocator, message.text.slice()) catch continue;
             defer a.allocator.free(text);
             if (!std.mem.eql(u8, text, pending.text.slice())) continue;
@@ -3943,8 +3964,9 @@ fn appendWhatsAppPending(a: *App, pending: *const PendingSend, from_reload: bool
     message.from_me = true;
     message.sender.set(a.allocator, "You");
     if (pending.ptt) {
-        var voice_buffer: [48]u8 = undefined;
-        message.text.set(a.allocator, std.fmt.bufPrint(&voice_buffer, "Voice message {d}:{d:0>2}", .{ pending.voice_seconds / 60, pending.voice_seconds % 60 }) catch "Voice message");
+        // The player bubble, playing straight from the recorded file.
+        message.media_type.set("audio");
+        message.local_path.set(a.allocator, pending.file.slice());
     } else if (pending.file.len > 0 and pending.text.len == 0) {
         message.text.set(a.allocator, file_send_placeholder);
     } else {
@@ -5040,10 +5062,42 @@ fn ensureAudioPlayer(a: *App) ?*audio.Player {
     return a.audio_player;
 }
 
+fn voicePosKey(a: *const App, jid: []const u8, id: []const u8) u64 {
+    _ = a;
+    return played.Set.pairKey(jid, id);
+}
+
+/// Remember where the note being played stands (0 when it finished). Called
+/// only on pause, stop, note switch and chat switch, never per frame.
+fn saveAudioPos(a: *App) void {
+    if (a.audio_playing_id.len == 0) return;
+    const player = a.audio_player orelse return;
+    const duration: i64 = if (a.audio_duration_ms > 0) a.audio_duration_ms else player.durationMs();
+    var position: i64 = player.positionMs();
+    if (player.state() == .ended or (duration > 0 and position >= duration - 500)) position = 0;
+    const key = voicePosKey(a, a.audio_playing_jid.slice(), a.audio_playing_id.slice());
+    if (!a.voice_pos.set(key, @intCast(@max(0, position)), @intCast(@max(0, duration)))) return;
+    var buffer: [voice_pos.capacity * 48]u8 = undefined;
+    const text = a.voice_pos.serialize(&buffer) orelse return;
+    const path = messagesDirPath(a, "voice-pos.txt") orelse return;
+    defer a.allocator.free(path);
+    writeCacheFileAtomic(a, path, text);
+}
+
+fn loadVoicePos(a: *App) void {
+    const path = messagesDirPath(a, "voice-pos.txt") orelse return;
+    defer a.allocator.free(path);
+    const contents = readFileWin(a.allocator, path, voice_pos.capacity * 48) orelse return;
+    defer a.allocator.free(contents);
+    a.voice_pos.load(contents);
+}
+
 fn stopAudio(a: *App) void {
     a.audio_auto_advance = false;
     a.audio_chain_waiting = false;
     if (a.audio_state == .empty) return;
+    saveAudioPos(a);
+    a.audio_resume_ms = 0;
     a.audio_state = .empty;
     a.audio_playing_id.set("");
     a.audio_position_ms = 0;
@@ -5059,10 +5113,15 @@ fn startAudioPlayback(a: *App, message: *Message) void {
     };
     const path_utf8 = std.unicode.utf16LeToUtf8Alloc(a.allocator, message.local_path.slice()) catch return;
     defer a.allocator.free(path_utf8);
+    // Leaving another note part way: remember where it stood first.
+    if (a.audio_state != .empty and !std.mem.eql(u8, a.audio_playing_id.slice(), message.id.slice())) saveAudioPos(a);
+    const jid = if (a.chat_count > 0 and a.selected_chat < a.chat_count) a.chats[a.selected_chat].jid.slice() else "";
     player.play(path_utf8);
     markPlayed(a, message.id.slice());
     a.audio_auto_advance = true;
     a.audio_chain_waiting = false;
+    a.audio_playing_jid.set(jid);
+    a.audio_resume_ms = if (a.voice_pos.get(voicePosKey(a, jid, message.id.slice()))) |saved| saved.pos_ms else 0;
     a.audio_playing_id.set(message.id.slice());
     a.audio_state = .playing;
     a.audio_position_ms = 0;
@@ -5078,6 +5137,7 @@ fn toggleAudio(a: *App, message: *Message) void {
         .playing => {
             player.pause();
             a.audio_state = .paused;
+            saveAudioPos(a);
         },
         .paused => {
             player.unpause();
@@ -5170,6 +5230,7 @@ fn updateAudioPlayback(a: *App) void {
         const ended = a.audio_playing_id.slice();
         const ended_len = @min(ended.len, ended_id.len);
         @memcpy(ended_id[0..ended_len], ended[0..ended_len]);
+        saveAudioPos(a); // finished: resets the note to the start
         // The next note is playing; skip the stale snapshot handling below.
         if (advanceAudio(a, ended_id[0..ended_len])) return;
     }
@@ -5202,6 +5263,10 @@ fn updateAudioPlayback(a: *App) void {
         }
     }
     const duration = player.durationMs();
+    if (a.audio_resume_ms > 0 and duration > 0) {
+        player.seek(a.audio_resume_ms);
+        a.audio_resume_ms = 0;
+    }
     const position = player.positionMs();
     if (duration > 0 and duration != a.audio_duration_ms) {
         a.audio_duration_ms = duration;
@@ -7825,7 +7890,9 @@ fn applyMessageData(a: *App, raw: []const u8, final: bool) bool {
                 text = parts.body;
             }
         }
-        message.text.set(a.allocator, text);
+        // wacli's "Sent audio" label sits under every audio row, received
+        // ones too; the player already says what it is.
+        message.text.set(a.allocator, if (std.ascii.eqlIgnoreCase(media_type, "audio") and voice_sent.isAudioPlaceholder(text)) "" else text);
         message.from_me = getBool(object, "FromMe");
         message.media_type.set(media_type);
         message.mime_type.set(getString(object, "MimeType"));
@@ -7895,6 +7962,7 @@ fn applyMessageData(a: *App, raw: []const u8, final: bool) bool {
         if (a.message_count >= max_messages) break;
         appendWhatsAppPending(a, pending, true);
     }
+    applySentVoice(a, chat.jid.slice());
     // Failures remembered from earlier sends: drop the ones the store now
     // contains, then re-append the rest for the open chat.
     pruneFailedSends(a, chat.jid.slice());
@@ -8244,11 +8312,21 @@ fn setStatus(a: *App, text: []const u8) void {
     }
 }
 
-fn removeFirstPendingSend(a: *App) void {
+fn removeFirstPendingSend(a: *App, delivered: bool) void {
     // Paste-to-send files live in the paste folder and are deleted once the
-    // queued send (or its spawn failure) finishes with them.
+    // queued send (or its spawn failure) finishes with them. A delivered
+    // voice note keeps its file: it plays and transcribes from disk, and the
+    // media-cache age policy evicts it later.
     if (a.pending_send_count == 0) return;
-    if (a.pending_sends[0].file.len > 0) deleteFileUtf8(a.pending_sends[0].file.slice());
+    const head = &a.pending_sends[0];
+    if (delivered and head.ptt and head.file.len > 0 and head.jid.len <= 191 and head.file.len <= 520) {
+        var entry = voice_sent.Entry{ .queued_unix = head.queued_unix, .seconds = head.voice_seconds, .seq = head.seq };
+        @memcpy(entry.jid[0..head.jid.len], head.jid.slice());
+        entry.jid_len = head.jid.len;
+        @memcpy(entry.file[0..head.file.len], head.file.slice());
+        entry.file_len = head.file.len;
+        voice_sent.push(&a.sent_voice, &a.sent_voice_count, entry);
+    } else if (head.file.len > 0) deleteFileUtf8(head.file.slice());
     var index: usize = 1;
     while (index < a.pending_send_count) : (index += 1) {
         a.pending_sends[index - 1] = a.pending_sends[index];
@@ -8289,7 +8367,7 @@ fn failHeadPendingSend(a: *App, code: u32, ambiguous: bool, detail: []const u8, 
     const failed = a.pending_sends[0];
     markPendingSendFailed(a, &failed);
     rememberFailedSend(a, &failed);
-    removeFirstPendingSend(a);
+    removeFirstPendingSend(a, false);
     restoreFailedSendText(a, &failed);
     var status_buffer: [400]u8 = undefined;
     const status = if (auth_failed)
@@ -8341,6 +8419,98 @@ fn storedAfterQueued(stored_unix: i64, queued_unix: i64) bool {
     return stored_unix >= queued_unix - 5;
 }
 
+/// Remember which stored message each sent note's file belongs to, so after a
+/// restart the note still plays from disk instead of asking for a download.
+fn saveSentVoice(a: *App) void {
+    var text = std.ArrayList(u8).empty;
+    defer text.deinit(a.allocator);
+    for (a.sent_voice[0..a.sent_voice_count]) |*entry| {
+        if (entry.matched_len == 0) continue;
+        text.print(a.allocator, "{s}\t{s}\t{s}\n", .{ entry.jidSlice(), entry.matchedSlice(), entry.fileSlice() }) catch return;
+    }
+    const path = messagesDirPath(a, "voice-sent.txt") orelse return;
+    defer a.allocator.free(path);
+    writeCacheFileAtomic(a, path, text.items);
+}
+
+fn loadSentVoice(a: *App) void {
+    const path = messagesDirPath(a, "voice-sent.txt") orelse return;
+    defer a.allocator.free(path);
+    const contents = readFileWin(a.allocator, path, 64 * 1024) orelse return;
+    defer a.allocator.free(contents);
+    var lines = std.mem.tokenizeAny(u8, contents, "\r\n");
+    while (lines.next()) |line| {
+        const entry = voice_sent.parseLine(line) orelse continue;
+        voice_sent.push(&a.sent_voice, &a.sent_voice_count, entry);
+    }
+}
+
+/// Lay the OGG of each voice note recorded here over its stored row, so the
+/// note plays at once and transcribes from the local file with no download.
+/// When wacli has not stored the row (yet), a stand-in player bubble is
+/// appended instead, so a delivered note never vanishes on reload.
+fn applySentVoice(a: *App, jid: []const u8) void {
+    for (a.sent_voice[0..a.sent_voice_count]) |*entry| {
+        if (!std.mem.eql(u8, entry.jidSlice(), jid)) continue;
+        var found: ?*Message = null;
+        for (a.messages[0..a.message_count]) |*message| {
+            if (!message.from_me or message.send_state != .none) continue;
+            const row_unix = media_age.unixSeconds(message.timestamp.slice()) orelse continue;
+            if (!voice_sent.rowMatchesEntry(true, message.media_type.slice(), row_unix, entry.queued_unix)) continue;
+            if (entry.matched_len > 0) {
+                if (!std.mem.eql(u8, message.id.slice(), entry.matchedSlice())) continue;
+            } else {
+                var claimed = false;
+                for (a.sent_voice[0..a.sent_voice_count]) |*other| {
+                    if (other != entry and std.mem.eql(u8, other.matchedSlice(), message.id.slice())) claimed = true;
+                }
+                if (claimed) continue;
+            }
+            found = message;
+            break;
+        }
+        if (found) |message| {
+            if (entry.matched_len == 0 and message.id.len <= entry.matched_id.len) {
+                @memcpy(entry.matched_id[0..message.id.len], message.id.slice());
+                entry.matched_len = message.id.len;
+                saveSentVoice(a);
+            }
+            message.local_path.set(a.allocator, entry.fileSlice());
+            loadTranscriptCache(a, message);
+            continue;
+        }
+        // A remembered note whose row is outside the loaded window gets no
+        // stand-in; only a note not yet stored does.
+        if (entry.matched_len > 0 or a.message_count >= max_messages) continue;
+        var message = Message{};
+        message.from_me = true;
+        message.sender.set(a.allocator, "You");
+        message.media_type.set("audio");
+        message.local_path.set(a.allocator, entry.fileSlice());
+        var id_buffer: [32]u8 = undefined;
+        message.id.set(std.fmt.bufPrint(&id_buffer, "sent-{d}", .{entry.seq}) catch "sent");
+        const epoch = std.time.epoch.EpochSeconds{ .secs = @intCast(@max(0, entry.queued_unix)) };
+        const year_day = epoch.getEpochDay().calculateYearDay();
+        const month_day = year_day.calculateMonthDay();
+        const day_seconds = epoch.getDaySeconds();
+        var stamp: [24]u8 = undefined;
+        if (std.fmt.bufPrint(&stamp, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z", .{
+            year_day.year,
+            month_day.month.numeric(),
+            month_day.day_index + 1,
+            day_seconds.getHoursIntoDay(),
+            day_seconds.getMinutesIntoHour(),
+            day_seconds.getSecondsIntoMinute(),
+        })) |text| {
+            message.timestamp.set(text);
+            formatTime(&message.time, a.allocator, text);
+        } else |_| {}
+        a.messages[a.message_count] = message;
+        a.message_count += 1;
+        loadTranscriptCache(a, &a.messages[a.message_count - 1]);
+    }
+}
+
 /// A timeout or an ambiguous nonzero exit may still have delivered the
 /// message; before retrying, check whether it already shows up as a recent
 /// outgoing message in the open chat, the same way a reload recognizes a
@@ -8388,7 +8558,7 @@ fn startNextSend(a: *App) void {
         sentMessageExists(a, a.pending_sends[0].jid.slice(), a.pending_sends[0].text.slice(), a.pending_sends[0].queued_unix))
     {
         appendLaunchLog(a, "send: matched an already-delivered message, not resending");
-        removeFirstPendingSend(a);
+        removeFirstPendingSend(a, true);
         if (a.pending_send_count > 0) {
             startNextSend(a);
         } else {
@@ -8489,7 +8659,7 @@ fn checkSend(a: *App) void {
         a.send_direct = false;
         if (code == 0) {
             appendLaunchLog(a, "send: ok");
-            removeFirstPendingSend(a);
+            removeFirstPendingSend(a, true);
             if (a.pending_send_count > 0) {
                 startNextSend(a);
             } else {
@@ -11052,6 +11222,20 @@ fn appendPaletteChat(a: *App, index: usize) void {
     item.chat_jid.set(chat.jid.slice());
 }
 
+/// "Microphone: ..." entries: System default plus each active input device,
+/// the current pick marked. Used by voice notes and Dictate alike.
+fn appendMicrophones(a: *App) void {
+    a.mic_count = mic_choice.list(&a.mic_names);
+    const picked = mic_choice.current();
+    appendPalette(a, if (picked.len == 0) "Microphone: System default (in use)" else "Microphone: System default", "", command_mic_default);
+    for (a.mic_names[0..a.mic_count], 0..) |*name, index| {
+        var label: [mic_choice.name_cap + 40]u8 = undefined;
+        const in_use = std.mem.eql(u8, name.slice(), picked);
+        const text = std.fmt.bufPrint(&label, "Microphone: {s}{s}", .{ name.slice(), if (in_use) " (in use)" else "" }) catch continue;
+        appendPalette(a, text, "", @intCast(command_mic_default + 1 + index));
+    }
+}
+
 fn buildPaletteItems(a: *App) void {
     a.palette_item_count = 0;
     appendPalette(a, "Search chats", "Ctrl+F", command_search);
@@ -11061,6 +11245,7 @@ fn buildPaletteItems(a: *App) void {
     appendPalette(a, "Dictation language: Automatic", "", command_dictation_auto);
     appendPalette(a, "Dictation language: English", "", command_dictation_english);
     appendPalette(a, "Dictation language: German", "", command_dictation_german);
+    appendMicrophones(a);
     appendPalette(a, "Playback speed: 1x", "", command_speed_1);
     appendPalette(a, "Playback speed: 1.5x", "", command_speed_150);
     appendPalette(a, "Playback speed: 2x", "", command_speed_200);
@@ -11960,6 +12145,16 @@ fn runCommand(a: *App, command: u16) void {
                 .english => "Dictation language: English",
                 .german => "Dictation language: German",
             });
+        },
+        command_mic_default...command_mic_default + mic_choice.max_devices => {
+            const slot = command - command_mic_default;
+            if (slot == 0) {
+                mic_choice.choose("");
+                setStatus(a, "Microphone: System default");
+            } else if (slot - 1 < a.mic_count) {
+                mic_choice.choose(a.mic_names[slot - 1].slice());
+                setStatus(a, "Microphone changed");
+            }
         },
         command_font_smaller => changeFontScale(a, -10),
         command_speed_1, command_speed_150, command_speed_200 => {
@@ -13553,6 +13748,20 @@ fn drawCanvas(hwnd: win.HWND, a: *App) void {
                     };
                     _ = win.FillRect(hdc, &track, filled_brush);
                     _ = win.DeleteObject(filled_brush);
+                }
+                if (!active) {
+                    // Where he left this note: progress shows after a reopen.
+                    const jid_here = if (a.chat_count > 0 and a.selected_chat < a.chat_count) a.chats[a.selected_chat].jid.slice() else "";
+                    if (a.voice_pos.get(voicePosKey(a, jid_here, message.id.slice()))) |saved| {
+                        if (saved.dur_ms > 0) {
+                            const fraction = std.math.clamp(@as(f64, @floatFromInt(saved.pos_ms)) / @as(f64, @floatFromInt(saved.dur_ms)), 0, 1);
+                            track.right = track_left + @as(i32, @intFromFloat(fraction * @as(f64, @floatFromInt(track_right - track_left))));
+                            if (win.CreateSolidBrush(color_accent)) |filled_brush| {
+                                _ = win.FillRect(hdc, &track, filled_brush);
+                                _ = win.DeleteObject(filled_brush);
+                            }
+                        }
+                    }
                 }
                 _ = win.DeleteObject(track_brush);
                 if (!active and a.played_set.wasPlayed(message.id.slice())) {
@@ -15268,6 +15477,9 @@ fn appendLaunchLog(a: *App, event: []const u8) void {
 
 fn loadPlayed(a: *App) void {
     loadHashSet(a, a.played_path, &a.played_set);
+    loadVoicePos(a);
+    mic_choice.load();
+    loadSentVoice(a);
 }
 
 // WAZI-85 crash diagnostics. When the process dies on an unhandled
