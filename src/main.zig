@@ -203,8 +203,11 @@ const reaction_surprised = 3004;
 const reaction_sad = 3005;
 const reaction_thanks = 3006;
 const reaction_remove = 3007;
+const reaction_woozy = 3008;
+const reaction_row = 3010; // owner-drawn quick row in the message menu
 const emoji_picker = @import("emoji_picker.zig");
 const emoji_draw = @import("emoji_draw.zig");
+const shortcodes = @import("shortcodes.zig");
 const accounts = @import("accounts.zig");
 
 const color_bg = rgb(11, 20, 26);
@@ -645,6 +648,10 @@ const App = struct {
     // Ctrl+R opens the picker in react mode for one message, named by chat
     // jid and message id because indices shift when the chat reloads.
     emoji_react: bool = false,
+    sc_wnd: ?win.HWND = null,
+    sc_matches: [shortcodes.max_matches]shortcodes.Match = undefined,
+    sc_count: usize = 0,
+    sc_sel: usize = 0,
     emoji_react_jid: Utf8Text(191) = .{},
     emoji_react_id: Utf8Text(191) = .{},
     pending_reactions: [max_pending_reactions]PendingReaction = [_]PendingReaction{.{}} ** max_pending_reactions,
@@ -9667,6 +9674,7 @@ fn reactionForCommand(command: u16) ?[]const u8 {
         reaction_surprised => "😮",
         reaction_sad => "😢",
         reaction_thanks => "🙏",
+        reaction_woozy => "🥴",
         reaction_remove => "",
         else => null,
     };
@@ -10036,6 +10044,145 @@ fn insertEmoji(a: *App, emoji: []const u8) void {
     _ = win.SetFocus(compose);
 }
 
+// ---- :shortcode autocomplete in the composer (shortcodes.zig) ----
+
+const sc_row_base: i32 = 30;
+
+/// The shortcode being typed before the caret, if any (same text the
+/// popup was built from, so a stale popup can never edit the wrong place).
+fn shortcodeTyping(a: *App) ?shortcodes.Typing {
+    const compose = a.compose orelse return null;
+    var start: u32 = 0;
+    var end: u32 = 0;
+    _ = win.SendMessageW(compose, win.EM_GETSEL, @intFromPtr(&start), @bitCast(@intFromPtr(&end)));
+    if (start != end or end == 0) return null;
+    var buffer: [2048]u16 = undefined;
+    const length: usize = @intCast(win.GetWindowTextW(compose, &buffer, buffer.len));
+    if (end > length) return null;
+    return shortcodes.typing(buffer[0..end]);
+}
+
+fn shortcodeHide(a: *App) void {
+    a.sc_count = 0;
+    if (a.sc_wnd) |popup| _ = win.ShowWindow(popup, win.SW_HIDE);
+}
+
+fn shortcodeReplace(a: *App, t: shortcodes.Typing, emoji: []const u8) void {
+    const compose = a.compose orelse return;
+    var wide = WideText(31){};
+    wide.set(a.allocator, emoji);
+    if (wide.len == 0) return;
+    shortcodeHide(a);
+    _ = win.SendMessageW(compose, win.EM_SETSEL, t.start, @bitCast(@as(isize, @intCast(t.end))));
+    _ = win.SendMessageW(compose, win.EM_REPLACESEL, win.TRUE, @bitCast(@intFromPtr(wide.ptr())));
+    _ = win.SendMessageW(compose, win.EM_SCROLLCARET, 0, 0);
+}
+
+/// Called after every composer edit: replaces a finished ":name:", or
+/// shows, updates or hides the suggestion popup for ":na".
+fn shortcodeUpdate(a: *App) void {
+    const t = shortcodeTyping(a) orelse return shortcodeHide(a);
+    if (t.closed) {
+        if (shortcodes.resolve(t.query())) |emoji| return shortcodeReplace(a, t, emoji);
+        return shortcodeHide(a);
+    }
+    a.sc_count = shortcodes.matches(t.query(), &a.sc_matches);
+    a.sc_sel = 0;
+    if (a.sc_count == 0) return shortcodeHide(a);
+    const owner = a.hwnd orelse return;
+    const compose = a.compose orelse return;
+    if (a.sc_wnd == null) {
+        a.sc_wnd = win.CreateWindowExW(win.WS_EX_TOOLWINDOW | win.WS_EX_NOACTIVATE, lit("MessagesShortcodePopup"), null, win.WS_POPUP, 0, 0, 10, 10, owner, null, a.instance, null);
+        if (a.sc_wnd) |popup| {
+            var corner: win.DWORD = 2; // DWMWCP_ROUND
+            _ = win.DwmSetWindowAttribute(popup, 33, &corner, @sizeOf(win.DWORD));
+        }
+    }
+    const popup = a.sc_wnd orelse return;
+    const row = px(a, sc_row_base);
+    const width = px(a, 300);
+    const height = row * @as(i32, @intCast(a.sc_count)) + px(a, 8);
+    const at = win.SendMessageW(compose, win.EM_POSFROMCHAR, t.start, 0);
+    var point = win.POINT{ .x = @as(i16, @bitCast(loword(@as(usize, @bitCast(at))))), .y = @as(i16, @bitCast(hiword(@as(usize, @bitCast(at))))) };
+    _ = win.ClientToScreen(compose, &point);
+    _ = win.MoveWindow(popup, point.x, @max(0, point.y - height - px(a, 4)), width, height, win.TRUE);
+    _ = win.ShowWindow(popup, win.SW_SHOWNOACTIVATE);
+    _ = win.InvalidateRect(popup, null, win.TRUE);
+}
+
+/// Inserts the highlighted suggestion; false when nothing is open.
+fn shortcodeAccept(a: *App) bool {
+    if (a.sc_count == 0 or a.sc_sel >= a.sc_count) return false;
+    const t = shortcodeTyping(a) orelse {
+        shortcodeHide(a);
+        return false;
+    };
+    if (t.closed) return false;
+    shortcodeReplace(a, t, a.sc_matches[a.sc_sel].emoji);
+    return true;
+}
+
+fn shortcodeMove(a: *App, down: bool) void {
+    if (a.sc_count == 0) return;
+    a.sc_sel = if (down) (a.sc_sel + 1) % a.sc_count else (a.sc_sel + a.sc_count - 1) % a.sc_count;
+    if (a.sc_wnd) |popup| _ = win.InvalidateRect(popup, null, win.FALSE);
+}
+
+fn shortcodeProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.LPARAM) callconv(.winapi) win.LRESULT {
+    const a = app_ptr orelse return win.DefWindowProcW(hwnd, message, wparam, lparam);
+    switch (message) {
+        win.WM_MOUSEACTIVATE => return win.MA_NOACTIVATE,
+        win.WM_ERASEBKGND => return 1,
+        win.WM_LBUTTONDOWN => {
+            const y: i32 = @as(i16, @bitCast(hiword(@as(usize, @bitCast(lparam)))));
+            const index = @divTrunc(y - px(a, 4), px(a, sc_row_base));
+            if (index >= 0 and index < a.sc_count) {
+                a.sc_sel = @intCast(index);
+                _ = shortcodeAccept(a);
+                focusCompose(a);
+            }
+            return 0;
+        },
+        win.WM_PAINT => {
+            var paint: win.PAINTSTRUCT = undefined;
+            const hdc = win.BeginPaint(hwnd, &paint);
+            defer _ = win.EndPaint(hwnd, &paint);
+            var client: win.RECT = undefined;
+            _ = win.GetClientRect(hwnd, &client);
+            _ = win.FillRect(hdc, &client, a.brush_panel.?);
+            _ = win.SetBkMode(hdc, win.TRANSPARENT);
+            const row = px(a, sc_row_base);
+            const em = px(a, 20);
+            for (a.sc_matches[0..a.sc_count], 0..) |*entry, index| {
+                var cell = win.RECT{ .left = 0, .top = px(a, 4) + @as(i32, @intCast(index)) * row, .right = client.right, .bottom = px(a, 4) + @as(i32, @intCast(index + 1)) * row };
+                if (index == a.sc_sel) {
+                    const highlight = win.CreateSolidBrush(color_selected) orelse return 0;
+                    defer _ = win.DeleteObject(highlight);
+                    _ = win.FillRect(hdc, &cell, highlight);
+                }
+                var wide = WideText(31){};
+                wide.set(a.allocator, entry.emoji);
+                const left = px(a, 12);
+                const top = cell.top + @divTrunc(row - em, 2);
+                if (emoji_draw.draw(hdc, wide.slice(), left, top, em, em) == null) {
+                    _ = win.SelectObject(hdc, @ptrCast((if (a.font_emoji != null) a.font_emoji else a.font) orelse return 0));
+                    _ = win.SetTextColor(hdc, color_text);
+                    _ = win.TextOutW(hdc, left, top, wide.ptr(), @intCast(wide.len));
+                }
+                var label = WideText(80){};
+                var label_utf8: [shortcodes.max_matches + 70]u8 = undefined;
+                label.set(a.allocator, std.fmt.bufPrint(&label_utf8, ":{s}:", .{entry.name()}) catch "");
+                _ = win.SelectObject(hdc, @ptrCast(a.font.?));
+                _ = win.SetTextColor(hdc, color_text);
+                cell.left = px(a, 12) + em + px(a, 12);
+                _ = win.DrawTextW(hdc, label.ptr(), -1, &cell, win.DT_LEFT | win.DT_SINGLELINE | win.DT_VCENTER | win.DT_END_ELLIPSIS);
+            }
+            return 0;
+        },
+        else => return win.DefWindowProcW(hwnd, message, wparam, lparam),
+    }
+}
+
 fn closeEmojiPicker(a: *App) void {
     if (a.emoji_wnd) |picker| _ = win.DestroyWindow(picker);
     focusCompose(a);
@@ -10377,13 +10524,18 @@ fn openEmojiMenu(a: *App) void {
     openEmojiPicker(a);
 }
 
+/// Quick reactions in the message menu, in row order; the last cell is "+"
+/// for the full picker. The row is one owner-drawn item painted with the
+/// same color emoji as the picker; the clicked cell comes from the mouse x.
+const quick_reactions = [_]u16{ reaction_like, reaction_love, reaction_laugh, reaction_surprised, reaction_sad, reaction_thanks, reaction_woozy };
+const quick_cells = quick_reactions.len + 1;
+
+fn reactionCellWidth(a: *const App) i32 {
+    return px(a, 36);
+}
+
 fn addReactionItems(menu: win.HMENU) void {
-    _ = win.AppendMenuW(menu, win.MF_STRING, reaction_like, lit("👍  Like"));
-    _ = win.AppendMenuW(menu, win.MF_STRING, reaction_love, lit("❤️  Love"));
-    _ = win.AppendMenuW(menu, win.MF_STRING, reaction_laugh, lit("😂  Laugh"));
-    _ = win.AppendMenuW(menu, win.MF_STRING, reaction_surprised, lit("😮  Surprised"));
-    _ = win.AppendMenuW(menu, win.MF_STRING, reaction_sad, lit("😢  Sad"));
-    _ = win.AppendMenuW(menu, win.MF_STRING, reaction_thanks, lit("🙏  Thanks"));
+    _ = win.AppendMenuW(menu, win.MF_OWNERDRAW, reaction_row, null);
     _ = win.AppendMenuW(menu, win.MF_SEPARATOR, 0, null);
     _ = win.AppendMenuW(menu, win.MF_STRING, reaction_remove, lit("Remove reaction"));
     _ = win.AppendMenuW(menu, win.MF_SEPARATOR, 0, null);
@@ -10407,7 +10559,41 @@ fn openReactionMenu(a: *App, x: i32, y: i32) void {
     _ = win.AppendMenuW(menu, win.MF_SEPARATOR, 0, null);
     addReactionItems(menu);
     const choice = win.TrackPopupMenu(menu, win.TPM_RETURNCMD | win.TPM_NONOTIFY, x, y, 0, a.hwnd.?, null);
-    if (choice == command_reply) startReply(a) else reactToSelected(a, @intCast(choice));
+    if (choice == command_reply) {
+        startReply(a);
+    } else if (choice == reaction_row) {
+        var rect: win.RECT = undefined;
+        var mouse: win.POINT = undefined;
+        var cell: i32 = 0;
+        if (win.GetMenuItemRect(a.hwnd.?, menu, 2, &rect) != 0 and win.GetCursorPos(&mouse) != 0 and mouse.x >= rect.left and mouse.x < rect.right)
+            cell = @divTrunc(mouse.x - rect.left, reactionCellWidth(a));
+        if (cell >= quick_reactions.len) openReactionPicker(a) else reactToSelected(a, quick_reactions[@intCast(@max(cell, 0))]);
+    } else reactToSelected(a, @intCast(choice));
+}
+
+fn measureReactionRow(a: *const App, item: *win.MEASUREITEMSTRUCT) void {
+    item.itemWidth = @intCast(reactionCellWidth(a) * @as(i32, @intCast(quick_cells)));
+    item.itemHeight = @intCast(reactionCellWidth(a));
+}
+
+fn drawReactionRow(a: *App, item: *win.DRAWITEMSTRUCT) void {
+    const selected = item.itemState & win.ODS_SELECTED != 0;
+    _ = win.FillRect(item.hDC, &item.rcItem, win.GetSysColorBrush(if (selected) win.COLOR_BTNFACE else win.COLOR_MENU));
+    _ = win.SetBkMode(item.hDC, win.TRANSPARENT);
+    _ = win.SetTextColor(item.hDC, win.GetSysColor(win.COLOR_MENUTEXT));
+    const cell = reactionCellWidth(a);
+    const em = px(a, 22);
+    for (0..quick_cells) |index| {
+        var wide = WideText(31){};
+        wide.set(a.allocator, if (index < quick_reactions.len) reactionForCommand(quick_reactions[index]).? else "+");
+        const left = item.rcItem.left + @as(i32, @intCast(index)) * cell + @divTrunc(cell - em, 2);
+        const top = item.rcItem.top + @divTrunc(cell - em, 2);
+        if (index == quick_reactions.len or emoji_draw.draw(item.hDC, wide.slice(), left, top, em, em) == null) {
+            _ = win.SelectObject(item.hDC, @ptrCast((if (a.font_emoji != null) a.font_emoji else a.font) orelse return));
+            var box = win.RECT{ .left = item.rcItem.left + @as(i32, @intCast(index)) * cell, .top = item.rcItem.top, .right = item.rcItem.left + @as(i32, @intCast(index + 1)) * cell, .bottom = item.rcItem.bottom };
+            _ = win.DrawTextW(item.hDC, wide.ptr(), -1, &box, win.DT_CENTER | win.DT_SINGLELINE | win.DT_VCENTER);
+        }
+    }
 }
 
 fn loadArchiveState(a: *App) void {
@@ -14562,7 +14748,7 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
             if (loword(wparam) != win.WA_INACTIVE) {
                 startUpdateCheck(hwnd, false);
                 focusCompose(a);
-            }
+            } else shortcodeHide(a);
             return win.DefWindowProcW(hwnd, message, wparam, lparam);
         },
         win.WM_ACTIVATEAPP => {
@@ -14811,13 +14997,21 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
         },
         win.WM_DRAWITEM => {
             const item: *win.DRAWITEMSTRUCT = winHandle(*win.DRAWITEMSTRUCT, @as(usize, @bitCast(lparam)));
-            if (item.CtlID == id_chats) {
+            if (item.CtlType == win.ODT_MENU) {
+                if (item.itemID == reaction_row) drawReactionRow(a, item);
+            } else if (item.CtlID == id_chats) {
                 drawChat(a, item);
             } else if (item.CtlID == id_voice) {
                 drawVoiceButton(a, item);
             } else if (item.CtlID == id_dictate or item.CtlID == id_send or item.CtlID == id_emoji) {
                 drawComposerButton(a, item);
             }
+            return 1;
+        },
+        win.WM_MEASUREITEM => {
+            const item: *win.MEASUREITEMSTRUCT = winHandle(*win.MEASUREITEMSTRUCT, @as(usize, @bitCast(lparam)));
+            if (item.CtlType != win.ODT_MENU) return win.DefWindowProcW(hwnd, message, wparam, lparam);
+            if (item.itemID == reaction_row) measureReactionRow(a, item);
             return 1;
         },
         // A click on any child (the chat list included) drops a Ctrl+A selection.
@@ -14849,6 +15043,7 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
                 openEmojiMenu(a);
             } else if (id == id_compose and notification == win.EN_CHANGE) {
                 layout(a, a.compose_client_width, a.compose_client_height);
+                shortcodeUpdate(a);
             } else if (id == id_search and notification == win.EN_CHANGE) {
                 _ = win.KillTimer(hwnd, timer_search);
                 _ = win.SetTimer(hwnd, timer_search, 240, null);
@@ -15483,6 +15678,21 @@ fn handleKeyboard(a: *App, message: *const win.MSG) bool {
     }
     if (a.compose) |compose| {
         if (focus == compose) {
+            if (a.sc_count > 0 and !control and !alt) {
+                switch (key) {
+                    win.VK_UP, win.VK_DOWN => {
+                        shortcodeMove(a, key == win.VK_DOWN);
+                        return true;
+                    },
+                    win.VK_RETURN, win.VK_TAB => if (!shift and shortcodeAccept(a)) return true,
+                    win.VK_ESCAPE => {
+                        shortcodeHide(a);
+                        return true;
+                    },
+                    win.VK_LEFT, win.VK_RIGHT, win.VK_HOME, win.VK_END => shortcodeHide(a),
+                    else => {},
+                }
+            }
             // Ctrl+V with an image on the clipboard stages a paste-to-send
             // (WAZI-37); without an image the edit control pastes text as usual.
             if (control and key == 'V' and stageImageFromClipboard(a)) return true;
@@ -16291,6 +16501,22 @@ pub fn main(init: std.process.Init) !void {
         .hIconSm = icon_small,
     };
     if (win.RegisterClassExW(&emoji_class) == 0) return error.RegisterEmojiPickerClassFailed;
+
+    var shortcode_class = win.WNDCLASSEXW{
+        .cbSize = @sizeOf(win.WNDCLASSEXW),
+        .style = win.CS_DROPSHADOW,
+        .lpfnWndProc = shortcodeProc,
+        .cbClsExtra = 0,
+        .cbWndExtra = 0,
+        .hInstance = instance,
+        .hIcon = icon_big,
+        .hCursor = cursor,
+        .hbrBackground = null,
+        .lpszMenuName = null,
+        .lpszClassName = lit("MessagesShortcodePopup"),
+        .hIconSm = icon_small,
+    };
+    if (win.RegisterClassExW(&shortcode_class) == 0) return error.RegisterShortcodeClassFailed;
 
     var viewer_class = win.WNDCLASSEXW{
         .cbSize = @sizeOf(win.WNDCLASSEXW),
