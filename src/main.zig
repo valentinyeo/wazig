@@ -87,6 +87,7 @@ const wm_slack_event = win.WM_APP + 4;
 const wm_slack_reload = win.WM_APP + 5;
 const wm_unfurl_done = win.WM_APP + 6;
 const wm_control = win.WM_APP + 7;
+const wm_startup_probe = win.WM_APP + 8;
 const wacli_queue_size = 8;
 const max_wacli_args = 16;
 const wacli_arg_cap = 512;
@@ -956,9 +957,30 @@ const App = struct {
     // most, so the reads stay bounded even when wacli keeps failing.
     chats_read_retry_ticks: u32 = 0,
     chats_read_attempts: u32 = 0,
+    // Startup speed: the account tag comes from disk at launch and the
+    // `auth status` probe verifies it after the window is up. Until the
+    // probe answers, cache files are only read, never written, so a stale
+    // tag cannot overwrite another account's snapshot.
+    startup_probe_pending: bool = false,
+    startup_logged: u8 = 0,
 };
 
 var app_ptr: ?*App = null;
+/// GetTickCount64 at the top of main; launch-log timings count from here.
+var process_start_ms: u64 = 0;
+
+const StartupMilestone = enum(u3) { window, chats, messages, auth };
+
+/// One launch-log line per milestone per run: milliseconds since process
+/// start, so a slow launch shows which step was late. UI thread only.
+fn logStartupMilestone(a: *App, milestone: StartupMilestone, label: []const u8) void {
+    const bit: u8 = @as(u8, 1) << @intFromEnum(milestone);
+    if (a.startup_logged & bit != 0) return;
+    a.startup_logged |= bit;
+    var buffer: [96]u8 = undefined;
+    const line = std.fmt.bufPrint(&buffer, "startup-timing: {s} {d} ms", .{ label, win.GetTickCount64() -% process_start_ms }) catch return;
+    appendLaunchLog(a, line);
+}
 
 fn lit(comptime text: []const u8) [*:0]const u16 {
     return std.unicode.utf8ToUtf16LeStringLiteral(text);
@@ -1743,6 +1765,7 @@ fn msgCacheStore(a: *App, jid: []const u8, data: []const u8) void {
     // Also persist for the next launch (WAZI-67). The file carries the jid
     // and it is verified on read, so a hash collision can only waste a file,
     // never show the wrong chat.
+    if (a.startup_probe_pending) return;
     if (msgCacheDiskPath(a, jid)) |path| {
         defer a.allocator.free(path);
         const envelope = chat_cache.envelope(a.allocator, jid, data) catch return;
@@ -5987,6 +6010,7 @@ fn chatsCachePath(a: *App) ?[]u8 {
 }
 
 fn saveChatsCache(a: *App, raw: []const u8) void {
+    if (a.startup_probe_pending) return;
     const path = chatsCachePath(a) orelse return;
     defer a.allocator.free(path);
     writeCacheFileAtomic(a, path, raw);
@@ -6030,6 +6054,7 @@ fn loadChatsCache(a: *App) void {
     };
     defer a.allocator.free(data);
     const applied = applyChats(a, data);
+    if (applied) logStartupMilestone(a, .chats, "chat list from cache");
     var log_buffer: [64]u8 = undefined;
     const log_line = std.fmt.bufPrint(&log_buffer, "cache-load: {d} bytes, applied={}", .{ data.len, applied }) catch "cache-load: logged";
     appendLaunchLog(a, log_line);
@@ -7762,6 +7787,7 @@ fn applyMessageData(a: *App, raw: []const u8, final: bool) bool {
     }
     if (a.canvas) |canvas| _ = win.InvalidateRect(canvas, null, win.TRUE);
     if (final) markChatRead(a);
+    if (a.message_count > 0) logStartupMilestone(a, .messages, if (final) "first messages shown (fresh)" else "first messages shown (cache)");
     return true;
 }
 
@@ -13502,6 +13528,10 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
             applyUnfurlResult(a, result);
             return 0;
         },
+        wm_startup_probe => {
+            applyStartupProbe(a, wparam, @bitCast(lparam));
+            return 0;
+        },
         wm_control => {
             controlOnUi(a, @ptrFromInt(@as(usize, @bitCast(lparam))));
             return 0;
@@ -14727,55 +14757,149 @@ fn mediaWasFetched(a: *const App, chat_jid: []const u8, message_id: []const u8) 
     return a.media_fetched.wasPlayedRaw(played.Set.pairKey(chat_jid, message_id));
 }
 
-/// Identity of the linked WhatsApp account, hashed for cache filenames
-/// (WAZI-67). One read-only `auth status` spawn; when WhatsApp is not paired
-/// or the read fails the tag is "none" and caches still work under that tag.
-const cache_tag_timeout_ms: win.DWORD = 5000;
+/// The auth probe runs on its own thread after the window is up, so a slow
+/// `wacli` only delays the account check, never the window.
+const cache_tag_timeout_ms: win.DWORD = 20000;
+
+const ProbeKind = enum(u2) { failed = 0, unlinked = 1, linked = 2 };
+const ProbeResult = struct { kind: ProbeKind, hash: u64 = 0, logged_out: bool = false };
 
 /// Identity of the linked WhatsApp account, hashed for cache filenames
-/// (WAZI-67). One read-only `auth status` spawn, hard-bounded to 5 seconds
-/// because it runs before the window exists and a hung child must never
-/// block startup. When WhatsApp is not paired or the read fails the result
-/// is null and the launch cache stays disabled: a snapshot written for an
-/// unknown account must never be shown under the identity of a later
-/// unknown-or-different account.
-fn findCacheTag(init: std.process.Init, wacli_path: []u8, scratch_dir: []const u8, logged_out: *bool) !?[]u8 {
-    const out_path = try std.fs.path.join(init.gpa, &.{ scratch_dir, "auth-status.tmp" });
-    defer init.gpa.free(out_path);
+/// (WAZI-67). One read-only `auth status` spawn, hard-bounded by
+/// cache_tag_timeout_ms. `failed` (spawn, timeout, bad output) leaves the
+/// persisted tag alone; `unlinked` means wacli answered with no account.
+fn probeAccount(gpa: std.mem.Allocator, io: std.Io, wacli_path: []const u8, scratch_dir: []const u8) ProbeResult {
+    const failed = ProbeResult{ .kind = .failed };
+    const out_path = std.fs.path.join(gpa, &.{ scratch_dir, "auth-status.tmp" }) catch return failed;
+    defer gpa.free(out_path);
     const cwd = std.Io.Dir.cwd();
-    var out_file = cwd.createFile(init.io, out_path, .{}) catch return null;
-    const child = child_process.spawn(init.io, .{
+    var out_file = cwd.createFile(io, out_path, .{}) catch return failed;
+    const child = child_process.spawn(io, .{
         .argv = &.{ wacli_path, "--json", "--read-only", "auth", "status" },
         .stdin = .ignore,
         .stdout = .{ .file = out_file },
         .stderr = .ignore,
         .create_no_window = true,
     }) catch {
-        out_file.close(init.io);
-        return null;
+        out_file.close(io);
+        return failed;
     };
     // The child inherited the handle; drop the parent's copy before reading
     // so the file pointer each side sees cannot interfere.
-    out_file.close(init.io);
-    const handle = child.id orelse return null;
+    out_file.close(io);
+    const handle = child.id orelse return failed;
     defer _ = win.CloseHandle(handle);
     if (win.WaitForSingleObject(handle, cache_tag_timeout_ms) != win.WAIT_OBJECT_0) {
         _ = win.TerminateProcess(handle, 1);
-        return null;
+        return failed;
     }
     var code: win.DWORD = 0;
-    if (win.GetExitCodeProcess(handle, &code) == 0 or code != 0) return null;
-    const data = readFileWin(init.gpa, out_path, 64 * 1024) orelse return null;
-    defer init.gpa.free(data);
+    if (win.GetExitCodeProcess(handle, &code) == 0 or code != 0) return failed;
+    const data = readFileWin(gpa, out_path, 64 * 1024) orelse return failed;
+    defer gpa.free(data);
     deleteFileUtf8(out_path);
-    var parsed = std.json.parseFromSlice(std.json.Value, init.gpa, data, .{}) catch return null;
+    var parsed = std.json.parseFromSlice(std.json.Value, gpa, data, .{}) catch return failed;
     defer parsed.deinit();
     // A revoked session keeps its store but answers authenticated:false;
     // starting sync on it only loops on "not authenticated".
-    logged_out.* = auth_status.unauthenticated(parsed.value) == true;
-    const jid = auth_status.linkedJid(parsed.value) orelse return null;
-    if (jid.len == 0) return null;
-    return try std.fmt.allocPrint(init.gpa, "{x:0>16}", .{std.hash.Wyhash.hash(0, jid)});
+    const logged_out = auth_status.unauthenticated(parsed.value) == true;
+    const jid = auth_status.linkedJid(parsed.value) orelse return .{ .kind = .unlinked, .logged_out = logged_out };
+    if (jid.len == 0) return .{ .kind = .unlinked, .logged_out = logged_out };
+    return .{ .kind = .linked, .hash = std.hash.Wyhash.hash(0, jid), .logged_out = logged_out };
+}
+
+const ProbeThread = struct { io: std.Io, hwnd: win.HWND, wacli_path: []const u8, scratch_dir: []const u8 };
+
+fn startupProbeMain(ctx: *ProbeThread) void {
+    defer std.heap.page_allocator.destroy(ctx);
+    const result = probeAccount(std.heap.page_allocator, ctx.io, ctx.wacli_path, ctx.scratch_dir);
+    const code: usize = @as(usize, @intFromEnum(result.kind)) | (if (result.logged_out) @as(usize, 4) else 0);
+    _ = win.PostMessageW(ctx.hwnd, wm_startup_probe, code, @bitCast(result.hash));
+}
+
+const account_tag_file = "account-tag.txt";
+
+fn isHexTag(text: []const u8) bool {
+    if (text.len != 16) return false;
+    for (text) |c| if (!std.ascii.isHex(c)) return false;
+    return true;
+}
+
+/// Account tag remembered from the last verified run, so the disk caches
+/// open before `auth status` has answered. Without the file (first launch of
+/// this version) the single chats-<tag>.json snapshot names the account.
+fn loadPersistedTag(allocator: std.mem.Allocator, messages_dir: []const u8) ?[16]u8 {
+    if (std.fs.path.join(allocator, &.{ messages_dir, account_tag_file })) |path| {
+        defer allocator.free(path);
+        if (readFileWin(allocator, path, 64)) |data| {
+            defer allocator.free(data);
+            const text = std.mem.trim(u8, data, " \r\n\t");
+            if (isHexTag(text)) return text[0..16].*;
+        }
+    } else |_| {}
+    const pattern = std.fs.path.join(allocator, &.{ messages_dir, "chats-*.json" }) catch return null;
+    defer allocator.free(pattern);
+    const wide = std.unicode.utf8ToUtf16LeAllocZ(allocator, pattern) catch return null;
+    defer allocator.free(wide);
+    var find: win.WIN32_FIND_DATAW = undefined;
+    const handle = win.FindFirstFileW(wide.ptr, &find);
+    if (handle == win.INVALID_HANDLE_VALUE or handle == null) return null;
+    defer _ = win.FindClose(handle);
+    var found: ?[16]u8 = null;
+    while (true) {
+        const name_len = std.mem.indexOfScalar(u16, &find.cFileName, 0) orelse find.cFileName.len;
+        var name_buffer: [64]u8 = undefined;
+        if (name_len <= name_buffer.len) {
+            // Tag characters are ASCII hex; anything else fails isHexTag.
+            for (find.cFileName[0..name_len], 0..) |wide_char, index| name_buffer[index] = if (wide_char < 128) @intCast(wide_char) else '?';
+            const name = name_buffer[0..name_len];
+            if (name.len == 27 and std.mem.startsWith(u8, name, "chats-") and std.mem.endsWith(u8, name, ".json") and isHexTag(name[6..22])) {
+                if (found != null) return null; // two accounts' snapshots: do not guess
+                found = name[6..22].*;
+            }
+        }
+        if (win.FindNextFileW(handle, &find) == 0) break;
+    }
+    return found;
+}
+
+fn persistTag(a: *App, tag: []const u8) void {
+    const path = messagesDirPath(a, account_tag_file) orelse return;
+    defer a.allocator.free(path);
+    if (tag.len == 0) return deleteFileUtf8(path);
+    writeCacheFileAtomic(a, path, tag);
+}
+
+/// The auth probe answered (it was started right after the window showed).
+/// wparam: ProbeKind in the low two bits, 4 = logged out; lparam: tag hash.
+fn applyStartupProbe(a: *App, code: usize, hash: u64) void {
+    a.startup_probe_pending = false;
+    const kind: ProbeKind = @enumFromInt(@as(u2, @truncate(code)));
+    const logged_out = code & 4 != 0;
+    var label_buffer: [48]u8 = undefined;
+    logStartupMilestone(a, .auth, std.fmt.bufPrint(&label_buffer, "auth status done ({s})", .{@tagName(kind)}) catch "auth status done");
+    if (kind == .failed) {
+        // Keep whatever tag the disk gave us; the next launch probes again.
+        appendLaunchLog(a, "startup: auth status failed, keeping saved account tag");
+        return;
+    }
+    var tag_buffer: [16]u8 = undefined;
+    const new_tag: []const u8 = if (kind == .linked) (std.fmt.bufPrint(&tag_buffer, "{x:0>16}", .{hash}) catch "") else "";
+    const changed = !std.mem.eql(u8, a.cache_tag.slice(), new_tag);
+    a.cache_tag.set(new_tag);
+    persistTag(a, new_tag);
+    if (kind == .unlinked) appendLaunchLog(a, "startup: no account tag (WhatsApp unlinked)");
+    if (logged_out and !a.sync_logged_out) {
+        appendLaunchLog(a, "startup: WhatsApp logged out, live sync halted");
+        markWhatsAppLoggedOut(a);
+    }
+    if (changed and activeChatView(a) == .whatsapp) {
+        appendLaunchLog(a, "startup: account changed, reloading caches");
+        _ = applyChats(a, "{\"data\":[]}");
+        loadChatsCache(a);
+        refreshChats(a);
+        refreshMessages(a);
+    }
 }
 
 fn findWacli(init: std.process.Init, allocator: std.mem.Allocator) ![]u8 {
@@ -14854,6 +14978,7 @@ fn LoadAppIcon(instance: win.HINSTANCE, cx: i32, cy: i32, flags: u32) win.HICON 
 }
 
 pub fn main(init: std.process.Init) !void {
+    process_start_ms = win.GetTickCount64();
     var argument_iterator = try init.minimal.args.iterateAllocator(init.gpa);
     defer argument_iterator.deinit();
     while (argument_iterator.next()) |argument| {
@@ -14872,9 +14997,10 @@ pub fn main(init: std.process.Init) !void {
     // Not freed: the detached sync-stderr reader thread may still log via
     // avatar_dir during teardown; the process reclaims it.
     const avatar_dir = try createAvatarDirectory(init, init.gpa);
-    var startup_logged_out = false;
-    const cache_tag = try findCacheTag(init, wacli_path, std.fs.path.dirname(avatar_dir) orelse return error.MissingMessagesDir, &startup_logged_out);
-    defer if (cache_tag) |tag| init.gpa.free(tag);
+    const messages_dir = std.fs.path.dirname(avatar_dir) orelse return error.MissingMessagesDir;
+    // The window never waits for `auth status`: the tag saved by the last
+    // run opens the caches now and the probe verifies it after first paint.
+    const cache_tag = loadPersistedTag(init.gpa, messages_dir);
     const slack_media_dir = try createSlackMediaDirectory(init, init.gpa);
     defer init.gpa.free(slack_media_dir);
     const store_watch_path = try createStoreWatchPath(init, init.gpa);
@@ -14908,14 +15034,11 @@ pub fn main(init: std.process.Init) !void {
     }
     var app = App{ .allocator = init.gpa, .io = init.io, .instance = instance, .wacli_path = wacli_path, .avatar_dir = avatar_dir, .slack_media_dir = slack_media_dir, .deepgram_configured = deepgram_key.len > 0, .deepgram_key = deepgram_key, .openrouter_key = openrouter_key, .openrouter_model = openrouter_model, .openrouter_configured = openrouter_key.len > 0, .format_workspace = format_workspace, .dictation_language = loadDictationLanguage(), .font_scale = loadFontScale(), .chat_view = loadChatView() };
     app.wacli_dir.set(wacli_dir);
+    app.startup_probe_pending = true;
     if (cache_tag) |tag| {
-        app.cache_tag.set(tag);
-        appendLaunchLog(&app, "startup: account tag found");
-    } else appendLaunchLog(&app, "startup: no account tag (auth status failed or unlinked)");
-    if (startup_logged_out) {
-        app.sync_logged_out = true;
-        appendLaunchLog(&app, "startup: WhatsApp logged out, live sync halted");
-    }
+        app.cache_tag.set(&tag);
+        appendLaunchLog(&app, "startup: saved account tag loaded");
+    } else appendLaunchLog(&app, "startup: no saved account tag, caches wait for auth status");
     loadEmojiRecents(&app);
     if (init.environ_map.get("LOCALAPPDATA")) |local| {
         if (std.fs.path.join(init.gpa, &.{ local, "Messages", "telegram" })) |telegram_dir| {
@@ -15100,6 +15223,8 @@ pub fn main(init: std.process.Init) !void {
     };
     if (win.RegisterClassExW(&viewer_class) == 0) return error.RegisterImageViewerClassFailed;
 
+    var pre_window_buffer: [64]u8 = undefined;
+    appendLaunchLog(&app, std.fmt.bufPrint(&pre_window_buffer, "startup-timing: pre-window work done {d} ms", .{win.GetTickCount64() -% process_start_ms}) catch "startup-timing: pre-window work done");
     const hwnd = win.CreateWindowExW(
         0,
         lit("MessagesZig"),
@@ -15119,6 +15244,18 @@ pub fn main(init: std.process.Init) !void {
     _ = win.ShowWindow(hwnd, win.SW_SHOW);
     _ = win.UpdateWindow(hwnd);
     focusCompose(&app);
+    logStartupMilestone(&app, .window, "window shown");
+    // Verify the saved account tag off the UI thread; the answer arrives as
+    // wm_startup_probe. Without a thread the saved tag simply stays.
+    if (std.heap.page_allocator.create(ProbeThread)) |probe| {
+        probe.* = .{ .io = init.io, .hwnd = hwnd, .wacli_path = wacli_path, .scratch_dir = messages_dir };
+        if (std.Thread.spawn(.{ .stack_size = 512 * 1024 }, startupProbeMain, .{probe})) |thread| {
+            thread.detach();
+        } else |_| {
+            std.heap.page_allocator.destroy(probe);
+            app.startup_probe_pending = false;
+        }
+    } else |_| app.startup_probe_pending = false;
 
     var message: win.MSG = undefined;
     while (win.GetMessageW(&message, null, 0, 0) > 0) {
