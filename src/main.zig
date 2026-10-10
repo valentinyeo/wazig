@@ -467,6 +467,11 @@ const Message = struct {
     toggle_hit: win.RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 },
     media_hit: win.RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 },
     bubble_hit: win.RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 },
+    // Height cache for the paint pass: re-measuring every message (long
+    // transcripts included) on each repaint pegged a core while a voice note
+    // played. measure_tag says which inputs the cached height was made for.
+    measure_tag: u64 = 0,
+    measure_height: i32 = 0,
 };
 
 // Background wacli reads: one worker thread runs every wacli call so the UI
@@ -12431,6 +12436,33 @@ fn quoteBlockTint(base: win.COLORREF, toward: u8) win.COLORREF {
     );
 }
 
+// Cached height for messages that are only summed or located, not drawn. The
+// tag covers what changes the height; the exact measure of each visible
+// message in the paint pass refreshes it.
+fn measureTag(a: *const App, message: *const Message, width: i32, show_sender: bool) u64 {
+    var h = std.hash.Wyhash.init(0);
+    const parts = [_]u64{
+        @intCast(width),                           @intFromBool(show_sender),              a.dpi,                           @intCast(a.font_scale),
+        message.text.len,                          message.quote.len,                      message.quote_sender.len,        message.transcript.len,
+        @intFromBool(message.transcript_expanded), @intFromEnum(message.transcript_state), @intCast(message.bitmap_height), message.media_type.len,
+        message.reaction.len,                      @intFromEnum(message.unfurl_provider),
+    };
+    h.update(std.mem.sliceAsBytes(&parts));
+    return h.final() | 1;
+}
+
+fn measureMessageCached(hdc: win.HDC, a: *App, message: *Message, width: i32, show_sender: bool) i32 {
+    if (message.measure_tag == measureTag(a, message, width, show_sender)) return message.measure_height;
+    return measureMessageStore(hdc, a, message, width, show_sender);
+}
+
+fn measureMessageStore(hdc: win.HDC, a: *App, message: *Message, width: i32, show_sender: bool) i32 {
+    const height = measureMessage(hdc, a, message, width, show_sender);
+    message.measure_tag = measureTag(a, message, width, show_sender);
+    message.measure_height = height;
+    return height;
+}
+
 fn measureMessage(hdc: win.HDC, a: *App, message: *const Message, width: i32, show_sender: bool) i32 {
     _ = win.SelectObject(hdc, @ptrCast(a.font.?));
     const header_height = messageHeaderHeight(hdc, a, show_sender);
@@ -12795,7 +12827,7 @@ fn drawCanvas(hwnd: win.HWND, a: *App) void {
         }
     }
     var total_height: i32 = px(a, 18);
-    for (a.messages[0..a.message_count], 0..) |*message, index| total_height += measureMessage(hdc, a, message, bubble_width, showSenderName(a, index)) + messageGap(a, index);
+    for (a.messages[0..a.message_count], 0..) |*message, index| total_height += measureMessageCached(hdc, a, message, bubble_width, showSenderName(a, index)) + messageGap(a, index);
     a.max_scroll = @max(0, total_height - (client.bottom - client.top));
     a.scroll_y = std.math.clamp(a.scroll_y, 0, a.max_scroll);
     var y = client.bottom - px(a, 14) + a.scroll_y;
@@ -12813,11 +12845,11 @@ fn drawCanvas(hwnd: win.HWND, a: *App) void {
         message.link_count = 0;
         message.word_count = 0;
         const show_sender = showSenderName(a, index);
-        const estimated_height = measureMessage(hdc, a, message, bubble_width, show_sender);
+        const estimated_height = measureMessageCached(hdc, a, message, bubble_width, show_sender);
         y -= estimated_height + messageGap(a, index);
         if (y > client.bottom or y + estimated_height < client.top) continue;
         ensureBitmap(a, message);
-        const height = measureMessage(hdc, a, message, bubble_width, show_sender);
+        const height = measureMessageStore(hdc, a, message, bubble_width, show_sender);
         y -= height - estimated_height;
         if (y > client.bottom or y + height < client.top) continue;
         const left: i32 = if (message.from_me) client.right - bubble_width - px(a, 24) else if (in_group) px(a, 62) else px(a, 24);
