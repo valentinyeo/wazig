@@ -81,18 +81,21 @@ pub fn formatResponseText(allocator: std.mem.Allocator, anthropic: bool, respons
 /// The app's owner; his own notes are summarised from his point of view.
 pub const owner_name = "Valentin";
 
+/// Notes come in German, English or both; the summary follows the note, never a setting.
+pub const language_rule = " LANGUAGE: write the summary in the SAME language as the transcript (German transcript: German summary, English transcript: English summary). For a mix, use the language of most of the words. Never translate.";
+
 /// Paragraph appended to the system prompt: who is talking in this note.
 /// `contact` is the other person in the chat (empty when unknown).
 pub fn speakerInstruction(allocator: std.mem.Allocator, from_me: bool, contact: []const u8) ![]u8 {
     const other = if (contact.len > 0) contact else "the other person";
     if (from_me) return std.fmt.allocPrint(
         allocator,
-        "SPEAKER: this note was recorded and sent by {s} himself, who is also the reader. The speaker is NOT {s}: {s} is the person he is talking to. Write each summary line from {s}'s own point of view, in the first person (\"I\" / \"ich\"), and name {s} when the note is addressed to them. Never call the speaker \"the speaker\", never use {s}'s name for the speaker, and never write \"he\" or \"she\" for the speaker.",
+        "SPEAKER: this note was recorded and sent by {s} himself, who is also the reader. The speaker is NOT {s}: {s} is the person he is talking to. Write each summary line from {s}'s own point of view, in the first person (\"I\" / \"ich\"), and name {s} when the note is addressed to them. Never call the speaker \"the speaker\", never use {s}'s name for the speaker, and never write \"he\" or \"she\" for the speaker." ++ language_rule,
         .{ owner_name, other, other, owner_name, other, other },
     );
     return std.fmt.allocPrint(
         allocator,
-        "SPEAKER: this note was recorded by {s}, who sent it to {s}, the reader. The speaker is {s}: refer to them by name, or with \"she\"/\"he\" where the language needs it, never as \"the speaker\" and never as {s}. When the speaker says \"you\" or \"du\", they mean {s}, the reader.",
+        "SPEAKER: this note was recorded by {s}, who sent it to {s}, the reader. The speaker is {s}: refer to them by name, or with \"she\"/\"he\" where the language needs it, never as \"the speaker\" and never as {s}. When the speaker says \"you\" or \"du\", they mean {s}, the reader." ++ language_rule,
         .{ other, owner_name, other, owner_name, owner_name },
     );
 }
@@ -165,6 +168,19 @@ test "speaker instruction differs for own and received notes" {
     const unknown = try speakerInstruction(std.testing.allocator, false, "");
     defer std.testing.allocator.free(unknown);
     try std.testing.expect(std.mem.indexOf(u8, unknown, "the other person") != null);
+}
+
+test "language rule is in the prompt and German and English transcripts pass unchanged" {
+    const instruction = try speakerInstruction(std.testing.allocator, false, "Jenny Hirtz");
+    defer std.testing.allocator.free(instruction);
+    try std.testing.expect(std.mem.indexOf(u8, instruction, "SAME language as the transcript") != null);
+    const german = try formatRequestBody(std.testing.allocator, true, "m", instruction, "Hallo, ich komme morgen um zehn.");
+    defer std.testing.allocator.free(german);
+    try std.testing.expect(std.mem.indexOf(u8, german, "Hallo, ich komme morgen um zehn.") != null);
+    const english = try formatRequestBody(std.testing.allocator, true, "m", instruction, "Hi, I will arrive tomorrow at ten.");
+    defer std.testing.allocator.free(english);
+    try std.testing.expect(std.mem.indexOf(u8, english, "Hi, I will arrive tomorrow at ten.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, english, "SAME language") != null);
 }
 
 test "formatted transcripts are recognised in utf8 and utf16" {

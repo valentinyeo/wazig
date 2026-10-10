@@ -444,7 +444,7 @@ fn formatTranscript(allocator: std.mem.Allocator, transcript: []const u8, api_ke
         \\
         \\OUTPUT, in this order:
         \\
-        \\1. Start directly with 3 to 5 numbered lines, in the reader's language, summarizing what the speaker actually said. This is the only part you write yourself. One line per topic. Concrete, not vague: "trigger shot at 2am, next step Monday" not "she talks about medical stuff." Do not write any headline or title before or above them.
+        \\1. Start directly with 3 to 5 numbered lines, in the SAME language as the transcript (German transcript: German summary, English transcript: English summary; if it mixes both, use the language of most of the words), summarizing what the speaker actually said. This is the only part you write yourself. One line per topic. Concrete, not vague: "trigger shot at 2am, next step Monday" not "she talks about medical stuff." Do not write any headline or title before or above them.
         \\
         \\2. A horizontal rule.
         \\

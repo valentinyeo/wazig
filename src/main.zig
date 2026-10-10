@@ -6340,11 +6340,9 @@ fn scheduleNextTranscription(a: *App) void {
     }
     if (candidate == null) return;
     const message = &a.messages[candidate.?];
-    const language: dictation.Language = switch (a.dictation_language) {
-        .automatic => .automatic,
-        .english => .english,
-        .german => .german,
-    };
+    // Notes arrive in German or English (or mixed): always detect per note.
+    // The dictation language setting only applies to the microphone button.
+    const language: dictation.Language = .automatic;
     const path_utf8 = std.unicode.utf16LeToUtf8Alloc(a.allocator, message.local_path.slice()) catch return;
     defer a.allocator.free(path_utf8);
     if (session.start(path_utf8, a.deepgram_key, language)) {
