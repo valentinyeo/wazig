@@ -27,6 +27,7 @@ const sidebar_nav = @import("sidebar_nav.zig");
 const archive_rules = @import("archive_rules.zig");
 const message_filter = @import("message_filter.zig");
 const voice_sent = @import("voice_sent.zig");
+const send_args = @import("send_args.zig");
 const chat_cache = @import("chat_cache.zig");
 const unfurl = @import("unfurl.zig");
 const shortcuts = @import("shortcuts.zig");
@@ -3981,7 +3982,7 @@ fn appendWhatsAppPending(a: *App, pending: *const PendingSend, from_reload: bool
             if (!message.from_me or message.send_state != .none) continue;
             if (pending.ptt) {
                 const row_unix = media_age.unixSeconds(message.timestamp.slice()) orelse continue;
-                if (voice_sent.rowMatchesEntry(true, message.media_type.slice(), row_unix, pending.queued_unix)) return;
+                if (voice_sent.rowMatchesEntry(true, message.media_type.slice(), row_unix, pending.queued_unix, true)) return;
                 continue;
             }
             const text = std.unicode.utf16LeToUtf8Alloc(a.allocator, message.text.slice()) catch continue;
@@ -5799,7 +5800,7 @@ fn downloadMedia(a: *App, message_index: usize, automatic: bool) bool {
     if (message.media_type.len == 0 or message.id.len == 0) return false;
     // Already on disk (e.g. a parallel download finished since the request):
     // a retry must not re-download.
-    if (message.local_path.len > 0) return false;
+    if (!voice_sent.needsDownload(message.from_me, message.local_path.len > 0, voice_sent.claimsId(a.sent_voice[0..a.sent_voice_count], a.chats[a.selected_chat].jid.slice(), message.id.slice()))) return false;
     const chat = &a.chats[a.selected_chat];
     // wacli media download is a WhatsApp-store call. Slack attachments fetch
     // through requestSlackDownload and Telegram ones through the TDLib
@@ -8407,14 +8408,14 @@ fn logSendTiming(a: *App, outcome: []const u8, pending: PendingSend) void {
 
 /// Drop the head of the send queue. The staged file (image or voice note) is
 /// deleted only when `delivered` is true: a failed send keeps it so the red
-/// bubble can retry the upload. A delivered voice note keeps its file: it
-/// plays and transcribes from disk, and the media-cache age policy evicts it
-/// later.
+/// bubble can retry the upload. A delivered voice note, image or file keeps
+/// its file: it plays or shows from disk with no download, and the
+/// media-cache age policy evicts it later.
 fn removeFirstPendingSend(a: *App, delivered: bool) void {
     if (a.pending_send_count == 0) return;
     const head = &a.pending_sends[0];
-    if (delivered and head.ptt and head.file.len > 0 and head.jid.len <= 191 and head.file.len <= 520) {
-        var entry = voice_sent.Entry{ .queued_unix = head.queued_unix, .seconds = head.voice_seconds, .seq = head.seq };
+    if (delivered and head.file.len > 0 and head.jid.len <= 191 and head.file.len <= 520) {
+        var entry = voice_sent.Entry{ .queued_unix = head.queued_unix, .seconds = head.voice_seconds, .seq = head.seq, .voice = head.ptt };
         @memcpy(entry.jid[0..head.jid.len], head.jid.slice());
         entry.jid_len = head.jid.len;
         @memcpy(entry.file[0..head.file.len], head.file.slice());
@@ -8603,7 +8604,7 @@ fn saveSentVoice(a: *App) void {
     defer text.deinit(a.allocator);
     for (a.sent_voice[0..a.sent_voice_count]) |*entry| {
         if (entry.matched_len == 0) continue;
-        text.print(a.allocator, "{s}\t{s}\t{s}\n", .{ entry.jidSlice(), entry.matchedSlice(), entry.fileSlice() }) catch return;
+        text.print(a.allocator, "{s}\t{s}\t{s}\t{s}\n", .{ entry.jidSlice(), entry.matchedSlice(), entry.fileSlice(), if (entry.voice) "v" else "f" }) catch return;
     }
     const path = messagesDirPath(a, "voice-sent.txt") orelse return;
     defer a.allocator.free(path);
@@ -8633,10 +8634,11 @@ fn applySentVoice(a: *App, jid: []const u8) void {
         for (a.messages[0..a.message_count]) |*message| {
             if (!message.from_me or message.send_state != .none) continue;
             const row_unix = media_age.unixSeconds(message.timestamp.slice()) orelse continue;
-            if (!voice_sent.rowMatchesEntry(true, message.media_type.slice(), row_unix, entry.queued_unix)) continue;
             if (entry.matched_len > 0) {
+                // Remembered across restarts: the id alone identifies the row.
                 if (!std.mem.eql(u8, message.id.slice(), entry.matchedSlice())) continue;
             } else {
+                if (!voice_sent.rowMatchesEntry(true, message.media_type.slice(), row_unix, entry.queued_unix, entry.voice)) continue;
                 var claimed = false;
                 for (a.sent_voice[0..a.sent_voice_count]) |*other| {
                     if (other != entry and std.mem.eql(u8, other.matchedSlice(), message.id.slice())) claimed = true;
@@ -8653,12 +8655,12 @@ fn applySentVoice(a: *App, jid: []const u8) void {
                 saveSentVoice(a);
             }
             message.local_path.set(a.allocator, entry.fileSlice());
-            loadTranscriptCache(a, message);
+            if (entry.voice) loadTranscriptCache(a, message);
             continue;
         }
         // A remembered note whose row is outside the loaded window gets no
         // stand-in; only a note not yet stored does.
-        if (entry.matched_len > 0 or a.message_count >= max_messages) continue;
+        if (!entry.voice or entry.matched_len > 0 or a.message_count >= max_messages) continue;
         var message = Message{};
         message.from_me = true;
         message.sender.set(a.allocator, "You");
@@ -8748,51 +8750,22 @@ fn startNextSend(a: *App) void {
         return;
     }
     const pending = &a.pending_sends[0];
-    const is_file = pending.file.len > 0;
-    var args: [18][]const u8 = undefined;
-    var count: usize = 0;
-    args[count] = a.wacli_path;
-    count += 1;
+    var args: [send_args.max_args][]const u8 = undefined;
     // Sends never stop live sync: wacli 0.19 hands them to the running sync
-    // process over .send.sock, but only after the lock attempt fails, so a
-    // lock wait would delay every send by its full length. 0s while sync
-    // runs; with sync down, 70s like mark-read, since a picture or media
-    // child can hold the store lock for up to 60s. A send in the few seconds
-    // before a fresh sync child opens its socket fails on the lock and
-    // retries (sendRetryDelayMs).
-    const lock_wait = if (a.sync_child != null) "0s" else "70s";
-    for ([_][]const u8{ "--json", "--lock-wait", lock_wait, "send", if (is_file) "file" else "text", "--to", pending.jid.slice() }) |argument| {
-        args[count] = argument;
-        count += 1;
-    }
-    if (is_file) {
-        args[count] = "--file";
-        args[count + 1] = pending.file.slice();
-        count += 2;
-        if (pending.ptt) {
-            args[count] = "--ptt";
-            count += 1;
-        }
-        if (pending.text.len > 0) {
-            args[count] = "--caption";
-            args[count + 1] = pending.text.slice();
-            count += 2;
-        }
-    } else {
-        args[count] = "--message";
-        args[count + 1] = pending.text.slice();
-        count += 2;
-    }
-    if (pending.reply_to.len > 0) {
-        args[count] = "--reply-to";
-        args[count + 1] = pending.reply_to.slice();
-        count += 2;
-        if (pending.reply_sender.len > 0) {
-            args[count] = "--reply-to-sender";
-            args[count + 1] = pending.reply_sender.slice();
-            count += 2;
-        }
-    }
+    // process over .send.sock, but only after the lock attempt fails, so any
+    // lock wait would delay every send by its full length (70 s before
+    // WAZI-113). send_args always passes 0s. A send in the few seconds before
+    // a fresh sync child opens its socket fails on the lock and retries
+    // (sendRetryDelayMs).
+    const count = send_args.buildSend(&args, .{
+        .wacli = a.wacli_path,
+        .jid = pending.jid.slice(),
+        .text = pending.text.slice(),
+        .file = pending.file.slice(),
+        .ptt = pending.ptt,
+        .reply_to = pending.reply_to.slice(),
+        .reply_sender = pending.reply_sender.slice(),
+    });
     const child = child_process.spawn(a.io, .{
         .argv = args[0..count],
         .stdin = .ignore,
@@ -8807,7 +8780,7 @@ fn startNextSend(a: *App) void {
     a.send_direct = a.sync_child == null;
     a.send_started_ms = win.GetTickCount64();
     var start_buffer: [120]u8 = undefined;
-    if (std.fmt.bufPrint(&start_buffer, "send: start kind={s} waited_in_queue={d}s lock_wait={s}", .{ sendKindName(pending), nowUnixSeconds() - pending.queued_unix, lock_wait })) |start_line| appendLaunchLog(a, start_line) else |_| {}
+    if (std.fmt.bufPrint(&start_buffer, "send: start kind={s} waited_in_queue={d}s lock_wait={s}", .{ sendKindName(pending), nowUnixSeconds() - pending.queued_unix, send_args.lock_wait })) |start_line| appendLaunchLog(a, start_line) else |_| {}
     var status_buffer: [80]u8 = undefined;
     const status = std.fmt.bufPrint(&status_buffer, "Sending queued message, {d} remaining", .{a.pending_send_count}) catch "Sending queued message...";
     setStatus(a, status);
@@ -9987,20 +9960,10 @@ fn reactToMessage(a: *App, jid: []const u8, msg_id: []const u8, emoji: []const u
 /// send that finds the store locked hands itself to the running sync process
 /// over .send.sock, so the reaction rides sync's open connection instead of a
 /// cold connect. --lock-wait delays that handoff by its full length, so it is
-/// 0s while sync runs; with sync down the reaction takes the lock itself.
+/// always 0s (send_args.zig).
 fn enqueueReactionJob(a: *App, entry: *const PendingReaction) void {
-    var args: [16][]const u8 = undefined;
-    var count: usize = 0;
-    const lock_wait = if (a.sync_child != null) "0s" else "10s";
-    for ([_][]const u8{ a.wacli_path, "--json", "--lock-wait", lock_wait, "send", "react", "--to", entry.jid.slice(), "--id", entry.msg_id.slice(), "--reaction", entry.emoji.slice() }) |argument| {
-        args[count] = argument;
-        count += 1;
-    }
-    if (entry.sender.len > 0) {
-        args[count] = "--sender";
-        args[count + 1] = entry.sender.slice();
-        count += 2;
-    }
+    var args: [send_args.max_args][]const u8 = undefined;
+    const count = send_args.buildReact(&args, a.wacli_path, entry.jid.slice(), entry.msg_id.slice(), entry.emoji.slice(), entry.sender.slice());
     var job = WacliJob{ .kind = .reaction };
     job.jid.set(entry.jid.slice());
     job.msg_id.set(entry.msg_id.slice());
