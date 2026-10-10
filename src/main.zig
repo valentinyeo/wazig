@@ -20,6 +20,7 @@ const paste_image = @import("paste_image.zig");
 const scrollbar = @import("scrollbar.zig");
 const message_scroll = @import("message_scroll.zig");
 const sidebar_nav = @import("sidebar_nav.zig");
+const archive_rules = @import("archive_rules.zig");
 const message_filter = @import("message_filter.zig");
 const chat_cache = @import("chat_cache.zig");
 const unfurl = @import("unfurl.zig");
@@ -48,6 +49,8 @@ const max_chats = 256;
 const max_groups = 1024;
 const max_messages = 100;
 const max_pending_sends = 32;
+// Ctrl+A then Ctrl+E queues one wacli call per chat.
+const max_pending_archives = max_chats;
 const max_pending_reads = 8;
 // A send that fails is retried instead of dropped: any failure (nonzero
 // exit, timeout, or a lost store lock) retries up to 3 times, backing off
@@ -181,6 +184,7 @@ const command_show_whatsapp = 2057;
 const command_show_slack = 2058;
 const command_show_telegram = 2059;
 const command_shortcuts_help = 2060;
+const command_keep_archived = 2061;
 const reaction_like = 3001;
 const reaction_love = 3002;
 const reaction_laugh = 3003;
@@ -489,7 +493,7 @@ const PendingReaction = struct {
     retry_at_ms: u64 = 0,
 };
 
-const WacliJobKind = enum(u8) { chats, groups, messages, reaction, slack_workspace, slack_users, slack_history, slack_replies, slack_send, slack_attach, slack_download, slack_auth, slack_mark, cache_tag };
+const WacliJobKind = enum(u8) { chats, groups, messages, reaction, slack_workspace, slack_users, slack_history, slack_replies, slack_send, slack_attach, slack_download, slack_auth, slack_mark, cache_tag, archived_scan, resurface_probe };
 const wacli_kind_count = @typeInfo(WacliJobKind).@"enum".fields.len;
 
 const WacliJob = struct {
@@ -687,11 +691,21 @@ const App = struct {
     unread_only: bool = false,
     show_archived: bool = false,
     archive_child: ?std.process.Child = null,
-    pending_archives: [max_pending_sends]PendingArchive = [_]PendingArchive{.{}} ** max_pending_sends,
+    pending_archives: [max_pending_archives]PendingArchive = [_]PendingArchive{.{}} ** max_pending_archives,
     pending_archive_count: usize = 0,
     // WAZI-62: an unarchive that could not queue (full queue) waits here and
     // is retried from the refresh timer, so the chat is never lost for good.
     unarchive_retry: Utf8Text(191) = .{},
+    // Kept-archived set and per-chat baselines (archive_rules.zig), loaded
+    // from archive-state.txt in the Messages folder under LOCALAPPDATA.
+    archive_state: ?*archive_rules.State = null,
+    archive_state_path: []u8 = &.{},
+    // Ctrl+A in the chat list: the jids that Ctrl+E will archive together.
+    bulk: archive_rules.Selection(max_chats) = .{},
+    // A wacli store change since the last archived-list scan, and the
+    // seconds since that scan ran.
+    archived_scan_dirty: bool = true,
+    archived_scan_ticks: u32 = 0,
     group_refresh_ticks: u8 = 0,
     deepgram_configured: bool = false,
     deepgram_key: []const u8 = "",
@@ -3319,6 +3333,7 @@ fn refreshVisibleChats(a: *App) void {
 
 /// Alt+N: show one messenger's chats. Keeps each messenger's last chat.
 fn switchChatView(a: *App, view: transport.Provider) void {
+    _ = clearBulkSelection(a);
     const current = activeChatView(a);
     if (messenger_view.effective(view, slackConfigured(a), telegramReady(a)) != view) {
         setStatus(a, if (view == .slack) "Slack is not set up" else "Telegram is not signed in");
@@ -8986,6 +9001,7 @@ fn updateDictation(a: *App) void {
 }
 
 fn selectChat(a: *App, delta: i32, wrap: bool) void {
+    _ = clearBulkSelection(a);
     if (a.chat_count == 0) return;
     clearReply(a);
     var next: i32 = @intCast(a.selected_chat);
@@ -9839,6 +9855,38 @@ fn openReactionMenu(a: *App, x: i32, y: i32) void {
     if (choice == command_reply) startReply(a) else reactToSelected(a, @intCast(choice));
 }
 
+fn loadArchiveState(a: *App) void {
+    const state = a.allocator.create(archive_rules.State) catch return;
+    state.* = .{};
+    a.archive_state = state;
+    const path = messagesDirPath(a, "archive-state.txt") orelse return;
+    a.archive_state_path = path;
+    const data = readFileWin(a.allocator, path, 256 * 1024) orelse return;
+    defer a.allocator.free(data);
+    state.parse(data);
+}
+
+fn saveArchiveState(a: *App) void {
+    const state = a.archive_state orelse return;
+    if (a.archive_state_path.len == 0) return;
+    const buffer = a.allocator.alloc(u8, archive_rules.max_entries * 260) catch return;
+    defer a.allocator.free(buffer);
+    writeFileWin(a.archive_state_path, state.format(buffer));
+}
+
+fn isKeptArchived(a: *const App, jid: []const u8) bool {
+    const state = a.archive_state orelse return false;
+    return state.isKept(jid);
+}
+
+/// Label for the archived marker on a chat: kept chats say so, other
+/// archived chats just say archived. Null for an inbox chat.
+fn archiveMarker(a: *const App, chat: *const Chat) ?[*:0]const u16 {
+    if (chat.provider != .whatsapp) return null;
+    if (!chat.archived and !a.show_archived) return null;
+    return if (isKeptArchived(a, chat.jid.slice())) lit("Kept archived") else lit("Archived");
+}
+
 /// Queue an unarchive for a chat the inbox list does not show (WAZI-62).
 /// Duplicates are dropped: live events can repeat before the write lands.
 fn queueUnarchiveChat(a: *App, jid: []const u8) void {
@@ -9858,7 +9906,159 @@ fn queueUnarchiveChat(a: *App, jid: []const u8) void {
     pending.jid.set(jid);
     pending.should_unarchive = true;
     a.pending_archive_count += 1;
+    if (a.archive_state) |state| {
+        state.remove(jid);
+        saveArchiveState(a);
+    }
     startNextArchive(a);
+}
+
+const archived_scan_min_ticks = 20;
+const archived_scan_idle_ticks = 300;
+const max_probes_per_scan = 4;
+
+/// Resurfacing, cheapest signal first: a store change (the same WAL stamp
+/// that drives the chat list) marks the archived list dirty, and at most
+/// every 20 s after that one `chats list --archived` read runs on the wacli
+/// worker. Only a chat whose last-message stamp moved past its baseline
+/// costs a second, one-chat read (applyArchivedScan). Without a store change
+/// it runs every 5 minutes as a safety net. Nothing runs while an archive
+/// call is queued or running, so the scan never races its own write.
+fn tickArchivedScan(a: *App, store_changed: bool) void {
+    if (a.archive_state == null) return;
+    if (store_changed) a.archived_scan_dirty = true;
+    a.archived_scan_ticks +|= 1;
+    if (a.archived_scan_ticks < archived_scan_min_ticks) return;
+    if (!a.archived_scan_dirty and a.archived_scan_ticks < archived_scan_idle_ticks) return;
+    if (wacliPendingGet(a, .archived_scan) > 0 or wacliPendingGet(a, .resurface_probe) > 0) return;
+    if (a.pending_archive_count > 0 or a.archive_child != null) return;
+    a.archived_scan_dirty = false;
+    a.archived_scan_ticks = 0;
+    var job = WacliJob{ .kind = .archived_scan };
+    wacliJobArgs(&job, &.{ a.wacli_path, "--json", "--read-only", "chats", "list", "--archived", "--limit", "250" });
+    wacliEnqueue(a, job, false);
+}
+
+fn enqueueResurfaceProbe(a: *App, jid: []const u8, row_ts: []const u8) void {
+    var job = WacliJob{ .kind = .resurface_probe };
+    job.jid.set(jid);
+    job.extra.set(row_ts);
+    wacliJobArgs(&job, &.{ a.wacli_path, "--json", "--read-only", "messages", "list", "--chat", jid, "--limit", "3" });
+    wacliEnqueue(a, job, false);
+}
+
+/// Read the archived list: remember a baseline for chats seen for the first
+/// time, probe chats that moved past theirs, and forget chats that are no
+/// longer archived (unarchived on the phone, say).
+fn applyArchivedScan(a: *App, raw: []const u8) void {
+    const state = a.archive_state orelse return;
+    var parsed = std.json.parseFromSlice(std.json.Value, a.allocator, raw, .{}) catch return;
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |o| o,
+        else => return,
+    };
+    const rows = switch (root.get("data") orelse return) {
+        .array => |items| items.items,
+        else => return,
+    };
+    var changed = false;
+    var probes: usize = 0;
+    for (rows) |item| {
+        const object = switch (item) {
+            .object => |o| o,
+            else => continue,
+        };
+        if (!getBool(object, "archived")) continue;
+        const jid = getString(object, "jid");
+        const stamp = getString(object, "last_message_ts");
+        if (jid.len == 0 or stamp.len == 0 or std.mem.indexOfScalar(u8, jid, '@') == null) continue;
+        const kept = state.isKept(jid);
+        const base = state.baseline(jid) orelse {
+            state.setBaseline(jid, stamp);
+            changed = true;
+            continue;
+        };
+        if (archive_rules.needsProbe(kept, stamp, base)) {
+            if (probes < max_probes_per_scan) {
+                enqueueResurfaceProbe(a, jid, stamp);
+                probes += 1;
+            }
+        } else if (kept and std.mem.order(u8, stamp, base) == .gt) {
+            state.setBaseline(jid, stamp);
+            changed = true;
+        }
+    }
+    // A full page means rows may be missing, and a queued archive means the
+    // list is about to change: only prune on a complete, quiet read.
+    if (rows.len < 250 and a.pending_archive_count == 0 and a.archive_child == null) {
+        var index = state.count;
+        while (index > 0) {
+            index -= 1;
+            const entry = &state.entries[index];
+            if (entry.keep) continue;
+            var present = false;
+            for (rows) |item| {
+                const object = switch (item) {
+                    .object => |o| o,
+                    else => continue,
+                };
+                if (std.mem.eql(u8, getString(object, "jid"), entry.jidSlice())) {
+                    present = true;
+                    break;
+                }
+            }
+            if (!present) {
+                state.remove(entry.jidSlice());
+                changed = true;
+            }
+        }
+    }
+    if (changed) saveArchiveState(a);
+    var log_buffer: [96]u8 = undefined;
+    appendLaunchLog(a, std.fmt.bufPrint(&log_buffer, "archive-scan: {d} archived, {d} to probe", .{ rows.len, probes }) catch "archive-scan");
+}
+
+/// The newest real message of an archived chat decides: someone else's and
+/// newer than the baseline brings the chat back, mine only moves the baseline.
+fn applyResurfaceProbe(a: *App, jid: []const u8, row_ts: []const u8, raw: []const u8) void {
+    const state = a.archive_state orelse return;
+    var parsed = std.json.parseFromSlice(std.json.Value, a.allocator, raw, .{}) catch return;
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |o| o,
+        else => return,
+    };
+    const data_object = switch (root.get("data") orelse return) {
+        .object => |o| o,
+        else => return,
+    };
+    const list = switch (data_object.get("messages") orelse return) {
+        .array => |items| items.items,
+        else => return,
+    };
+    var newest_from_me: ?bool = null;
+    for (list) |item| {
+        const object = switch (item) {
+            .object => |o| o,
+            else => continue,
+        };
+        // Reactions and receipts are not a conversation turn.
+        if (getString(object, "ReactionToID").len > 0 or getString(object, "MsgID").len == 0) continue;
+        newest_from_me = getBool(object, "FromMe");
+        break;
+    }
+    const from_me = newest_from_me orelse return;
+    const base = state.baseline(jid) orelse "";
+    if (archive_rules.shouldResurface(from_me, state.isKept(jid), row_ts, base)) {
+        appendLaunchLog(a, "archive-scan: new message in an archived chat, unarchiving");
+        queueUnarchiveChat(a, jid);
+        return;
+    }
+    // Not resurfacing (my own reply, or kept): move the baseline so the same
+    // message is not probed again.
+    state.setBaseline(jid, row_ts);
+    saveArchiveState(a);
 }
 
 /// Re-queue an unarchive that had to wait for a free archive slot.
@@ -9973,17 +10173,121 @@ fn archiveChat(a: *App, jid: []const u8, unarchive: bool) ?[]const u8 {
     pending.jid.set(jid);
     pending.should_unarchive = unarchive;
     a.pending_archive_count += 1;
+    if (a.archive_state) |state| {
+        // Archiving remembers the newest stamp as the baseline a later
+        // incoming message is compared with; unarchiving forgets the chat
+        // (and its kept-archived flag).
+        if (unarchive) {
+            state.remove(jid);
+        } else if (visibleChatIndex(a, jid)) |index| {
+            const stamp = a.chats[index].timestamp.slice();
+            if (stamp.len > 0) state.setBaseline(jid, stamp);
+        }
+        saveArchiveState(a);
+    }
     if (visibleChatIndex(a, pending.jid.slice())) |index| removeChatRow(a, index);
     startNextArchive(a);
     return null;
 }
 
+/// Rows just left the list. If the chat open in the pane was one of them,
+/// show the new selection at once, the way Ctrl+Tab does: refreshMessages
+/// paints from the in-memory cache, then the disk cache, then reads fresh.
+/// Waiting for the archive call to finish left the old chat on screen for
+/// many seconds.
+fn paneFollowSelection(a: *App, open_jid: []const u8) void {
+    const now: ?[]const u8 = if (a.selected_chat < a.chat_count) a.chats[a.selected_chat].jid.slice() else null;
+    if (!archive_rules.paneNeedsSwitch(open_jid, now)) return;
+    clearReply(a);
+    discardStagedImage(a);
+    a.user_viewed = true;
+    refreshMessages(a);
+    if (a.chat_count > 0) focusCompose(a);
+    if (a.hwnd) |hwnd| _ = win.InvalidateRect(hwnd, null, win.TRUE);
+}
+
 fn archiveSelectedChat(a: *App) void {
     if (a.chat_count == 0 or a.selected_chat >= a.chat_count) return;
+    if (a.bulk.count > 0) return archiveBulkSelection(a);
     const chat = &a.chats[a.selected_chat];
+    var open_jid = Utf8Text(191){};
+    open_jid.set(chat.jid.slice());
     const unarchive = a.show_archived or chat.archived;
-    if (archiveChat(a, chat.jid.slice(), unarchive)) |problem| return setStatus(a, problem);
+    if (archiveChat(a, open_jid.slice(), unarchive)) |problem| return setStatus(a, problem);
+    paneFollowSelection(a, open_jid.slice());
     setStatus(a, if (unarchive) "Unarchive queued" else "Archive queued");
+}
+
+/// Ctrl+A in the chat list: remember every row on screen. Ctrl+E then
+/// archives exactly these; Esc or a click clears them.
+fn selectAllChats(a: *App) void {
+    a.bulk.clear();
+    for (a.chats[0..a.chat_count]) |*chat| a.bulk.add(chat.jid.slice());
+    if (a.chats_hwnd) |list| _ = win.InvalidateRect(list, null, win.FALSE);
+    var buffer: [64]u8 = undefined;
+    setStatus(a, std.fmt.bufPrint(&buffer, "{d} chats selected - Ctrl+E archives them, Esc cancels", .{a.bulk.count}) catch "Chats selected");
+}
+
+fn clearBulkSelection(a: *App) bool {
+    if (a.bulk.count == 0) return false;
+    a.bulk.clear();
+    if (a.chats_hwnd) |list| _ = win.InvalidateRect(list, null, win.FALSE);
+    return true;
+}
+
+/// Ctrl+E with chats selected by Ctrl+A: queue one call per chat, drop the
+/// rows from the list at once, and move the pane a single time.
+fn archiveBulkSelection(a: *App) void {
+    var open_jid = Utf8Text(191){};
+    if (a.selected_chat < a.chat_count) open_jid.set(a.chats[a.selected_chat].jid.slice());
+    const unarchive = a.show_archived;
+    var queued: usize = 0;
+    var problem: ?[]const u8 = null;
+    var index: usize = 0;
+    while (index < a.bulk.count) : (index += 1) {
+        // The selection holds copies, so removed rows cannot shift them.
+        if (archiveChat(a, a.bulk.at(index), unarchive)) |why| {
+            problem = why;
+        } else queued += 1;
+    }
+    a.bulk.clear();
+    if (a.chats_hwnd) |list| _ = win.InvalidateRect(list, null, win.FALSE);
+    paneFollowSelection(a, open_jid.slice());
+    var buffer: [80]u8 = undefined;
+    if (problem != null and queued == 0) return setStatus(a, problem.?);
+    setStatus(a, std.fmt.bufPrint(&buffer, "{d} chats {s} queued", .{ queued, if (unarchive) "unarchive" else "archive" }) catch "Archive queued");
+}
+
+/// Ctrl+K "Keep archived": archive the open chat and stop it coming back on
+/// new messages. Run again ("Allow resurfacing") it only clears the flag.
+fn toggleKeepArchived(a: *App) void {
+    if (a.chat_count == 0 or a.selected_chat >= a.chat_count) return setStatus(a, "Select a chat first");
+    const state = a.archive_state orelse return setStatus(a, "Keep archived is not available");
+    const chat = &a.chats[a.selected_chat];
+    if (chat.provider != .whatsapp) return setStatus(a, "Keep archived works for WhatsApp chats only");
+    var jid = Utf8Text(191){};
+    jid.set(chat.jid.slice());
+    if (state.isKept(jid.slice())) {
+        state.setKeep(jid.slice(), false);
+        saveArchiveState(a);
+        if (a.chats_hwnd) |list| _ = win.InvalidateRect(list, null, win.FALSE);
+        if (a.canvas) |canvas| _ = win.InvalidateRect(canvas, null, win.FALSE);
+        return setStatus(a, "New messages can bring this chat back to the inbox again");
+    }
+    const already_archived = a.show_archived or chat.archived;
+    if (already_archived) {
+        state.setKeep(jid.slice(), true);
+        if (state.baseline(jid.slice()) == null and chat.timestamp.len > 0) state.setBaseline(jid.slice(), chat.timestamp.slice());
+        saveArchiveState(a);
+        if (a.chats_hwnd) |list| _ = win.InvalidateRect(list, null, win.FALSE);
+        if (a.canvas) |canvas| _ = win.InvalidateRect(canvas, null, win.FALSE);
+        return setStatus(a, "Kept archived: new messages will not bring it back");
+    }
+    if (archiveChat(a, jid.slice(), false)) |problem| return setStatus(a, problem);
+    state.setKeep(jid.slice(), true);
+    saveArchiveState(a);
+    paneFollowSelection(a, jid.slice());
+    setStatus(a, "Archived and kept archived: new messages will not bring it back");
 }
 
 // --------------------------------------------------------- wazigctl control
@@ -10532,6 +10836,9 @@ fn buildPaletteItems(a: *App) void {
     appendPalette(a, if (a.selected_chat < a.chat_count and isChatPinned(a, a.chats[a.selected_chat].jid.slice())) "Unpin selected chat" else "Pin chat to top", "", command_pin);
     appendPalette(a, if (a.show_archived) "Show inbox chats" else "Show archived chats", "", command_archived);
     appendPalette(a, if (a.show_archived) "Unarchive selected chat" else "Archive selected chat", "Ctrl+E", command_archive);
+    if (a.selected_chat < a.chat_count and a.chats[a.selected_chat].provider == .whatsapp) {
+        appendPalette(a, if (isKeptArchived(a, a.chats[a.selected_chat].jid.slice())) "Allow resurfacing" else "Keep archived", "", command_keep_archived);
+    }
     appendPalette(a, "Reply to selected message", "Ctrl+Shift+R", command_reply);
     appendPalette(a, "Resend failed message", "", command_resend);
     appendPalette(a, "React to selected message", "Ctrl+R", command_react_menu);
@@ -11370,11 +11677,13 @@ fn runCommand(a: *App, command: u16) void {
         command_shortcuts_help => openShortcutHelp(a),
         command_emoji_diag => setStatus(a, emoji_draw.failureNotice() orelse "Colour emoji is working"),
         command_unread => {
+            _ = clearBulkSelection(a);
             a.unread_only = !a.unread_only;
             refreshChats(a);
             refreshMessages(a);
         },
         command_archive => archiveSelectedChat(a),
+        command_keep_archived => toggleKeepArchived(a),
         command_pin => togglePinSelected(a),
         command_reply => startReply(a),
         command_resend => {
@@ -11392,6 +11701,7 @@ fn runCommand(a: *App, command: u16) void {
         command_show_slack => switchChatView(a, .slack),
         command_show_telegram => switchChatView(a, .telegram),
         command_archived => {
+            _ = clearBulkSelection(a);
             a.show_archived = !a.show_archived;
             refreshChats(a);
             refreshMessages(a);
@@ -12226,10 +12536,19 @@ fn drawChat(a: *App, item: *win.DRAWITEMSTRUCT) void {
     if (index >= a.chat_count) return;
     const chat = &a.chats[index];
     const selected = (item.itemState & win.ODS_SELECTED) != 0;
-    const background = win.CreateSolidBrush(if (selected) color_selected else color_panel) orelse return;
+    // Ctrl+A marks every row: green fill plus an accent bar on the left.
+    const bulk_selected = a.bulk.count > 0 and a.bulk.contains(chat.jid.slice());
+    const background = win.CreateSolidBrush(if (bulk_selected) color_outgoing else if (selected) color_selected else color_panel) orelse return;
     defer _ = win.DeleteObject(background);
     _ = win.FillRect(item.hDC, &item.rcItem, background);
     _ = win.SetBkMode(item.hDC, win.TRANSPARENT);
+    if (bulk_selected) {
+        if (win.CreateSolidBrush(color_accent)) |bar_brush| {
+            defer _ = win.DeleteObject(bar_brush);
+            var bar = win.RECT{ .left = item.rcItem.left, .top = item.rcItem.top, .right = item.rcItem.left + px(a, 4), .bottom = item.rcItem.bottom };
+            _ = win.FillRect(item.hDC, &bar, bar_brush);
+        }
+    }
 
     // The avatar bitmap is a fixed 42px DIB, so its offset scales but its
     // own box stays 42 to keep the baked circle and initial centered.
@@ -12279,8 +12598,15 @@ fn drawChat(a: *App, item: *win.DRAWITEMSTRUCT) void {
     _ = win.SetTextColor(item.hDC, color_muted);
     var time_rect = win.RECT{ .left = item.rcItem.right - px(a, 52), .top = item.rcItem.top + px(a, 10), .right = item.rcItem.right - px(a, 10), .bottom = item.rcItem.top + px(a, 32) };
     _ = win.DrawTextW(item.hDC, chat.time.ptr(), @intCast(chat.time.len), &time_rect, win.DT_RIGHT | win.DT_SINGLELINE | win.DT_VCENTER);
-    var kind_rect = win.RECT{ .left = item.rcItem.left + px(a, 66), .top = item.rcItem.top + px(a, 35), .right = item.rcItem.right - px(a, 42), .bottom = item.rcItem.top + px(a, 56) };
+    const marker = archiveMarker(a, chat);
+    var kind_rect = win.RECT{ .left = item.rcItem.left + px(a, 66), .top = item.rcItem.top + px(a, 35), .right = item.rcItem.right - px(a, if (marker != null) @as(i32, 130) else 42), .bottom = item.rcItem.top + px(a, 56) };
     _ = win.DrawTextW(item.hDC, chat.kind.ptr(), @intCast(chat.kind.len), &kind_rect, win.DT_LEFT | win.DT_SINGLELINE | win.DT_END_ELLIPSIS);
+    if (marker) |text| {
+        _ = win.SetTextColor(item.hDC, color_accent);
+        var marker_rect = win.RECT{ .left = item.rcItem.right - px(a, 128), .top = item.rcItem.top + px(a, 35), .right = item.rcItem.right - px(a, 40), .bottom = item.rcItem.top + px(a, 56) };
+        _ = win.DrawTextW(item.hDC, text, -1, &marker_rect, win.DT_RIGHT | win.DT_SINGLELINE);
+        _ = win.SetTextColor(item.hDC, color_muted);
+    }
 
     if (chat.unread or chat.unread_count > 0) {
         const unread_brush = win.CreateSolidBrush(color_accent) orelse return;
@@ -13054,6 +13380,19 @@ fn drawCanvas(hwnd: win.HWND, a: *App) void {
         var time_rect = win.RECT{ .left = right - px(a, 52), .top = y + height - px(a, 5) - time_band, .right = right - px(a, 10), .bottom = y + height - px(a, 5) };
         _ = win.DrawTextW(hdc, message.time.ptr(), @intCast(message.time.len), &time_rect, win.DT_RIGHT | win.DT_SINGLELINE);
     }
+    // Archived chats say so in a small badge at the top right of the pane.
+    if (a.selected_chat < a.chat_count) {
+        if (archiveMarker(a, &a.chats[a.selected_chat])) |text| {
+            _ = win.SelectObject(hdc, @ptrCast(a.font_small.?));
+            var badge = win.RECT{ .left = client.right - px(a, 150), .top = client.top + px(a, 8), .right = client.right - px(a, 24), .bottom = client.top + px(a, 32) };
+            if (win.CreateSolidBrush(color_raised)) |badge_brush| {
+                defer _ = win.DeleteObject(badge_brush);
+                _ = win.FillRect(hdc, &badge, badge_brush);
+            }
+            _ = win.SetTextColor(hdc, color_accent);
+            _ = win.DrawTextW(hdc, text, -1, &badge, win.DT_CENTER | win.DT_SINGLELINE | win.DT_VCENTER);
+        }
+    }
     drawScrollbar(hdc, canvasStripRect(a), canvasScrollInfo(a), a.brush_muted.?);
 }
 
@@ -13410,6 +13749,8 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
                     }
                 },
                 .reaction => applyReaction(a, result),
+                .archived_scan => if (result.ok) applyArchivedScan(a, result.data),
+                .resurface_probe => if (result.ok) applyResurfaceProbe(a, result.jid.slice(), result.extra.slice(), result.data),
                 .cache_tag => {
                     if (a.sync_auth_probe and result.gen == a.cache_tag_gen) applySyncAuthProbe(a, result.ok, result.data);
                     if (a.pairing_probe and result.gen == a.cache_tag_gen) applyPairingProbe(a, result.ok, result.data);
@@ -13792,10 +14133,16 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
             }
             return 1;
         },
+        // A click on any child (the chat list included) drops a Ctrl+A selection.
+        win.WM_PARENTNOTIFY => {
+            if (loword(wparam) == win.WM_LBUTTONDOWN) _ = clearBulkSelection(a);
+            return 0;
+        },
         win.WM_COMMAND => {
             const id = loword(wparam);
             const notification = hiword(wparam);
             if (id == id_chats and notification == win.LBN_SELCHANGE) {
+                _ = clearBulkSelection(a);
                 const selected = win.SendMessageW(a.chats_hwnd.?, win.LB_GETCURSEL, 0, 0);
                 if (selected >= 0) {
                     discardStagedImage(a);
@@ -13873,8 +14220,10 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
                 // could never start.
                 retryPendingDownload(a);
                 retryUnarchiveChat(a);
+                tickArchivedScan(a, changed);
                 _ = autoDownloadNextMedia(a);
             } else if (wparam == timer_search) {
+                _ = clearBulkSelection(a);
                 _ = win.KillTimer(hwnd, timer_search);
                 refreshChats(a);
                 refreshMessages(a);
@@ -14201,6 +14550,12 @@ fn handleKeyboard(a: *App, message: *const win.MSG) bool {
             _ = win.SendMessageW(focus.?, win.EM_SETSEL, 0, @bitCast(@as(isize, -1)));
             return true;
         }
+        // With focus in the chat list, Ctrl+A selects every chat shown;
+        // Ctrl+E then archives them together.
+        if (a.chats_hwnd != null and focus == a.chats_hwnd.?) {
+            selectAllChats(a);
+            return true;
+        }
     }
     // Ctrl+Backspace deletes the previous word in the same three fields:
     // left to the default EDIT control it inserts a box glyph instead (see
@@ -14303,6 +14658,11 @@ fn handleKeyboard(a: *App, message: *const win.MSG) bool {
                 }
             }
         }
+    }
+    // Esc drops a Ctrl+A chat selection before anything else uses it.
+    if (key == win.VK_ESCAPE and clearBulkSelection(a)) {
+        setStatus(a, "Selection cleared");
+        return true;
     }
     if (key == win.VK_ESCAPE) {
         const focused = win.GetFocus();
@@ -15067,6 +15427,7 @@ pub fn main(init: std.process.Init) !void {
     }
     app.played_path = findPlayedPath(init, init.gpa);
     loadPlayed(&app);
+    loadArchiveState(&app);
     app.media_fetched_path = findMediaFetchedPath(init, init.gpa);
     loadHashSet(&app, app.media_fetched_path, &app.media_fetched);
     app.read_path = hashStorePath(init, init.gpa, "pending-reads.txt");

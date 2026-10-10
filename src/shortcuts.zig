@@ -25,6 +25,7 @@ pub const groups = [_]Group{
         .{ .key = "Esc", .desc = "Clear the search and show all chats" },
         .{ .key = "U", .desc = "Toggle unread chats" },
         .{ .key = "Ctrl+E or E", .desc = "Archive or unarchive the selected chat" },
+        .{ .key = "Ctrl+A in the chat list", .desc = "Select all chats; Ctrl+E archives them, Esc cancels" },
         .{ .key = "R", .desc = "Refresh" },
         .{ .key = "Q", .desc = "Quit Messages" },
     } },
