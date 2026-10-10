@@ -13897,7 +13897,7 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
                     }
                     a.update_pending = upd;
                     if (is_new_offer) a.update_failures = 0;
-                                    // A new release resets the card; a click already in flight
+                    // A new release resets the card; a click already in flight
                     // keeps going on its own.
                     if (is_new_offer) {
                         a.update_staged = false;
