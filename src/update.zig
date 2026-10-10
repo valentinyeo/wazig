@@ -8,10 +8,89 @@
 // builds from before the ARM zip existed from ever matching it.
 const std = @import("std");
 
-pub const zip_asset_prefix = if (@import("builtin").cpu.arch == .aarch64) "Messages_arm64-" else "Messages-";
+/// The release channel is picked by CPU: x64 and ARM64 builds each take only
+/// their own zip, so one never installs the other's binary.
+pub fn zipPrefixFor(arm64: bool) []const u8 {
+    return if (arm64) "Messages_arm64-" else "Messages-";
+}
+
+pub const zip_asset_prefix = zipPrefixFor(@import("builtin").cpu.arch == .aarch64);
+
+pub fn isZipAssetNameFor(name: []const u8, arm64: bool) bool {
+    return std.mem.startsWith(u8, name, zipPrefixFor(arm64)) and std.mem.endsWith(u8, name, ".zip");
+}
 
 pub fn isZipAssetName(name: []const u8) bool {
-    return std.mem.startsWith(u8, name, zip_asset_prefix) and std.mem.endsWith(u8, name, ".zip");
+    return isZipAssetNameFor(name, @import("builtin").cpu.arch == .aarch64);
+}
+
+test "channel pick: each CPU takes only its own zip" {
+    try std.testing.expect(isZipAssetNameFor("Messages-0.9.92.zip", false));
+    try std.testing.expect(!isZipAssetNameFor("Messages_arm64-0.9.92.zip", false));
+    try std.testing.expect(isZipAssetNameFor("Messages_arm64-0.9.92.zip", true));
+    try std.testing.expect(!isZipAssetNameFor("Messages-0.9.92.zip", true));
+    try std.testing.expect(!isZipAssetNameFor("Messages-0.9.92.zip.sig", false));
+}
+
+/// Test hook for the update card: an environment value naming an OLDER
+/// version makes the app believe it is behind, so the card can be shown
+/// without waiting for a real release. A value that is malformed or not
+/// older is ignored, so the hook can only ever lower the version.
+pub fn effectiveCurrent(real: Version, fake_text: ?[]const u8) Version {
+    const text = fake_text orelse return real;
+    const fake = parseVersion(text) orelse return real;
+    if (isNewerVersion(real, fake)) return fake;
+    return real;
+}
+
+fn isNewerVersion(latest: Version, current: Version) bool {
+    if (latest.major != current.major) return latest.major > current.major;
+    if (latest.minor != current.minor) return latest.minor > current.minor;
+    return latest.patch > current.patch;
+}
+
+test effectiveCurrent {
+    const real = Version{ .major = 0, .minor = 9, .patch = 92 };
+    try std.testing.expectEqual(real, effectiveCurrent(real, null));
+    try std.testing.expectEqual(Version{ .major = 0, .minor = 0, .patch = 1 }, effectiveCurrent(real, "0.0.1"));
+    try std.testing.expectEqual(real, effectiveCurrent(real, "9.9.9"));
+    try std.testing.expectEqual(real, effectiveCurrent(real, "garbage"));
+    try std.testing.expectEqual(real, effectiveCurrent(real, "v0.9.92"));
+}
+
+/// The staged download is marked by a small file written after the archive
+/// was verified and extracted: line one is the release tag, line two the
+/// archive's top folder (may be empty). No marker means nothing is staged.
+pub const StageMarker = struct { tag: []const u8, inner_root: []const u8 };
+
+pub fn parseStageMarker(text: []const u8) ?StageMarker {
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    const tag = std.mem.trimEnd(u8, lines.next() orelse return null, "\r");
+    if (parseVersion(tag) == null) return null;
+    const inner = std.mem.trimEnd(u8, lines.next() orelse "", "\r");
+    return .{ .tag = tag, .inner_root = inner };
+}
+
+test parseStageMarker {
+    const m = parseStageMarker("v0.9.92\nMessages\n").?;
+    try std.testing.expectEqualStrings("v0.9.92", m.tag);
+    try std.testing.expectEqualStrings("Messages", m.inner_root);
+    try std.testing.expectEqualStrings("", parseStageMarker("v0.9.92\n\n").?.inner_root);
+    try std.testing.expectEqualStrings("", parseStageMarker("v0.9.92").?.inner_root);
+    try std.testing.expect(parseStageMarker("") == null);
+    try std.testing.expect(parseStageMarker("junk\nx") == null);
+}
+
+/// Whole-number percent for the card's progress bar; 0 when the size is unknown.
+pub fn percent(done: u64, total: u64) u32 {
+    if (total == 0) return 0;
+    return @intCast(@min(100, done * 100 / total));
+}
+
+test percent {
+    try std.testing.expectEqual(@as(u32, 0), percent(5, 0));
+    try std.testing.expectEqual(@as(u32, 50), percent(50, 100));
+    try std.testing.expectEqual(@as(u32, 100), percent(300, 100));
 }
 
 pub const Version = struct {
