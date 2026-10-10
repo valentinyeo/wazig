@@ -2,6 +2,7 @@
 // in-process Opus encoding (voice_note.zig). The UI polls level, elapsed time
 // and state; it never blocks on audio.
 const std = @import("std");
+const mic_choice = @import("mic_choice.zig");
 const voice_note = @import("voice_note.zig");
 const win = @cImport({
     @cDefine("WIN32_LEAN_AND_MEAN", "1");
@@ -148,7 +149,9 @@ fn capture(self: *Session, pcm: *std.ArrayList(i16)) !void {
     defer _ = enumerator.?.*.lpVtbl.*.Release.?(enumerator);
 
     var device: ?*win.IMMDevice = null;
-    if (enumerator.?.*.lpVtbl.*.GetDefaultAudioEndpoint.?(enumerator.?, win.eCapture, win.eCommunications, &device) < 0 or device == null) return error.NoMicrophone;
+    // The microphone picked in the palette, else the Windows default.
+    if (mic_choice.openChosen()) |picked| device = @ptrCast(@alignCast(picked));
+    if (device == null and (enumerator.?.*.lpVtbl.*.GetDefaultAudioEndpoint.?(enumerator.?, win.eCapture, win.eCommunications, &device) < 0 or device == null)) return error.NoMicrophone;
     defer _ = device.?.*.lpVtbl.*.Release.?(device);
 
     var client: ?*win.IAudioClient = null;
