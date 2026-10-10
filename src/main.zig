@@ -329,8 +329,12 @@ const FailedSend = struct {
     // older than this, so an old same-text message is not mistaken for this
     // failed (then delivered) send.
     queued_unix: i64 = 0,
-    // A file send: its paste file is gone, so a manual resend is refused.
+    // A file send keeps its staged file until a send is confirmed, so a
+    // manual resend can upload it again (image or recorded voice note).
     is_file: bool = false,
+    file: Utf8Text(519) = .{},
+    ptt: bool = false,
+    voice_seconds: u32 = 0,
 };
 
 // An image staged from the clipboard (WAZI-37): a PNG copy written to the
@@ -1569,6 +1573,14 @@ fn splitQuote(display: []const u8, reply: []const u8) ?QuoteParts {
     const separator = display.len - reply.len - 1;
     if (separator < 2 or display[separator] != '\n') return null;
     return .{ .quote = display[2..separator], .body = reply };
+}
+
+test "sendBaseText labels voice notes, bare images and captions" {
+    var buffer: [48]u8 = undefined;
+    try std.testing.expectEqualStrings("Voice message 1:05", sendBaseText(&buffer, "", true, true, 65));
+    try std.testing.expectEqualStrings("Image", sendBaseText(&buffer, "", true, false, 0));
+    try std.testing.expectEqualStrings("hello", sendBaseText(&buffer, "hello", true, false, 0));
+    try std.testing.expectEqualStrings("hi", sendBaseText(&buffer, "hi", false, false, 0));
 }
 
 test "splitQuote recovers a normal reply" {
@@ -3926,6 +3938,15 @@ fn localSendId(buffer: []u8, seq: u64) []const u8 {
 // The placeholder text a file send's bubble shows instead of its caption.
 const file_send_placeholder = "Sending file...";
 
+/// The bubble label of a send without any "(retrying)" or "(not sent)"
+/// decoration: a voice note reads "Voice message m:ss", a caption-less file
+/// "Image", anything else its text.
+fn sendBaseText(buffer: []u8, text: []const u8, has_file: bool, ptt: bool, voice_seconds: u32) []const u8 {
+    if (ptt) return std.fmt.bufPrint(buffer, "Voice message {d}:{d:0>2}", .{ voice_seconds / 60, voice_seconds % 60 }) catch "Voice message";
+    if (has_file and text.len == 0) return "Image";
+    return text;
+}
+
 /// Bubble text for a queued send that has failed at least once and is
 /// waiting out its backoff: still reads as in-progress, not "not sent".
 /// Built fresh from `pending.text` each time rather than accumulated, so it
@@ -3999,7 +4020,8 @@ fn markPendingSendFailed(a: *App, pending: *const PendingSend) void {
         // Built from pending.text (the canonical, unmarked text), not the
         // displayed bubble: a retried send's bubble carries a "(retrying
         // N/3)" label that must not end up stacked onto "(not sent)".
-        const old = pending.text.slice();
+        var base_buffer: [48]u8 = undefined;
+        const old = sendBaseText(&base_buffer, pending.text.slice(), pending.file.len > 0, pending.ptt, pending.voice_seconds);
         if (old.len + " (not sent)".len < 4095) {
             const marked = std.fmt.allocPrint(a.allocator, "{s} (not sent)", .{old}) catch return;
             defer a.allocator.free(marked);
@@ -4036,14 +4058,16 @@ fn appendWhatsAppFailed(a: *App, failed: *const FailedSend) void {
     var message = Message{};
     message.from_me = true;
     message.sender.set(a.allocator, "You");
-    if (failed.text.len == 0) {
+    var base_buffer: [48]u8 = undefined;
+    const base = sendBaseText(&base_buffer, failed.text.slice(), failed.is_file, failed.ptt, failed.voice_seconds);
+    if (base.len == 0) {
         message.text.set(a.allocator, "(not sent)");
-    } else if (failed.text.len + " (not sent)".len < 4095) {
-        const marked = std.fmt.allocPrint(a.allocator, "{s} (not sent)", .{failed.text.slice()}) catch return;
+    } else if (base.len + " (not sent)".len < 4095) {
+        const marked = std.fmt.allocPrint(a.allocator, "{s} (not sent)", .{base}) catch return;
         defer a.allocator.free(marked);
         message.text.set(a.allocator, marked);
     } else {
-        message.text.set(a.allocator, failed.text.slice());
+        message.text.set(a.allocator, base);
     }
     var local = std.mem.zeroes(win.SYSTEMTIME);
     win.GetLocalTime(&local);
@@ -4062,7 +4086,8 @@ fn appendWhatsAppFailed(a: *App, failed: *const FailedSend) void {
 fn rememberFailedSend(a: *App, pending: *const PendingSend) void {
     for (a.failed_sends[0..a.failed_send_count]) |*entry| {
         if (std.mem.eql(u8, entry.jid.slice(), pending.jid.slice()) and
-            std.mem.eql(u8, entry.text.slice(), pending.text.slice())) return;
+            std.mem.eql(u8, entry.text.slice(), pending.text.slice()) and
+            std.mem.eql(u8, entry.file.slice(), pending.file.slice())) return;
     }
     if (a.failed_send_count == a.failed_sends.len) {
         var index: usize = 1;
@@ -4073,6 +4098,9 @@ fn rememberFailedSend(a: *App, pending: *const PendingSend) void {
     a.failed_sends[a.failed_send_count].text.set(pending.text.slice());
     a.failed_sends[a.failed_send_count].queued_unix = pending.queued_unix;
     a.failed_sends[a.failed_send_count].is_file = pending.file.len > 0;
+    a.failed_sends[a.failed_send_count].file.set(pending.file.slice());
+    a.failed_sends[a.failed_send_count].ptt = pending.ptt;
+    a.failed_sends[a.failed_send_count].voice_seconds = pending.voice_seconds;
     a.failed_send_count += 1;
 }
 
@@ -4080,7 +4108,7 @@ fn rememberFailedSend(a: *App, pending: *const PendingSend) void {
 /// bubble is not resurrected by the next reload.
 fn forgetFailedSend(a: *App, jid: []const u8, text: []const u8) void {
     for (a.failed_sends[0..a.failed_send_count], 0..) |*entry, index| {
-        if (!std.mem.eql(u8, entry.jid.slice(), jid) or !std.mem.eql(u8, entry.text.slice(), text)) continue;
+        if (entry.is_file or !std.mem.eql(u8, entry.jid.slice(), jid) or !std.mem.eql(u8, entry.text.slice(), text)) continue;
         var shift = index;
         while (shift + 1 < a.failed_send_count) : (shift += 1) a.failed_sends[shift] = a.failed_sends[shift + 1];
         a.failed_send_count -= 1;
@@ -4115,10 +4143,13 @@ fn pruneFailedSends(a: *App, jid: []const u8) void {
             index += 1;
             continue;
         }
+        // Delivered after all: the kept file is no longer needed.
+        if (entry.is_file and entry.file.len > 0) deleteFileUtf8(entry.file.slice());
         var shift = index;
         while (shift + 1 < a.failed_send_count) : (shift += 1) a.failed_sends[shift] = a.failed_sends[shift + 1];
         a.failed_send_count -= 1;
         a.failed_sends[a.failed_send_count] = .{};
+        persistFileOutbox(a);
     }
 }
 
@@ -4168,7 +4199,9 @@ fn resendFailedMessage(a: *App, index: usize) bool {
     // says whether this was a file send and when it was first queued.
     var entry: ?*const FailedSend = null;
     for (a.failed_sends[0..a.failed_send_count]) |*candidate| {
-        if (std.mem.eql(u8, candidate.jid.slice(), jid) and std.mem.eql(u8, candidate.text.slice(), original)) {
+        var base_buffer: [48]u8 = undefined;
+        const base = sendBaseText(&base_buffer, candidate.text.slice(), candidate.is_file, candidate.ptt, candidate.voice_seconds);
+        if (std.mem.eql(u8, candidate.jid.slice(), jid) and std.mem.eql(u8, base, original)) {
             entry = candidate;
             break;
         }
@@ -4178,7 +4211,34 @@ fn resendFailedMessage(a: *App, index: usize) bool {
         return true;
     };
     if (failed.is_file) {
-        setStatus(a, "Can't resend a file automatically - attach it again");
+        // The file was kept on purpose (a failed send never deletes it):
+        // upload it again, with its caption and voice-note flag.
+        if (!fileExistsUtf8(failed.file.slice())) {
+            forgetFailedSendEntry(a, failed);
+            setStatus(a, "The file is gone - attach it again");
+            return true;
+        }
+        const file_pending = &a.pending_sends[a.pending_send_count];
+        file_pending.* = .{};
+        file_pending.jid.set(jid);
+        file_pending.text.set(failed.text.slice());
+        file_pending.file.set(failed.file.slice());
+        file_pending.ptt = failed.ptt;
+        file_pending.voice_seconds = failed.voice_seconds;
+        a.send_seq += 1;
+        file_pending.seq = a.send_seq;
+        file_pending.queued_unix = nowUnixSeconds();
+        a.pending_send_count += 1;
+        message.send_state = .pending;
+        var label_buffer: [48]u8 = undefined;
+        message.text.set(a.allocator, sendBaseText(&label_buffer, file_pending.text.slice(), true, file_pending.ptt, file_pending.voice_seconds));
+        var file_id_buffer: [32]u8 = undefined;
+        message.id.set(localSendId(&file_id_buffer, file_pending.seq));
+        forgetFailedSendEntry(a, failed);
+        persistFileOutbox(a);
+        setStatus(a, "Resending...");
+        if (a.canvas) |canvas| _ = win.InvalidateRect(canvas, null, win.TRUE);
+        startNextSend(a);
         return true;
     }
     if (original.len == 0) {
@@ -8312,11 +8372,26 @@ fn setStatus(a: *App, text: []const u8) void {
     }
 }
 
+fn sendKindName(pending: *const PendingSend) []const u8 {
+    if (pending.ptt) return "voice";
+    return if (pending.file.len > 0) "file" else "text";
+}
+
+/// One launch-log line per finished send with where the time went: `run` is
+/// how long the wacli child ran (forwarder, ssh and VM upload), `since_queued`
+/// is everything from the click, so queue wait is the difference.
+fn logSendTiming(a: *App, outcome: []const u8, pending: PendingSend) void {
+    var buffer: [160]u8 = undefined;
+    const line = std.fmt.bufPrint(&buffer, "send: {s} kind={s} run={d}ms since_queued={d}s retries={d}", .{ outcome, sendKindName(&pending), win.GetTickCount64() -| a.send_started_ms, nowUnixSeconds() - pending.queued_unix, pending.retries }) catch "send: ok";
+    appendLaunchLog(a, line);
+}
+
+/// Drop the head of the send queue. The staged file (image or voice note) is
+/// deleted only when `delivered` is true: a failed send keeps it so the red
+/// bubble can retry the upload. A delivered voice note keeps its file: it
+/// plays and transcribes from disk, and the media-cache age policy evicts it
+/// later.
 fn removeFirstPendingSend(a: *App, delivered: bool) void {
-    // Paste-to-send files live in the paste folder and are deleted once the
-    // queued send (or its spawn failure) finishes with them. A delivered
-    // voice note keeps its file: it plays and transcribes from disk, and the
-    // media-cache age policy evicts it later.
     if (a.pending_send_count == 0) return;
     const head = &a.pending_sends[0];
     if (delivered and head.ptt and head.file.len > 0 and head.jid.len <= 191 and head.file.len <= 520) {
@@ -8326,13 +8401,95 @@ fn removeFirstPendingSend(a: *App, delivered: bool) void {
         @memcpy(entry.file[0..head.file.len], head.file.slice());
         entry.file_len = head.file.len;
         voice_sent.push(&a.sent_voice, &a.sent_voice_count, entry);
-    } else if (head.file.len > 0) deleteFileUtf8(head.file.slice());
+    } else if (delivered and head.file.len > 0) deleteFileUtf8(head.file.slice());
     var index: usize = 1;
     while (index < a.pending_send_count) : (index += 1) {
         a.pending_sends[index - 1] = a.pending_sends[index];
     }
     a.pending_send_count -= 1;
     a.pending_sends[a.pending_send_count] = .{};
+    persistFileOutbox(a);
+}
+
+fn fileExistsUtf8(path_utf8: []const u8) bool {
+    const wide = std.unicode.utf8ToUtf16LeAllocZ(std.heap.page_allocator, path_utf8) catch return false;
+    defer std.heap.page_allocator.free(wide);
+    return win.GetFileAttributesW(wide.ptr) != win.INVALID_FILE_ATTRIBUTES;
+}
+
+fn forgetFailedSendEntry(a: *App, entry: *const FailedSend) void {
+    const index = (@intFromPtr(entry) - @intFromPtr(&a.failed_sends[0])) / @sizeOf(FailedSend);
+    if (index >= a.failed_send_count) return;
+    var shift = index;
+    while (shift + 1 < a.failed_send_count) : (shift += 1) a.failed_sends[shift] = a.failed_sends[shift + 1];
+    a.failed_send_count -= 1;
+    a.failed_sends[a.failed_send_count] = .{};
+    persistFileOutbox(a);
+}
+
+/// Journal of file sends (images, voice notes) that are queued or failed:
+/// one tab-separated line each, `jid ptt seconds queued_unix file caption`.
+/// It lets a restart (an update relaunch killed a queued voice note on
+/// 2026-10-10) bring them back as red "not sent" bubbles instead of losing
+/// them. Rewritten whole after every change; an empty queue removes it.
+fn persistFileOutbox(a: *App) void {
+    const path = messagesDirPath(a, "outbox-files.txt") orelse return;
+    defer a.allocator.free(path);
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(a.allocator);
+    for (a.pending_sends[0..a.pending_send_count]) |*pending| {
+        if (pending.file.len == 0) continue;
+        appendOutboxLine(a, &body, pending.jid.slice(), pending.ptt, pending.voice_seconds, pending.queued_unix, pending.file.slice(), pending.text.slice());
+    }
+    for (a.failed_sends[0..a.failed_send_count]) |*failed| {
+        if (!failed.is_file) continue;
+        appendOutboxLine(a, &body, failed.jid.slice(), failed.ptt, failed.voice_seconds, failed.queued_unix, failed.file.slice(), failed.text.slice());
+    }
+    if (body.items.len == 0) {
+        deleteFileUtf8(path);
+        return;
+    }
+    writeCacheFileAtomic(a, path, body.items);
+}
+
+fn appendOutboxLine(a: *App, body: *std.ArrayList(u8), jid: []const u8, ptt: bool, seconds: u32, queued_unix: i64, file: []const u8, caption: []const u8) void {
+    const line = std.fmt.allocPrint(a.allocator, "{s}\t{d}\t{d}\t{d}\t{s}\t", .{ jid, @intFromBool(ptt), seconds, queued_unix, file }) catch return;
+    defer a.allocator.free(line);
+    body.appendSlice(a.allocator, line) catch return;
+    for (caption) |byte| body.append(a.allocator, if (byte == '\t' or byte == '\n' or byte == '\r') ' ' else byte) catch return;
+    body.append(a.allocator, '\n') catch return;
+}
+
+/// At startup, turn every journalled file send whose file still exists into
+/// a remembered failure, so it shows as a red "not sent" bubble with retry.
+fn loadFileOutbox(a: *App) void {
+    const path = messagesDirPath(a, "outbox-files.txt") orelse return;
+    defer a.allocator.free(path);
+    const data = readFileWin(a.allocator, path, 256 * 1024) orelse return;
+    defer a.allocator.free(data);
+    var lines = std.mem.splitScalar(u8, data, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0 or a.failed_send_count >= max_failed_sends) continue;
+        var fields = std.mem.splitScalar(u8, line, '\t');
+        const jid = fields.next() orelse continue;
+        const ptt = fields.next() orelse continue;
+        const seconds = fields.next() orelse continue;
+        const queued = fields.next() orelse continue;
+        const file = fields.next() orelse continue;
+        const caption = fields.rest();
+        if (jid.len == 0 or file.len == 0 or !fileExistsUtf8(file)) continue;
+        const entry = &a.failed_sends[a.failed_send_count];
+        entry.* = .{};
+        entry.jid.set(jid);
+        entry.text.set(caption);
+        entry.file.set(file);
+        entry.is_file = true;
+        entry.ptt = std.mem.eql(u8, ptt, "1");
+        entry.voice_seconds = std.fmt.parseInt(u32, seconds, 10) catch 0;
+        entry.queued_unix = std.fmt.parseInt(i64, queued, 10) catch 0;
+        a.failed_send_count += 1;
+    }
+    if (a.failed_send_count > 0) appendLaunchLog(a, "outbox: restored unsent file sends");
 }
 
 /// Record a failed attempt for the head send. Every failure (a nonzero exit,
@@ -8350,7 +8507,8 @@ fn failHeadPendingSend(a: *App, code: u32, ambiguous: bool, detail: []const u8, 
     a.pending_sends[0].ambiguous = ambiguous;
     const retries = a.pending_sends[0].retries;
     var log_buffer: [320]u8 = undefined;
-    const event = std.fmt.bufPrint(&log_buffer, "send: failed exit {d} retry {d}: {s}", .{ code, retries, detail }) catch "send: failed";
+    const head = &a.pending_sends[0];
+    const event = std.fmt.bufPrint(&log_buffer, "send: failed exit {d} retry {d} kind={s} run={d}ms since_queued={d}s: {s}", .{ code, retries, sendKindName(head), win.GetTickCount64() -| a.send_started_ms, nowUnixSeconds() - head.queued_unix, detail }) catch "send: failed";
     appendLaunchLog(a, event);
     if (!auth_failed) {
         if (sendRetryDelayMs(retries)) |delay_ms| {
@@ -8629,6 +8787,8 @@ fn startNextSend(a: *App) void {
     a.send_child = child;
     a.send_direct = a.sync_child == null;
     a.send_started_ms = win.GetTickCount64();
+    var start_buffer: [120]u8 = undefined;
+    if (std.fmt.bufPrint(&start_buffer, "send: start kind={s} waited_in_queue={d}s lock_wait={s}", .{ sendKindName(pending), nowUnixSeconds() - pending.queued_unix, lock_wait })) |start_line| appendLaunchLog(a, start_line) else |_| {}
     var status_buffer: [80]u8 = undefined;
     const status = std.fmt.bufPrint(&status_buffer, "Sending queued message, {d} remaining", .{a.pending_send_count}) catch "Sending queued message...";
     setStatus(a, status);
@@ -8658,7 +8818,7 @@ fn checkSend(a: *App) void {
         a.send_child = null;
         a.send_direct = false;
         if (code == 0) {
-            appendLaunchLog(a, "send: ok");
+            logSendTiming(a, "ok", a.pending_sends[0]);
             removeFirstPendingSend(a, true);
             if (a.pending_send_count > 0) {
                 startNextSend(a);
@@ -9147,6 +9307,7 @@ fn queueVoiceNote(a: *App, jid: []const u8, ogg: []const u8, seconds: u32, wavef
     a.user_viewed = true;
     a.scroll_y = 0;
     appendWhatsAppPending(a, pending, false);
+    persistFileOutbox(a);
     if (a.hwnd) |main_hwnd| _ = win.InvalidateRect(main_hwnd, null, win.TRUE);
     startNextSend(a);
     return true;
@@ -9197,6 +9358,7 @@ fn sendMessage(a: *App) void {
         a.user_viewed = true;
         a.scroll_y = 0; // the user just sent: pin the view to the newest bubble
         appendWhatsAppPending(a, pending, false);
+        persistFileOutbox(a);
         _ = win.SetWindowTextW(a.compose.?, lit(""));
         layout(a, a.compose_client_width, a.compose_client_height);
         if (a.hwnd) |main_hwnd| _ = win.InvalidateRect(main_hwnd, null, win.TRUE);
@@ -15927,6 +16089,7 @@ pub fn main(init: std.process.Init) !void {
         appendLaunchLog(&app, "startup: saved account tag loaded");
     } else appendLaunchLog(&app, "startup: no saved account tag, caches wait for auth status");
     loadEmojiRecents(&app);
+    loadFileOutbox(&app);
     if (init.environ_map.get("LOCALAPPDATA")) |local| {
         if (std.fs.path.join(init.gpa, &.{ local, "Messages", "telegram" })) |telegram_dir| {
             // Runtime keys (registry) override the baked build defaults.
