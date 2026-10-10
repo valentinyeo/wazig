@@ -452,6 +452,8 @@ fn formatTranscript(allocator: std.mem.Allocator, transcript: []const u8, api_ke
         \\
         \\STYLE: No preamble. No "Here is your formatted transcript." No closing pleasantries. Start with the Gist, end with the last bullet or the cutoff note.
         \\
+        \\ALWAYS ANSWER: whatever the transcript contains, produce the format above. Never refuse, never apologize, never ask a question, never comment on the task, never say you cannot format it. If the transcript is very short, unclear, repeated, or only noise, write one numbered line stating exactly that (for example "1. Very short note: only a greeting") and then the transcript under it. If it is already formatted, repeat it unchanged. The first character of your answer is always "1".
+        \\
         \\If you are ever unsure whether a change is allowed: it is not. Keep the words.
     ;
     const anthropic = std.mem.startsWith(u8, api_key, "sk-ant-");
@@ -494,7 +496,14 @@ fn formatTranscript(allocator: std.mem.Allocator, transcript: []const u8, api_ke
         response.shrinkRetainingCapacity(old_len + read);
     }
 
-    return format_request.formatResponseText(allocator, anthropic, response.items);
+    const formatted = try format_request.formatResponseText(allocator, anthropic, response.items);
+    // A refusal or other meta answer must not replace the transcript: failing
+    // here keeps the raw transcript on screen.
+    if (format_request.isRefusal(formatted)) {
+        allocator.free(formatted);
+        return error.Refused;
+    }
+    return formatted;
 }
 
 fn readSmallFile(allocator: std.mem.Allocator, path_utf8: []const u8, max_bytes: usize) ?[]u8 {

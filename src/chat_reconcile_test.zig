@@ -65,7 +65,12 @@ const App = struct {
     last_job: WacliJob = .{},
     painted: u32 = 0,
     cached: u32 = 0,
+    message_count: usize = 0,
+    pending_send_count: usize = 0,
+    failed_send_count: usize = 0,
+    msg_applied_hash: u64 = 0,
 };
+fn markChatRead(_: *App) void {}
 fn fixture() App {
     var a = App{};
     a.chats[0].jid.set("a@g.us");
@@ -141,6 +146,24 @@ test "failed and malformed reads retry but a valid empty conversation succeeds" 
     deliver(&a, &result);
     try std.testing.expectEqual(@as(u32, 0), a.msg_read_attempts);
     try std.testing.expectEqual(@as(u32, 0), a.msg_read_retry_ticks);
+    try std.testing.expectEqual(@as(u32, 1), a.cached);
+}
+
+test "an identical fresh read for the open chat is not repainted" {
+    var a = fixture();
+    refreshMessages(&a);
+    var result = resultFor(a.last_job);
+    a.message_count = 1;
+    a.msg_applied_hash = std.hash.Wyhash.hash(0, result.data);
+    const painted = a.painted;
+    deliver(&a, &result);
+    try std.testing.expectEqual(painted, a.painted);
+    try std.testing.expectEqual(@as(u32, 0), a.cached);
+    // A changed payload still paints and caches.
+    refreshMessages(&a);
+    result = resultFor(a.last_job);
+    result.data = "{\"data\":{\"messages\":[{}]}}";
+    deliver(&a, &result);
     try std.testing.expectEqual(@as(u32, 1), a.cached);
 }
 

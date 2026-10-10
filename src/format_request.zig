@@ -78,6 +78,68 @@ pub fn formatResponseText(allocator: std.mem.Allocator, anthropic: bool, respons
     return allocator.dupe(u8, trimmed);
 }
 
+/// True when the model answered about the task instead of doing it: a refusal,
+/// an apology, a question, or any reply that is not the numbered summary the
+/// prompt demands. Such an answer must never replace the raw transcript.
+pub fn isRefusal(text: []const u8) bool {
+    const body = std.mem.trimStart(u8, text, " \r\n\t");
+    if (body.len == 0) return true;
+    var lower_buffer: [96]u8 = undefined;
+    const head = std.ascii.lowerString(&lower_buffer, body[0..@min(body.len, lower_buffer.len)]);
+    // Skip a list marker so "1. I cannot ..." is caught too.
+    var skip: usize = 0;
+    while (skip < head.len and (std.ascii.isDigit(head[skip]) or head[skip] == '.' or head[skip] == ')' or head[skip] == ' ' or head[skip] == '-')) skip += 1;
+    const openers = [_][]const u8{
+        "i cannot",       "i can't",    "i can not",       "i'm unable",      "i am unable",
+        "i'm sorry",      "i am sorry", "sorry",           "i apologize",     "unfortunately",
+        "as an ai",       "i won't",    "i will not",      "i'm not able",    "i am not able",
+        "entschuldigung", "leider",     "ich kann nicht",  "ich kann dieses", "ich kann diese",
+        "there is no",    "there's no", "this transcript", "the transcript",  "it looks like",
+        "it seems",       "could you",  "can you",         "please provide",  "please share",
+    };
+    for (openers) |opener| if (std.mem.startsWith(u8, head[skip..], opener)) return true;
+    // The contract: the answer starts with the numbered summary line "1.".
+    // Anything else is a meta answer, not a summary.
+    return !(head.len >= 2 and head[0] == '1' and (head[1] == '.' or head[1] == ')'));
+}
+
+/// True when a transcript already carries the numbered summary this app asks
+/// for, so it is not sent for formatting a second time.
+pub fn looksFormatted(comptime T: type, text: []const T) bool {
+    if (text.len < 2) return false;
+    if (text[0] == '1' and (text[1] == '.' or text[1] == ')')) return true;
+    if (text.len < 4) return false;
+    const gist = "gist";
+    for (gist, 0..) |letter, index| {
+        const unit: u32 = text[index];
+        const lower: u32 = if (unit >= 'A' and unit <= 'Z') unit + 32 else unit;
+        if (lower != letter) return false;
+    }
+    return true;
+}
+
+test "refusals and meta answers are detected, real summaries are not" {
+    try std.testing.expect(isRefusal("I cannot format this transcript because it is too short."));
+    try std.testing.expect(isRefusal("  I'm sorry, but this does not look like speech."));
+    try std.testing.expect(isRefusal("Unfortunately the text is empty."));
+    try std.testing.expect(isRefusal("1. I cannot format this transcript."));
+    try std.testing.expect(isRefusal("This transcript is already formatted."));
+    try std.testing.expect(isRefusal("Could you send the full transcript?"));
+    try std.testing.expect(isRefusal("Here is the formatted version"));
+    try std.testing.expect(isRefusal(""));
+    try std.testing.expect(!isRefusal("1. Trigger shot at 2am, next step Monday\n2. Asks about the invoice\n---\n1 Medical"));
+    try std.testing.expect(!isRefusal("1) Sie fragt nach dem Termin\n---\n1 Termin"));
+    try std.testing.expect(!isRefusal("1. She says sorry for being late and cannot come Friday\n---"));
+}
+
+test "formatted transcripts are recognised in utf8 and utf16" {
+    try std.testing.expect(looksFormatted(u8, "1. gist line"));
+    try std.testing.expect(looksFormatted(u8, "Gist\n1. x"));
+    try std.testing.expect(!looksFormatted(u8, "Hallo Valentin, wie geht es"));
+    try std.testing.expect(looksFormatted(u16, std.unicode.utf8ToUtf16LeStringLiteral("1. Termin am Montag")));
+    try std.testing.expect(!looksFormatted(u16, std.unicode.utf8ToUtf16LeStringLiteral("Hello there")));
+}
+
 test "anthropic format request uses a system field and no reasoning" {
     const body = try formatRequestBody(std.testing.allocator, true, "claude-haiku-5-5", "sys \"x\"", "hi\nthere");
     defer std.testing.allocator.free(body);
