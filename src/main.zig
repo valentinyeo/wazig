@@ -5,6 +5,7 @@ const audio = @import("audio.zig");
 const avatar = @import("avatar.zig");
 const avatar_mask = @import("avatar_mask.zig");
 const dictation = @import("dictation.zig");
+const voice_capture = @import("voice_capture.zig");
 const slack = @import("slack.zig");
 const slack_win = @import("slack_win.zig");
 const played = @import("played.zig");
@@ -78,6 +79,7 @@ const timer_update_restart = 6;
 const timer_update_first_check = 8;
 const timer_telegram = 7;
 const timer_slack_mark = 9;
+const timer_voice = 10;
 // Telegram-specific commands live past the shared palette command block.
 const command_telegram_login = 2025;
 const command_telegram_logout = 2026;
@@ -123,6 +125,7 @@ const id_dictate = 1056;
 const id_palette_edit = 1064;
 const id_palette_list = 1072;
 const id_emoji = 1080;
+const id_voice = 1104;
 const id_emoji_edit = 1088;
 const id_emoji_list = 1096;
 const command_search = 2001;
@@ -289,6 +292,10 @@ const PendingSend = struct {
     // Paste-to-send (WAZI-37): when set, the queued send is
     // `wacli send file --file <path>` with `text` as the caption.
     file: Utf8Text(519) = .{},
+    // Recorded voice note: the file is sent with `--ptt` so it arrives as a
+    // native WhatsApp voice note. `voice_seconds` only labels the local bubble.
+    ptt: bool = false,
+    voice_seconds: u32 = 0,
     // Optimistic-bubble correlation and retry bookkeeping: `seq` names the
     // local bubble, `retries` counts failed attempts, `not_before_ms` delays
     // the next attempt, and `queued_unix` is the enqueue time (unix seconds)
@@ -586,9 +593,16 @@ const App = struct {
     send: ?win.HWND = null,
     emoji_btn: ?win.HWND = null,
     dictate: ?win.HWND = null,
+    // Voice-note recorder (mic button, index 8 in btn_hover).
+    voice_btn: ?win.HWND = null,
+    voice_session: ?*voice_capture.Session = null,
+    voice_active: bool = false,
+    voice_finishing: bool = false,
+    voice_visible: bool = true,
+    voice_jid: Utf8Text(191) = .{},
     // 0-2: composer buttons, 3-4: Slack setup dialog, 5-7: Telegram login dialog.
-    btn_hover: [8]bool = .{ false, false, false, false, false, false, false, false },
-    btn_prev_proc: [8]usize = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+    btn_hover: [9]bool = .{ false, false, false, false, false, false, false, false, false },
+    btn_prev_proc: [9]usize = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0 },
     tooltips: ?win.HWND = null,
     status: ?win.HWND = null,
     palette: ?win.HWND = null,
@@ -1061,6 +1075,87 @@ fn buttonLabel(item: *win.DRAWITEMSTRUCT, buffer: []u16) []const u16 {
     return buffer[0..@intCast(text_len)];
 }
 
+const color_recording = rgb(229, 57, 53);
+
+fn drawMicIcon(a: *App, hdc: win.HDC, cx: i32, cy: i32, color: win.COLORREF) void {
+    const brush = win.CreateSolidBrush(color) orelse return;
+    defer _ = win.DeleteObject(brush);
+    const pen = win.CreatePen(win.PS_SOLID, @max(1, px(a, 2)), color) orelse return;
+    defer _ = win.DeleteObject(pen);
+    const old_brush = win.SelectObject(hdc, brush);
+    const old_pen = win.SelectObject(hdc, pen);
+    defer {
+        _ = win.SelectObject(hdc, old_brush);
+        _ = win.SelectObject(hdc, old_pen);
+    }
+    const half = px(a, 4);
+    _ = win.RoundRect(hdc, cx - half, cy - px(a, 10), cx + half + 1, cy + px(a, 3), half * 2, half * 2);
+    _ = win.SelectObject(hdc, win.GetStockObject(win.NULL_BRUSH));
+    const arc = px(a, 7);
+    _ = win.Arc(hdc, cx - arc, cy - px(a, 7), cx + arc + 1, cy + px(a, 6), cx - arc, cy - px(a, 1), cx + arc + 1, cy - px(a, 1));
+    _ = win.MoveToEx(hdc, cx, cy + px(a, 6), null);
+    _ = win.LineTo(hdc, cx, cy + px(a, 10));
+    _ = win.MoveToEx(hdc, cx - px(a, 4), cy + px(a, 10), null);
+    _ = win.LineTo(hdc, cx + px(a, 5), cy + px(a, 10));
+}
+
+fn drawVoiceButton(a: *App, item: *win.DRAWITEMSTRUCT) void {
+    const pressed = (item.itemState & win.ODS_SELECTED) != 0;
+    const focused = (item.itemState & win.ODS_FOCUS) != 0;
+    const hdc = item.hDC;
+    _ = win.FillRect(hdc, &item.rcItem, a.brush_bg.?);
+    const recording = a.voice_active;
+    const face: win.COLORREF = if (pressed) color_outgoing else if (a.btn_hover[8]) color_selected else color_raised;
+    paintRoundedButton(hdc, item.rcItem, face, color_text, a.font_bold.?, if (recording) color_recording else if (focused) color_accent else null, &.{});
+    const mid_y = @divTrunc(item.rcItem.top + item.rcItem.bottom, 2);
+    if (!recording) {
+        drawMicIcon(a, hdc, @divTrunc(item.rcItem.left + item.rcItem.right, 2), mid_y, color_text);
+        return;
+    }
+    // Red dot, elapsed time, live level, and the mic at the right end.
+    const dot = px(a, 5);
+    const dot_x = item.rcItem.left + px(a, 16);
+    if (win.CreateSolidBrush(color_recording)) |red| {
+        defer _ = win.DeleteObject(red);
+        const old_brush = win.SelectObject(hdc, red);
+        const old_pen = win.SelectObject(hdc, win.GetStockObject(win.NULL_PEN));
+        _ = win.Ellipse(hdc, dot_x - dot, mid_y - dot, dot_x + dot, mid_y + dot);
+        _ = win.SelectObject(hdc, old_brush);
+        _ = win.SelectObject(hdc, old_pen);
+    }
+    var seconds: u64 = 0;
+    var level: u32 = 0;
+    if (a.voice_session) |session| {
+        seconds = session.elapsedMs() / 1000;
+        level = session.levelPercent();
+    }
+    var text_utf8: [16]u8 = undefined;
+    const label = std.fmt.bufPrint(&text_utf8, "{d}:{d:0>2}", .{ seconds / 60, seconds % 60 }) catch "";
+    var wide: [16]u16 = undefined;
+    for (label, 0..) |ch, i| wide[i] = ch;
+    _ = win.SetBkMode(hdc, win.TRANSPARENT);
+    _ = win.SetTextColor(hdc, color_text);
+    _ = win.SelectObject(hdc, @ptrCast(a.font_bold.?));
+    var text_rect = win.RECT{ .left = dot_x + px(a, 12), .top = item.rcItem.top, .right = dot_x + px(a, 62), .bottom = item.rcItem.bottom };
+    _ = win.DrawTextW(hdc, &wide, @intCast(label.len), &text_rect, win.DT_LEFT | win.DT_SINGLELINE | win.DT_VCENTER);
+    const meter_left = text_rect.right + px(a, 4);
+    const meter_right = item.rcItem.right - px(a, 38);
+    if (meter_right > meter_left) {
+        const meter = win.RECT{ .left = meter_left, .top = mid_y - px(a, 3), .right = meter_right, .bottom = mid_y + px(a, 3) };
+        if (win.CreateSolidBrush(color_bg)) |track| {
+            defer _ = win.DeleteObject(track);
+            _ = win.FillRect(hdc, &meter, track);
+        }
+        var filled = meter;
+        filled.right = meter.left + @divTrunc((meter.right - meter.left) * @as(i32, @intCast(level)), 100);
+        if (win.CreateSolidBrush(color_accent)) |fill| {
+            defer _ = win.DeleteObject(fill);
+            _ = win.FillRect(hdc, &filled, fill);
+        }
+    }
+    drawMicIcon(a, hdc, item.rcItem.right - px(a, 20), mid_y, color_recording);
+}
+
 fn drawComposerButton(a: *App, item: *win.DRAWITEMSTRUCT) void {
     const index: usize = if (item.CtlID == id_dictate) 0 else if (item.CtlID == id_send) 1 else 2;
     const pressed = (item.itemState & win.ODS_SELECTED) != 0;
@@ -1145,6 +1240,7 @@ fn createTooltips(a: *App, hwnd: win.HWND) void {
     addTooltip(tt, a.dictate, lit("Dictate  Ctrl+D"));
     addTooltip(tt, a.send, lit("Send message  Enter"));
     addTooltip(tt, a.emoji_btn, lit("Emoji menu"));
+    addTooltip(tt, a.voice_btn, lit("Record a voice note  Enter sends · Esc cancels"));
 }
 
 fn loadRegistryString(allocator: std.mem.Allocator, name: [*:0]const u16) ?[]const u8 {
@@ -3818,7 +3914,10 @@ fn appendWhatsAppPending(a: *App, pending: *const PendingSend, from_reload: bool
     var message = Message{};
     message.from_me = true;
     message.sender.set(a.allocator, "You");
-    if (pending.file.len > 0 and pending.text.len == 0) {
+    if (pending.ptt) {
+        var voice_buffer: [48]u8 = undefined;
+        message.text.set(a.allocator, std.fmt.bufPrint(&voice_buffer, "Voice message {d}:{d:0>2}", .{ pending.voice_seconds / 60, pending.voice_seconds % 60 }) catch "Voice message");
+    } else if (pending.file.len > 0 and pending.text.len == 0) {
         message.text.set(a.allocator, file_send_placeholder);
     } else {
         var retry_buffer: [4095]u8 = undefined;
@@ -8304,6 +8403,10 @@ fn startNextSend(a: *App) void {
         args[count] = "--file";
         args[count + 1] = pending.file.slice();
         count += 2;
+        if (pending.ptt) {
+            args[count] = "--ptt";
+            count += 1;
+        }
         if (pending.text.len > 0) {
             args[count] = "--caption";
             args[count + 1] = pending.text.slice();
@@ -8723,6 +8826,140 @@ fn stageImageFromClipboard(a: *App) bool {
     if (a.hwnd) |hwnd| _ = win.InvalidateRect(hwnd, null, win.TRUE);
     setStatus(a, "Image ready... Enter sends, Esc discards");
     focusCompose(a);
+    return true;
+}
+
+// ---------------------------------------------------------------- Voice notes
+
+fn voiceChatAllowed(a: *const App) bool {
+    return a.selected_chat < a.chat_count and a.chats[a.selected_chat].provider == .whatsapp;
+}
+
+/// The mic button only exists for WhatsApp chats.
+fn updateVoiceButton(a: *App) void {
+    const button = a.voice_btn orelse return;
+    const allowed = voiceChatAllowed(a);
+    if (a.voice_active and !allowed) cancelVoice(a, "Voice note cancelled");
+    if (allowed == a.voice_visible) return;
+    a.voice_visible = allowed;
+    _ = win.ShowWindow(button, if (allowed) win.SW_SHOW else win.SW_HIDE);
+}
+
+fn toggleVoice(a: *App) void {
+    if (a.voice_active) {
+        if (!a.voice_finishing) finishVoice(a);
+        return;
+    }
+    if (!voiceChatAllowed(a)) return;
+    if (a.pending_send_count >= max_pending_sends) {
+        setStatus(a, "Send queue is full");
+        return;
+    }
+    if (a.voice_session == null) a.voice_session = voice_capture.Session.create(a.allocator) catch null;
+    const session = a.voice_session orelse {
+        setStatus(a, "Could not start the microphone");
+        return;
+    };
+    if (!session.start()) {
+        setStatus(a, "Could not start the microphone");
+        return;
+    }
+    a.voice_jid.set(a.chats[a.selected_chat].jid.slice());
+    a.voice_active = true;
+    a.voice_finishing = false;
+    if (a.hwnd) |hwnd| _ = win.SetTimer(hwnd, timer_voice, 100, null);
+    layout(a, a.compose_client_width, a.compose_client_height);
+    setStatus(a, "Recording... Enter sends, Esc cancels");
+    focusCompose(a);
+}
+
+fn finishVoice(a: *App) void {
+    const session = a.voice_session orelse return;
+    a.voice_finishing = true;
+    session.finish();
+    setStatus(a, "Preparing voice note...");
+}
+
+fn endVoiceUi(a: *App) void {
+    a.voice_active = false;
+    a.voice_finishing = false;
+    if (a.hwnd) |hwnd| _ = win.KillTimer(hwnd, timer_voice);
+    layout(a, a.compose_client_width, a.compose_client_height);
+    if (a.voice_btn) |button| _ = win.InvalidateRect(button, null, win.TRUE);
+}
+
+fn cancelVoice(a: *App, status: []const u8) void {
+    if (a.voice_session) |session| {
+        session.cancel();
+        session.reap();
+    }
+    endVoiceUi(a);
+    setStatus(a, status);
+}
+
+fn tickVoice(a: *App) void {
+    if (!a.voice_active) return;
+    const session = a.voice_session orelse return;
+    if (!a.voice_finishing and !std.mem.eql(u8, a.voice_jid.slice(), if (voiceChatAllowed(a)) a.chats[a.selected_chat].jid.slice() else "")) {
+        cancelVoice(a, "Voice note cancelled: you switched chats");
+        return;
+    }
+    switch (session.state()) {
+        .recording, .encoding => {
+            if (a.voice_btn) |button| _ = win.InvalidateRect(button, null, win.FALSE);
+        },
+        .ready => {
+            const result = session.take();
+            endVoiceUi(a);
+            if (result) |note| {
+                defer a.allocator.free(note.ogg);
+                if (!queueVoiceNote(a, a.voice_jid.slice(), note.ogg, note.seconds, &note.waveform)) setStatus(a, "Could not send the voice note");
+            }
+        },
+        .failed => {
+            const too_short = session.elapsedMs() < 250;
+            session.reap();
+            endVoiceUi(a);
+            setStatus(a, if (too_short) "Voice note too short" else "Could not record; check the microphone");
+        },
+        .idle => endVoiceUi(a),
+    }
+}
+
+/// The one place a recorded voice note leaves the app: today it joins the
+/// wacli send queue (`wacli send file --ptt`, which WhatsApp shows as a
+/// native voice note); moving sends to the wa-bridge only means replacing
+/// this body with a POST of the same four values. WhatsApp's `seconds` and
+/// `waveform` are filled by the receiving side from the Ogg today, so they
+/// are not on the wacli command line.
+fn queueVoiceNote(a: *App, jid: []const u8, ogg: []const u8, seconds: u32, waveform: *const [64]u8) bool {
+    _ = waveform;
+    if (a.pending_send_count >= max_pending_sends) return false;
+    var path_buffer: [520]u8 = undefined;
+    const path_len = stageNewPath(a, &path_buffer, "ogg") orelse return false;
+    const path = path_buffer[0..path_len];
+    std.Io.Dir.cwd().writeFile(a.io, .{ .sub_path = path, .data = ogg }) catch {
+        deleteFileUtf8(path);
+        return false;
+    };
+    const pending = &a.pending_sends[a.pending_send_count];
+    pending.* = .{};
+    pending.jid.set(jid);
+    pending.file.set(path);
+    pending.ptt = true;
+    pending.voice_seconds = seconds;
+    pending.reply_to.set(a.reply_to.slice());
+    pending.reply_sender.set(a.reply_sender.slice());
+    clearReply(a);
+    a.send_seq += 1;
+    pending.seq = a.send_seq;
+    pending.queued_unix = nowUnixSeconds();
+    a.pending_send_count += 1;
+    a.user_viewed = true;
+    a.scroll_y = 0;
+    appendWhatsAppPending(a, pending, false);
+    if (a.hwnd) |main_hwnd| _ = win.InvalidateRect(main_hwnd, null, win.TRUE);
+    startNextSend(a);
     return true;
 }
 
@@ -11626,9 +11863,9 @@ fn layout(a: *App, width: i32, height: i32) void {
     // The wrap count depends on the edit's width, so measure once more after
     // sizing (the themed strip keeps that width constant across heights).
     if (a.compose) |hwnd| {
-        _ = win.MoveWindow(hwnd, left_width + px(a, 14), height - px(a, 11) - sizes.edit_height, width - left_width - px(a, 258) - scrollbar_width, sizes.edit_height, win.TRUE);
+        _ = win.MoveWindow(hwnd, left_width + px(a, 14), height - px(a, 11) - sizes.edit_height, width - left_width - px(a, 310) - scrollbar_width, sizes.edit_height, win.TRUE);
         sizes = compose_layout.computeScaled(a.compose_dragged, composerContentHeight(a), height, a.staged_image.path.len > 0, @intCast(a.dpi));
-        _ = win.MoveWindow(hwnd, left_width + px(a, 14), height - px(a, 11) - sizes.edit_height, width - left_width - px(a, 258) - scrollbar_width, sizes.edit_height, win.TRUE);
+        _ = win.MoveWindow(hwnd, left_width + px(a, 14), height - px(a, 11) - sizes.edit_height, width - left_width - px(a, 310) - scrollbar_width, sizes.edit_height, win.TRUE);
     }
     a.compose_strip_top = height - sizes.strip_height;
     if (a.search) |hwnd| {
@@ -11644,6 +11881,11 @@ fn layout(a: *App, width: i32, height: i32) void {
     if (a.canvas) |hwnd| _ = win.MoveWindow(hwnd, left_width + 1, header_height, width - left_width - 1, height - header_height - sizes.strip_height, win.TRUE);
     if (a.emoji_btn) |hwnd| _ = win.MoveWindow(hwnd, width - px(a, 236), height - px(a, 55), px(a, 44), px(a, 44), win.TRUE);
     if (a.dictate) |hwnd| _ = win.MoveWindow(hwnd, width - px(a, 176), height - px(a, 55), px(a, 84), px(a, 44), win.TRUE);
+    if (a.voice_btn) |hwnd| {
+        // While recording the button grows left over the composer to fit the dot, time and level.
+        const voice_width: i32 = if (a.voice_active) px(a, 200) else px(a, 44);
+        _ = win.MoveWindow(hwnd, width - px(a, 244) - voice_width, height - px(a, 55), voice_width, px(a, 44), win.TRUE);
+    }
     if (a.send) |hwnd| _ = win.MoveWindow(hwnd, width - px(a, 82), height - px(a, 55), px(a, 68), px(a, 44), win.TRUE);
     if (a.hwnd) |main_hwnd| _ = win.InvalidateRect(main_hwnd, null, win.TRUE);
 }
@@ -13585,6 +13827,8 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
             a.dictate = win.CreateWindowExW(0, lit("BUTTON"), lit("Dictate"), win.WS_CHILD | win.WS_VISIBLE | win.WS_TABSTOP | win.BS_OWNERDRAW, 0, 0, 0, 0, hwnd, controlId(id_dictate), a.instance, null);
             a.send = win.CreateWindowExW(0, lit("BUTTON"), lit("Send"), win.WS_CHILD | win.WS_VISIBLE | win.WS_TABSTOP | win.BS_OWNERDRAW, 0, 0, 0, 0, hwnd, controlId(id_send), a.instance, null);
             a.emoji_btn = win.CreateWindowExW(0, lit("BUTTON"), lit("😊"), win.WS_CHILD | win.WS_VISIBLE | win.WS_TABSTOP | win.BS_OWNERDRAW, 0, 0, 0, 0, hwnd, controlId(id_emoji), a.instance, null);
+            a.voice_btn = win.CreateWindowExW(0, lit("BUTTON"), lit("Voice"), win.WS_CHILD | win.WS_VISIBLE | win.WS_TABSTOP | win.BS_OWNERDRAW, 0, 0, 0, 0, hwnd, controlId(id_voice), a.instance, null);
+            subclassComposerButton(a, a.voice_btn, 8);
             subclassComposerButton(a, a.dictate, 0);
             subclassComposerButton(a, a.send, 1);
             subclassComposerButton(a, a.emoji_btn, 2);
@@ -13787,6 +14031,8 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
             const item: *win.DRAWITEMSTRUCT = winHandle(*win.DRAWITEMSTRUCT, @as(usize, @bitCast(lparam)));
             if (item.CtlID == id_chats) {
                 drawChat(a, item);
+            } else if (item.CtlID == id_voice) {
+                drawVoiceButton(a, item);
             } else if (item.CtlID == id_dictate or item.CtlID == id_send or item.CtlID == id_emoji) {
                 drawComposerButton(a, item);
             }
@@ -13809,6 +14055,8 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
                 sendMessage(a);
             } else if (id == id_dictate and notification == win.BN_CLICKED) {
                 runCommand(a, command_dictate);
+            } else if (id == id_voice and notification == win.BN_CLICKED) {
+                toggleVoice(a);
             } else if (id == id_emoji and notification == win.BN_CLICKED) {
                 openEmojiMenu(a);
             } else if (id == id_compose and notification == win.EN_CHANGE) {
@@ -13820,7 +14068,10 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
             return 0;
         },
         win.WM_TIMER => {
-            if (wparam == timer_refresh) {
+            if (wparam == timer_voice) {
+                tickVoice(a);
+            } else if (wparam == timer_refresh) {
+                updateVoiceButton(a);
                 checkMediaDownload(a);
                 checkSend(a);
                 retryPendingReactions(a);
@@ -13973,6 +14224,10 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
                 session.destroy();
                 a.dictation_session = null;
             }
+            if (a.voice_session) |session| {
+                session.destroy();
+                a.voice_session = null;
+            }
             if (a.avatar_session) |session| {
                 session.destroy();
                 a.avatar_session = null;
@@ -14107,6 +14362,11 @@ fn handleKeyboard(a: *App, message: *const win.MSG) bool {
     // The shortcuts help overlay owns the keyboard while open; its own
     // window proc handles Esc/F1 to close it.
     if (a.shortcut_help != null) return false;
+    // A voice note being recorded: Enter sends it, Esc throws it away.
+    if (a.voice_active and !a.voice_finishing and (key == win.VK_RETURN or key == win.VK_ESCAPE) and !alt and !control) {
+        if (key == win.VK_ESCAPE) cancelVoice(a, "Voice note cancelled") else finishVoice(a);
+        return true;
+    }
     if (key == win.VK_F1) {
         openShortcutHelp(a);
         return true;
