@@ -10311,18 +10311,6 @@ fn emojiProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.
         win.WM_LBUTTONDOWN => {
             const x: i32 = @as(i16, @bitCast(loword(@as(usize, @bitCast(lparam)))));
             const y: i32 = @as(i16, @bitCast(hiword(@as(usize, @bitCast(lparam)))));
-            switch (updateCardHit(a, x, y)) {
-                .button => {
-                    updateCardClick(a);
-                    return 0;
-                },
-                .close => {
-                    updateCardDismiss(a);
-                    return 0;
-                },
-                .body => return 0,
-                .none => {},
-            }
             if (a.emoji_list) |list| {
                 const strip = stripRightOf(list, hwnd);
                 if (hitStrip(strip, x, y)) {
@@ -14745,6 +14733,18 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
         win.WM_LBUTTONDOWN => {
             const x: i32 = @as(i16, @bitCast(loword(@as(usize, @bitCast(lparam)))));
             const y: i32 = @as(i16, @bitCast(hiword(@as(usize, @bitCast(lparam)))));
+            switch (updateCardHit(a, x, y)) {
+                .button => {
+                    updateCardClick(a);
+                    return 0;
+                },
+                .close => {
+                    updateCardDismiss(a);
+                    return 0;
+                },
+                .body => return 0,
+                .none => {},
+            }
             // The composer's resize band takes precedence over the scrollbar
             // strip: their top 11px overlap when the edit is at minimum height.
             if (a.compose != null and y >= a.compose_strip_top and y < a.compose_strip_top + px(a, 11)) {
@@ -16526,6 +16526,7 @@ fn updateCardClick(a: *App) void {
     a.update_install_auto = false;
     a.update_card_busy = true;
     appendLaunchLog(a, "update: card clicked");
+    setStatus(a, "Updating Messages...");
     // A background download still running finishes first; its completion
     // message then starts the swap.
     if (a.update_install_running.load(.acquire)) {
