@@ -6405,11 +6405,9 @@ fn scheduleNextTranscription(a: *App) void {
     }
     if (candidate == null) return;
     const message = &a.messages[candidate.?];
-    const language: dictation.Language = switch (a.dictation_language) {
-        .automatic => .automatic,
-        .english => .english,
-        .german => .german,
-    };
+    // Notes arrive in German or English (or mixed): always detect per note.
+    // The dictation language setting only applies to the microphone button.
+    const language: dictation.Language = .automatic;
     const path_utf8 = std.unicode.utf16LeToUtf8Alloc(a.allocator, message.local_path.slice()) catch return;
     defer a.allocator.free(path_utf8);
     if (session.start(path_utf8, a.deepgram_key, language)) {
@@ -6533,7 +6531,16 @@ fn scheduleNextFormatting(a: *App) void {
     const message = &a.messages[message_index];
     const transcript_utf8 = std.unicode.utf16LeToUtf8Alloc(a.allocator, message.transcript.slice()) catch return;
     defer a.allocator.free(transcript_utf8);
-    if (session.start(transcript_utf8, a.openrouter_key, a.openrouter_model, a.format_workspace)) {
+    // Who is talking: his own note is summarised as "I", a received one by the contact's name.
+    var contact_buffer: [192]u8 = undefined;
+    const contact_name = blk: {
+        const named = if (message.sender.len > 0 and !message.from_me) message.sender.slice() else if (a.selected_chat < a.chat_count) a.chats[a.selected_chat].name.slice() else &[_]u16{};
+        const len = std.unicode.utf16LeToUtf8(&contact_buffer, named) catch 0;
+        break :blk contact_buffer[0..len];
+    };
+    const speaker = format_request.speakerInstruction(a.allocator, message.from_me, contact_name) catch return;
+    defer a.allocator.free(speaker);
+    if (session.start(transcript_utf8, a.openrouter_key, a.openrouter_model, a.format_workspace, speaker)) {
         a.openrouter_active_id.set(message.id.slice());
         appendDebugLog(a, "format schedule: queued len={d}", .{transcript_utf8.len});
     }
