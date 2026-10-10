@@ -6,6 +6,7 @@ const avatar = @import("avatar.zig");
 const avatar_mask = @import("avatar_mask.zig");
 const dictation = @import("dictation.zig");
 const voice_capture = @import("voice_capture.zig");
+const format_request = @import("format_request.zig");
 const slack = @import("slack.zig");
 const slack_win = @import("slack_win.zig");
 const played = @import("played.zig");
@@ -806,6 +807,13 @@ const App = struct {
     format_workspace: []const u8 = "",
     openrouter_attempts: [512]u64 = [_]u64{0} ** 512,
     openrouter_attempt_count: usize = 0,
+    openrouter_attempt_next: usize = 0,
+    // Hash of the last WhatsApp messages payload painted; an identical fresh read is skipped.
+    msg_applied_hash: u64 = 0,
+    // Paint counters for the once-a-minute launch-log line (idle proof).
+    paints_canvas: u32 = 0,
+    paints_window: u32 = 0,
+    paint_minute_ticks: u32 = 0,
     transcribe_active_id: Utf8Text(191) = .{},
     transcribe_attempts: [512]u64 = [_]u64{0} ** 512,
     transcribe_attempt_count: usize = 0,
@@ -6427,22 +6435,12 @@ fn pollFormatting(a: *App) void {
 fn openrouterWasAttempted(a: *App, id: []const u8) bool {
     const hash = std.hash.Wyhash.hash(0, id);
     for (a.openrouter_attempts[0..a.openrouter_attempt_count]) |attempt| if (attempt == hash) return true;
-    if (a.openrouter_attempt_count >= a.openrouter_attempts.len) a.openrouter_attempt_count = 0;
-    a.openrouter_attempts[a.openrouter_attempt_count] = hash;
-    a.openrouter_attempt_count += 1;
+    // Ring buffer: overwrite the oldest entry. Resetting the count used to
+    // forget every attempt at once and re-sent all notes for formatting.
+    a.openrouter_attempts[a.openrouter_attempt_next % a.openrouter_attempts.len] = hash;
+    a.openrouter_attempt_next += 1;
+    a.openrouter_attempt_count = @min(a.openrouter_attempt_next, a.openrouter_attempts.len);
     return false;
-}
-
-fn startsWithGist(text: []const u16) bool {
-    if (text.len < 4) return false;
-    const g = [_]u16{ 'g', 'i', 's', 't' };
-    const lower = [4]u16{
-        lowerUnit(text[0]),
-        lowerUnit(text[1]),
-        lowerUnit(text[2]),
-        lowerUnit(text[3]),
-    };
-    return std.mem.eql(u16, &lower, &g);
 }
 
 fn scheduleNextFormatting(a: *App) void {
@@ -6461,7 +6459,7 @@ fn scheduleNextFormatting(a: *App) void {
         index -= 1;
         const message = &a.messages[index];
         if (message.transcript_state != .ready or message.transcript.len == 0) continue;
-        if (startsWithGist(message.transcript.slice())) continue;
+        if (format_request.looksFormatted(u16, message.transcript.slice())) continue;
         if (message.id.len == 0 or openrouterWasAttempted(a, message.id.slice())) continue;
         candidate = index;
         break;
@@ -7904,6 +7902,7 @@ fn applyMessageData(a: *App, raw: []const u8, final: bool) bool {
         if (a.message_count >= max_messages) break;
         appendWhatsAppFailed(a, failed);
     }
+    a.msg_applied_hash = std.hash.Wyhash.hash(0, raw);
     if (a.canvas) |canvas| _ = win.InvalidateRect(canvas, null, win.TRUE);
     if (final) markChatRead(a);
     if (a.message_count > 0) logStartupMilestone(a, .messages, if (final) "first messages shown (fresh)" else "first messages shown (cache)");
@@ -13674,6 +13673,7 @@ fn canvasProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win
     const a = app_ptr orelse return win.DefWindowProcW(hwnd, message, wparam, lparam);
     switch (message) {
         win.WM_PAINT => {
+            a.paints_canvas +%= 1;
             drawCanvas(hwnd, a);
             return 0;
         },
@@ -14009,7 +14009,17 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
                         // WAZI-79: a 0-exit read without a messages list is
                         // as useless as a failed one; a valid empty
                         // conversation paints and clears the retry budget.
-                        if (applyMessageData(a, result.data, true)) {
+                        // An identical answer for the chat already on screen
+                        // changes nothing: skip the teardown, re-decode and
+                        // repaint (the WAL moves far more often than a chat).
+                        if (a.message_count > 0 and a.pending_send_count == 0 and a.failed_send_count == 0 and
+                            std.mem.eql(u8, a.displayed_jid.slice(), result.jid.slice()) and
+                            std.hash.Wyhash.hash(0, result.data) == a.msg_applied_hash)
+                        {
+                            markChatRead(a);
+                            a.msg_read_attempts = 0;
+                            a.msg_read_retry_ticks = 0;
+                        } else if (applyMessageData(a, result.data, true)) {
                             msgCacheStore(a, result.jid.slice(), result.data);
                             a.msg_read_attempts = 0;
                             a.msg_read_retry_ticks = 0;
@@ -14278,6 +14288,7 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
             return 0;
         },
         win.WM_PAINT => {
+            a.paints_window +%= 1;
             var paint: win.PAINTSTRUCT = undefined;
             const hdc = win.BeginPaint(hwnd, &paint);
             var client: win.RECT = undefined;
@@ -14451,6 +14462,15 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
                 tickVoice(a);
             } else if (wparam == timer_refresh) {
                 updateVoiceButton(a);
+                // Idle proof: paints per minute, one launch-log line a minute.
+                a.paint_minute_ticks += 1;
+                if (a.paint_minute_ticks >= 60) {
+                    a.paint_minute_ticks = 0;
+                    var paint_buffer: [64]u8 = undefined;
+                    appendLaunchLog(a, std.fmt.bufPrint(&paint_buffer, "paints: canvas={d} window={d} per min", .{ a.paints_canvas, a.paints_window }) catch "paints");
+                    a.paints_canvas = 0;
+                    a.paints_window = 0;
+                }
                 checkMediaDownload(a);
                 checkSend(a);
                 retryPendingReactions(a);
@@ -14513,10 +14533,13 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
             } else if (wparam == timer_telegram) {
                 drainTelegram(a);
             } else if (wparam == timer_animation) {
-                advanceGifs(a);
+                // A minimized window shows nothing: no GIF frames or scrollbar strips.
+                if (win.IsIconic(hwnd) == 0) {
+                    advanceGifs(a);
+                    syncScrollbarStrips(a);
+                }
                 updateAudioPlayback(a);
                 updateDictation(a);
-                syncScrollbarStrips(a);
                 // Harvest the finished result before scheduling the next
                 // job; the session has one result slot and scheduling first
                 // silently discarded every completed transcript.
