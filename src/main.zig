@@ -158,6 +158,8 @@ const id_attach = 1136;
 const id_emoji_edit = 1088;
 const id_emoji_list = 1096;
 const command_slack_threads = 2068;
+const command_include_archived = 2069;
+const id_include_archived = 1146;
 const id_thread_list = 1144;
 const id_thread_compose = 1145;
 const command_search = 2001;
@@ -296,6 +298,7 @@ const Chat = struct {
     unread: bool = false,
     saved: bool = false,
     provider_unread: bool = false,
+    provider_archived: bool = false,
     slack_last_read: Utf8Text(40) = .{},
     slack_user_id: Utf8Text(32) = .{},
     pinned: bool = false,
@@ -719,9 +722,9 @@ const App = struct {
     voice_origin: drafts.Identity = .{},
     voice_reply_to: Utf8Text(191) = .{},
     voice_reply_sender: Utf8Text(191) = .{},
-    btn_hover: [10]bool = @splat(false),
+    btn_hover: [11]bool = @splat(false),
     compose_prev_proc: usize = 0,
-    btn_prev_proc: [10]usize = @splat(0),
+    btn_prev_proc: [11]usize = @splat(0),
     tooltips: ?win.HWND = null,
     status: ?win.HWND = null,
     palette: ?win.HWND = null,
@@ -828,6 +831,8 @@ const App = struct {
     max_scroll: i32 = 0,
     unread_only: bool = false,
     show_archived: bool = false,
+    include_archived: bool = false,
+    include_archived_button: ?win.HWND = null,
     archive_child: ?std.process.Child = null,
     pending_archives: [max_pending_archives]PendingArchive = [_]PendingArchive{.{}} ** max_pending_archives,
     pending_archive_count: usize = 0,
@@ -1374,9 +1379,10 @@ fn drawSetupButton(a: *App, item: *win.DRAWITEMSTRUCT) void {
         id_tg_next => 5,
         id_tg_cancel => 6,
         id_tg_open_page => 7,
+        id_include_archived => 10,
         else => return,
     };
-    const pressed = (item.itemState & win.ODS_SELECTED) != 0;
+    const pressed = (item.itemState & win.ODS_SELECTED) != 0 or (item.CtlID == id_include_archived and a.include_archived);
     const focused = (item.itemState & win.ODS_FOCUS) != 0;
     _ = win.FillRect(item.hDC, &item.rcItem, a.brush_panel.?);
     const face: win.COLORREF = if (theme.choice == .amoled) (if (pressed) theme.amoled_button_pressed else if (a.btn_hover[index]) theme.amoled_button_hover else theme.amoled_button) else if (pressed) theme.current.primary_container else if (a.btn_hover[index]) theme.current.secondary_container else theme.current.surface_container_high;
@@ -1465,6 +1471,7 @@ fn createTooltips(a: *App, hwnd: win.HWND) void {
     a.tooltips = tt;
     updateTooltipTheme(a);
     _ = win.SendMessageW(tt, 0x400 + 24, 0, 260);
+    addTooltip(a, tt, a.include_archived_button, lit("Show archived  Alt+A"));
     addTooltip(a, tt, a.search, lit("Search chats  Ctrl+F or /"));
     addTooltip(a, tt, a.chats_hwnd, lit("Chats  ↑/↓ move · Ctrl+Tab next chat"));
     addTooltip(a, tt, a.canvas, lit("Messages  Alt+J/K select · Ctrl+P play voice · Ctrl+T transcript · Ctrl+R react"));
@@ -1872,6 +1879,7 @@ fn recreateFonts(a: *App) void {
     a.font_bold = win.CreateFontW(scaledFontHeight(16, a.font_scale, dpi), 0, 0, 0, win.FW_SEMIBOLD, 0, 0, 0, win.DEFAULT_CHARSET, win.OUT_DEFAULT_PRECIS, win.CLIP_DEFAULT_PRECIS, win.CLEARTYPE_NATURAL_QUALITY, win.DEFAULT_PITCH, lit("IBM Plex Sans"));
     a.font_emoji = win.CreateFontW(scaledFontHeight(16, a.font_scale, dpi), 0, 0, 0, win.FW_NORMAL, 0, 0, 0, win.DEFAULT_CHARSET, win.OUT_DEFAULT_PRECIS, win.CLIP_DEFAULT_PRECIS, win.CLEARTYPE_NATURAL_QUALITY, win.DEFAULT_PITCH, lit("Segoe UI Emoji"));
     a.font_underline = win.CreateFontW(scaledFontHeight(17, a.font_scale, dpi), 0, 0, 0, body_weight, 0, 1, 0, win.DEFAULT_CHARSET, win.OUT_DEFAULT_PRECIS, win.CLIP_DEFAULT_PRECIS, win.CLEARTYPE_NATURAL_QUALITY, win.DEFAULT_PITCH, lit("IBM Plex Sans"));
+    setFont(a.include_archived_button, a.font_bold);
     setFont(a.search, a.font);
     setFont(a.chats_hwnd, a.font);
     setFont(a.compose, a.font);
@@ -2434,13 +2442,14 @@ fn applyGroups(a: *App, raw: []const u8) void {
 }
 
 fn refreshChats(a: *App) void {
-    const flags: u8 = if (a.show_archived) @as(u8, 2) else 0;
+    const flags: u8 = if (a.show_archived) 2 else if (a.include_archived) 1 else 0;
     if (wacliPendingGet(a, .chats) > 0 and a.chats_pending_flags == flags) return;
     var job = WacliJob{ .account = a.cache_tag, .kind = .chats };
-    wacliJobArgs(&job, &.{
-        a.wacli_path,                                           "--json", "--read-only", "chats", "list", "--limit", "250",
-        if (a.show_archived) "--archived" else "--no-archived",
-    });
+    wacliJobArgs(&job, &.{ a.wacli_path, "--json", "--read-only", "chats", "list", "--limit", "250" });
+    if (a.show_archived or !a.include_archived or hubConfigured(a)) {
+        job.args[job.arg_count].set(if (a.show_archived) "--archived" else if (a.include_archived) "--include-archived" else "--no-archived");
+        job.arg_count += 1;
+    }
     a.chats_gen += 1;
     job.gen = a.chats_gen;
     _ = wacliEnqueue(a, job, wacliPendingGet(a, .chats) > 0);
@@ -2511,6 +2520,7 @@ fn applyChats(a: *App, raw: []const u8, fresh: bool) bool {
             if (!populated) {
                 a.chat_view = .all;
                 a.view_account.set("");
+                loadViewArchiveSetting(a);
                 saveChatView(.all);
                 _ = saveRegistryString(a.allocator, lit("AccountView"), "");
                 a.chat_view_switched = true;
@@ -2585,10 +2595,13 @@ fn applyChats(a: *App, raw: []const u8, fresh: bool) bool {
         chat.unread = a.read_state.isUnread(a.cache_tag.slice(), jid);
         chat.unread_count = if (chat.unread) @max(1, getInt(object, "unread_count")) else 0;
         queueUnreadProbe(a, &chat);
-        if (a.unread_only and !chat.unread) continue;
         chat.pinned = getBool(object, "pinned");
-        chat.archived = (if (a.archive_state) |state| state.localArchived(chat_key.of(&chat)) else false) or (chat.provider != .slack and getBool(object, "archived"));
-        if (chat.archived != a.show_archived) continue;
+        chat.archived = if (a.archive_state) |state| state.isArchived(chat_key.of(&chat), getBool(object, "archived")) else getBool(object, "archived");
+        chat.provider_archived = getBool(object, "archived");
+        for (a.pending_archives[0..a.pending_archive_count]) |*pending| {
+            if (chat.provider == .whatsapp and std.mem.eql(u8, pending.jid.slice(), chat.jid.slice())) chat.archived = !pending.should_unarchive;
+        }
+        if (!messenger_view.archiveMatches(a.show_archived, a.include_archived, activeChatView(a) == .all, a.unread_only, chat.archived, chat.unread)) continue;
         a.chats[a.chat_count] = chat;
         a.chat_count += 1;
     }
@@ -2597,7 +2610,7 @@ fn applyChats(a: *App, raw: []const u8, fresh: bool) bool {
         if (!a.show_archived and messenger_view.includes(view, .telegram)) appendTelegramChats(a, query_utf8);
     }
     controlSortChats(a, a.chats[0..a.chat_count], view);
-    if (!unifiedHub(a) and messenger_view.includes(view, .whatsapp) and !a.show_archived and !a.unread_only) {
+    if (!unifiedHub(a) and messenger_view.includes(view, .whatsapp) and !a.show_archived and !a.unread_only and !(a.include_archived and view == .all)) {
         if (query_utf8) |query| {
             const exclude = a.allocator.alloc(people_index.Identity, a.chat_count) catch return false;
             defer a.allocator.free(exclude);
@@ -2619,7 +2632,7 @@ fn applyChats(a: *App, raw: []const u8, fresh: bool) bool {
     }
     if (a.people_open_jid.len > 0) {
         const open_allowed = if (unifiedHub(a)) true else messenger_view.includes(view, .whatsapp) and selected_key.provider == .whatsapp;
-        if (!open_allowed or a.show_archived or query_len > 0 or
+        if (!open_allowed or a.show_archived or (a.include_archived and view == .all) or query_len > 0 or
             !std.mem.eql(u8, selected_jid[0..selected_len], a.people_open_jid.slice()))
         {
             a.people_open_jid.set("");
@@ -2767,7 +2780,7 @@ fn applyUnreadProbe(a: *App, result: *const WacliResult) void {
         if (was_unread != (chat.unread or chat.unread_count > 0)) invalidateChatRow(a, index);
         queueUnreadProbe(a, chat);
     }
-    if (a.unread_only) refreshChats(a);
+    if (a.unread_only or (a.include_archived and a.chat_view == .all)) refreshChats(a);
 }
 
 fn tgChatIdString(buffer: *[24]u8, chat_id: i64) []const u8 {
@@ -2834,7 +2847,7 @@ fn appendTelegramChats(a: *App, query_utf8: ?[]const u8) void {
         chat.provider = .telegram;
         chat.account = a.tg_account;
         if (!chatInView(a, chat_key.of(&chat))) continue;
-        if (!messenger_view.matches(activeChatView(a), .telegram, a.unread_only, chat.unread, query_utf8 orelse "", name_bytes, chat.jid.slice())) continue;
+        if (!messenger_view.matches(activeChatView(a), .telegram, a.unread_only or (a.include_archived and activeChatView(a) == .all), chat.unread, query_utf8 orelse "", name_bytes, chat.jid.slice())) continue;
         messenger_view.merge(Chat, a.chats, &a.chat_count, &.{chat});
     }
 }
@@ -4237,6 +4250,8 @@ fn hubWorkspaceNames(a: *App, rows: []const std.json.Value) ?std.json.Parsed(std
 }
 
 fn rebuildViews(a: *App, rows: []const std.json.Value) void {
+    const previous_view = a.chat_view;
+    const previous_account = a.view_account;
     var known: std.ArrayList(messenger_view.Account) = .empty;
     defer known.deinit(a.allocator);
     if (unifiedHub(a)) {
@@ -4308,6 +4323,7 @@ fn rebuildViews(a: *App, rows: []const std.json.Value) void {
             a.view_account.set("");
         }
     }
+    if (previous_view != a.chat_view or !std.mem.eql(u8, previous_account.slice(), a.view_account.slice())) loadViewArchiveSetting(a);
 }
 
 fn saveViewOrder(a: *App) bool {
@@ -4348,7 +4364,7 @@ fn refreshVisibleChats(a: *App) void {
 }
 
 fn refilterChats(a: *App) void {
-    const flags: u8 = if (a.show_archived) @as(u8, 2) else 0;
+    const flags: u8 = if (a.show_archived) 2 else if (a.include_archived) 1 else 0;
     if (a.chats_raw) |raw| {
         if (a.chats_raw_flags == flags) {
             _ = applyChats(a, raw, false);
@@ -4357,6 +4373,37 @@ fn refilterChats(a: *App) void {
     }
     refreshVisibleChats(a);
     refreshChats(a);
+}
+
+fn loadViewArchiveSetting(a: *App) void {
+    const key = messenger_view.archivedSettingKey(a.allocator, a.chat_view, a.view_account.slice()) catch return;
+    defer a.allocator.free(key);
+    const wide = utf8ToWide(a.allocator, key) catch return;
+    defer a.allocator.free(wide);
+    const value = loadRegistryString(a.allocator, wide.ptr);
+    defer if (value) |text| a.allocator.free(text);
+    a.include_archived = messenger_view.archivedSetting(value);
+    updateViewArchiveButton(a);
+}
+
+fn updateViewArchiveButton(a: *App) void {
+    if (a.include_archived_button) |button| {
+        _ = win.SetWindowTextW(button, if (a.include_archived) lit("Show archived: On") else lit("Show archived: Off"));
+        _ = win.InvalidateRect(button, null, win.FALSE);
+    }
+}
+
+fn toggleViewArchived(a: *App) void {
+    const key = messenger_view.archivedSettingKey(a.allocator, a.chat_view, a.view_account.slice()) catch return;
+    defer a.allocator.free(key);
+    const wide = utf8ToWide(a.allocator, key) catch return;
+    defer a.allocator.free(wide);
+    if (!saveRegistryString(a.allocator, wide.ptr, if (a.include_archived) "0" else "1")) return setStatus(a, "Could not save Show archived preference");
+    a.include_archived = !a.include_archived;
+    _ = clearBulkSelection(a);
+    updateViewArchiveButton(a);
+    refilterChats(a);
+    refreshMessages(a);
 }
 
 fn switchChatView(a: *App, view: messenger_view.View) void {
@@ -4373,6 +4420,7 @@ fn switchAccountView(a: *App, wanted: ?chat_key.Key) void {
     if (a.selected_chat < a.chat_count) selectedViewKey(a).set(chat_key.of(&a.chats[a.selected_chat]));
     a.chat_view = if (wanted) |key| messenger_view.providerView(key.provider) else .all;
     a.view_account.set(if (wanted) |key| key.account else "");
+    loadViewArchiveSetting(a);
     updateWindowTitle(a);
     saveChatView(a.chat_view);
     _ = saveRegistryString(a.allocator, lit("AccountView"), a.view_account.slice());
@@ -4381,7 +4429,7 @@ fn switchAccountView(a: *App, wanted: ?chat_key.Key) void {
     clearReply(a);
     discardStagedImage(a);
     refreshVisibleChats(a);
-    if (messenger_view.includes(a.chat_view, .whatsapp)) refreshChats(a);
+    if (unifiedHub(a) or messenger_view.includes(a.chat_view, .whatsapp)) refreshChats(a);
     refreshMessages(a);
     if (a.canvas) |canvas| _ = win.InvalidateRect(canvas, null, win.FALSE);
     var buffer: [300]u8 = undefined;
@@ -4395,7 +4443,7 @@ fn appendSlackChats(a: *App, query_utf8: ?[]const u8) void {
             const name = std.unicode.utf16LeToUtf8Alloc(a.allocator, cached.name.slice()) catch continue;
             defer a.allocator.free(name);
             cached.archived = if (a.archive_state) |state| state.localArchived(chat_key.of(cached)) else false;
-            if (cached.archived != a.show_archived) continue;
+            if (!messenger_view.archiveMatches(a.show_archived, a.include_archived, activeChatView(a) == .all, a.unread_only, cached.archived, cached.unread)) continue;
             if (!chatInView(a, chat_key.of(cached))) continue;
             if (!messenger_view.matches(activeChatView(a), .slack, a.unread_only, cached.unread, query_utf8 orelse "", name, cached.jid.slice())) continue;
             messenger_view.merge(Chat, a.chats, &a.chat_count, &.{cached.*});
@@ -7935,7 +7983,7 @@ fn loadChatsCache(a: *App) void {
         if (a.allocator.dupe(u8, data)) |copy| {
             if (a.chats_raw) |old| a.allocator.free(old);
             a.chats_raw = copy;
-            a.chats_raw_flags = if (a.show_archived) 2 else 0;
+            a.chats_raw_flags = if (a.show_archived) 2 else if (a.include_archived) 1 else 0;
         } else |_| {}
         logStartupMilestone(a, .chats, "chat list from cache");
     }
@@ -12671,7 +12719,7 @@ fn isKeptArchived(a: *const App, jid: []const u8) bool {
 
 fn archiveMarker(a: *const App, chat: *const Chat) ?[*:0]const u16 {
     if (chat.provider == .slack) return if (chat.archived) lit("Kept archived") else null;
-    if (chat.provider != .whatsapp) return null;
+    if (chat.provider != .whatsapp) return if (chat.archived) lit("Archived") else null;
     if (std.mem.eql(u16, chat.kind.slice(), std.mem.span(lit("Contact")))) return lit("Contact");
     if (!chat.archived and !a.show_archived) return null;
     return if (isKeptArchived(a, chat.jid.slice())) lit("Kept archived") else lit("Archived");
@@ -12839,6 +12887,7 @@ fn retryUnarchiveChat(a: *App) void {
 }
 
 fn pendingArchiveHidesChat(a: *const App, jid: []const u8, show_archived: bool) bool {
+    if (a.include_archived and !show_archived) return false;
     for (a.pending_archives[0..a.pending_archive_count]) |*pending| {
         if (archive_rules.pendingHidesChat(show_archived, pending.should_unarchive) and
             std.mem.eql(u8, pending.jid.slice(), jid)) return true;
@@ -12954,10 +13003,13 @@ fn archiveChat(a: *App, key: chat_key.Key, action: archive_rules.Action, source:
     const unarchive = action == .unarchive;
     if (key.provider == .slack or (unifiedHub(a) and (key.provider == .telegram or key.provider == .signal))) {
         const state = a.archive_state orelse return "Archive is not available";
-        if (!state.setLocalArchived(key, !unarchive)) return "Keep archived list is full";
+        const provider_archived = if (visibleChatIndex(a, key)) |index| a.chats[index].provider_archived else false;
+        const saved = if (unarchive and provider_archived) state.setLocalUnarchived(key) else state.setLocalArchived(key, !unarchive);
+        if (!saved) return "Keep archived list is full";
         saveArchiveState(a);
         if (visibleChatIndex(a, key)) |index| {
-            if (unarchive or !a.show_archived) removeChatRow(a, index);
+            a.chats[index].archived = !unarchive;
+            if (!messenger_view.archiveMatches(a.show_archived, a.include_archived, activeChatView(a) == .all, a.unread_only, !unarchive, a.chats[index].unread)) removeChatRow(a, index);
         }
         if (a.chats_hwnd) |list| _ = win.InvalidateRect(list, null, win.FALSE);
         if (a.canvas) |canvas| _ = win.InvalidateRect(canvas, null, win.FALSE);
@@ -12997,7 +13049,8 @@ fn archiveChat(a: *App, key: chat_key.Key, action: archive_rules.Action, source:
         a.pending_archive_count += 1;
     }
     if (visibleChatIndex(a, key)) |index| {
-        if (unarchive or !(a.show_archived or a.chats[index].archived)) removeChatRow(a, index);
+        a.chats[index].archived = !unarchive;
+        if (!messenger_view.archiveMatches(a.show_archived, a.include_archived, activeChatView(a) == .all, a.unread_only, !unarchive, a.chats[index].unread)) removeChatRow(a, index);
     }
     startNextArchive(a);
     return null;
@@ -13288,6 +13341,8 @@ fn controlWriteChat(a: *const App, w: *std.Io.Writer, chat: *const Chat) !void {
         isChatPinned(a, chat_key.of(chat)), chat.archived,
     });
     try control_api.writeString(w, chat.timestamp.slice());
+    try w.writeAll(",\"archive_label\":");
+    try control_api.writeStringUtf16(w, if (archiveMarker(a, chat)) |marker| std.mem.span(marker) else &.{});
     try w.writeByte('}');
 }
 
@@ -13312,6 +13367,7 @@ fn controlStatus(a: *App, w: *std.Io.Writer) !void {
         try controlWriteView(w, view.key.key(), view.labelText());
     }
     try w.writeByte(']');
+    try w.print(",\"include_archived\":{}", .{a.include_archived});
     var buffer: [1024]u8 = undefined;
     try w.print(",\"sync\":\"{s}\",\"slack_connected\":{},\"pending_sends\":{d},\"pending_archives\":{d},\"slack_chat_count\":{d},\"chat_count\":{d},\"show_archived\":{},\"unread_only\":{},\"search\":", .{
         sync,              a.slack_connected.load(.acquire), pending_sends,   a.pending_archive_count,
@@ -13446,7 +13502,7 @@ fn controlWhatsAppChats(a: *App, raw: []const u8, view: messenger_view.View, acc
         fillSlackTimestamp(a, &chat);
         chat.unread = getBool(object, "unread");
         chat.unread_count = getInt(object, "unread_count");
-        chat.archived = (if (a.archive_state) |state| state.localArchived(chat_key.of(&chat)) else false) or (chat.provider != .slack and getBool(object, "archived"));
+        chat.archived = if (a.archive_state) |state| state.isArchived(chat_key.of(&chat), getBool(object, "archived")) else getBool(object, "archived");
         if (chat.archived != show_archived) continue;
         try list.append(a.allocator, chat);
     }
@@ -13751,8 +13807,9 @@ fn buildPaletteItems(a: *App) void {
         if (a.palette_item_count > before) a.palette_items[before].view_identity = view.key;
     }
     appendPalette(a, if (a.selected_chat < a.chat_count and isChatPinned(a, chat_key.of(&a.chats[a.selected_chat]))) "Unpin selected chat" else "Pin chat to top", "", command_pin);
+    appendPalette(a, "Toggle archived chats in this view", "Alt+A", command_include_archived);
     appendPalette(a, if (a.show_archived) "Show inbox chats" else "Show archived chats", "", command_archived);
-    appendPalette(a, if (a.show_archived) "Unarchive selected chat" else "Archive selected chat", "Ctrl+E", command_archive);
+    appendPalette(a, if (a.show_archived or (a.selected_chat < a.chat_count and a.chats[a.selected_chat].archived)) "Unarchive selected chat" else "Archive selected chat", "Ctrl+E", command_archive);
     appendPalette(a, "Reply to selected message", "Ctrl+Shift+R", command_reply);
     appendPalette(a, "Resend failed message", "", command_resend);
     appendPalette(a, "React to selected message", "Ctrl+R", command_react_menu);
@@ -14724,6 +14781,7 @@ fn runCommand(a: *App, command: u16) void {
         command_show_whatsapp => switchChatView(a, .whatsapp),
         command_show_slack => switchChatView(a, .slack),
         command_show_telegram => switchChatView(a, .telegram),
+        command_include_archived => toggleViewArchived(a),
         command_archived => {
             _ = clearBulkSelection(a);
             a.show_archived = !a.show_archived;
@@ -14999,7 +15057,7 @@ fn layoutRegion(a: *App, width: i32, height: i32, dirty: ?*const win.RECT) void 
         }
     }
     a.compose_strip_top = height - sizes.strip_height;
-    a.search_pill = .{ .left = px(a, 12), .top = header_height + px(a, 8), .right = px(a, 12) + left_width - px(a, 24), .bottom = header_height + px(a, 8) + px(a, 34) };
+    a.search_pill = .{ .left = px(a, 12), .top = header_height + px(a, 8), .right = left_width - px(a, 148), .bottom = header_height + px(a, 8) + px(a, 34) };
     if (a.search) |hwnd| {
         const pill = field_pill.compute(a.search_pill, px(a, theme.radius_field * 2));
         var inner = pill.inner;
@@ -15008,6 +15066,7 @@ fn layoutRegion(a: *App, width: i32, height: i32, dirty: ?*const win.RECT) void 
         _ = win.MoveWindow(hwnd, inner.left, inner.top, inner.right - inner.left, inner.bottom - inner.top, win.TRUE);
         _ = win.SendMessageW(hwnd, win.EM_SETMARGINS, win.EC_LEFTMARGIN | win.EC_RIGHTMARGIN, @as(win.LPARAM, px(a, 2)) | (@as(win.LPARAM, px(a, 2)) << 16));
     }
+    if (a.include_archived_button) |button| _ = win.MoveWindow(button, left_width - px(a, 140), px(a, 8), px(a, 128), px(a, 34), win.TRUE);
     if (a.chats_hwnd) |hwnd| _ = win.MoveWindow(hwnd, 0, header_height + search_height, left_width - scrollbar_width, height - header_height - search_height - status_height - updateCardSpan(a), win.TRUE);
     if (a.status) |hwnd| _ = win.MoveWindow(hwnd, px(a, 12), height - status_height, left_width - px(a, 24), status_height, win.TRUE);
     if (a.thread_parent.len > 0 and (a.selected_chat >= a.chat_count or !chat_key.Key.eql(a.thread_origin.key(), chat_key.of(&a.chats[a.selected_chat])))) closeSlackThread(a);
@@ -17366,6 +17425,8 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
             a.voice_btn = win.CreateWindowExW(0, lit("BUTTON"), lit("Voice"), win.WS_CHILD | win.WS_VISIBLE | win.WS_TABSTOP | win.BS_OWNERDRAW, 0, 0, 0, 0, hwnd, controlId(id_voice), a.instance, null);
             a.dictate = win.CreateWindowExW(0, lit("BUTTON"), lit("Dictate"), win.WS_CHILD | win.WS_VISIBLE | win.WS_TABSTOP | win.BS_OWNERDRAW, 0, 0, 0, 0, hwnd, controlId(id_dictate), a.instance, null);
             a.emoji_btn = win.CreateWindowExW(0, lit("BUTTON"), lit("😊"), win.WS_CHILD | win.WS_VISIBLE | win.WS_TABSTOP | win.BS_OWNERDRAW, 0, 0, 0, 0, hwnd, controlId(id_emoji), a.instance, null);
+            a.include_archived_button = win.CreateWindowExW(0, lit("BUTTON"), if (a.include_archived) lit("Show archived: On") else lit("Show archived: Off"), win.WS_CHILD | win.WS_VISIBLE | win.WS_TABSTOP | win.BS_OWNERDRAW, 0, 0, 0, 0, hwnd, controlId(id_include_archived), a.instance, null);
+            subclassComposerButton(a, a.include_archived_button, 10);
             a.send = win.CreateWindowExW(0, lit("BUTTON"), lit("Send"), win.WS_CHILD | win.WS_VISIBLE | win.WS_TABSTOP | win.BS_OWNERDRAW, 0, 0, 0, 0, hwnd, controlId(id_send), a.instance, null);
             subclassComposerButton(a, a.attach_btn, 9);
             subclassComposerButton(a, a.voice_btn, 8);
@@ -17643,6 +17704,8 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
                 if (item.itemID == reaction_row) drawReactionRow(a, item) else if (theme.choice == .amoled) drawMessageMenuItem(a, item);
             } else if (item.CtlID == id_chats) {
                 drawChat(a, item);
+            } else if (item.CtlID == id_include_archived) {
+                drawSetupButton(a, item);
             } else if (item.CtlID == id_voice) {
                 drawVoiceButton(a, item);
             } else if (item.CtlID == id_dictate or item.CtlID == id_send or item.CtlID == id_emoji or item.CtlID == id_attach) {
@@ -17673,6 +17736,8 @@ fn mainProc(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam: win.L
             if (id == id_chats and notification == win.LBN_SELCHANGE) {
                 const selected = win.SendMessageW(a.chats_hwnd.?, win.LB_GETCURSEL, 0, 0);
                 if (selected >= 0) selectChatRow(a, @intCast(selected)) else _ = clearBulkSelection(a);
+            } else if (id == id_include_archived and notification == win.BN_CLICKED) {
+                runCommand(a, command_include_archived);
             } else if (id == id_send and notification == win.BN_CLICKED) {
                 sendMessage(a);
             } else if (id == id_dictate and notification == win.BN_CLICKED) {
@@ -18026,6 +18091,10 @@ fn handleKeyboard(a: *App, message: *const win.MSG) bool {
     }
     if (control and !alt and !shift and (key == win.VK_UP or key == win.VK_DOWN) and a.message_count > 0 and (a.thread_compose == null or focus != a.thread_compose.?)) {
         walkMessageHighlight(a, key);
+        return true;
+    }
+    if (alt and !control and !shift and key == 'A') {
+        runCommand(a, command_include_archived);
         return true;
     }
     if (alt and !control and !shift and key == 'I') {
@@ -18914,7 +18983,7 @@ fn verificationProvider(a: *App, operation: enum { chats, messages, archive, una
                     .object => |object| object,
                     else => continue,
                 };
-                if (getBool(object, "archived") != a.show_archived) continue;
+                if ((a.show_archived or !a.include_archived) and getBool(object, "archived") != a.show_archived) continue;
                 if (count > 0) out.writer.writeByte(',') catch return null;
                 std.json.Stringify.value(row, .{}, &out.writer) catch return null;
                 count += 1;
@@ -19074,6 +19143,7 @@ pub fn main(init: std.process.Init) !void {
         app.view_account.set(saved);
         init.gpa.free(saved);
     }
+    loadViewArchiveSetting(app);
     defer {
         app.views.deinit(init.gpa);
         if (app.hub_workspace_names) |names| init.gpa.free(names);
@@ -20826,6 +20896,14 @@ fn executeHubJob(a: *App, allocator: std.mem.Allocator, job: *const WacliJob, re
         const client_id = if (job.kind == .hub_send) job.msg_id.slice() else job.client_id.slice();
         if (!std.mem.eql(u8, reply.value.client_id, client_id) or !std.mem.eql(u8, reply.value.status, "sent")) return error.SendNotConfirmed;
         return "";
+    }
+    if (job.kind == .chats and hubHasArg(job, "--include-archived")) {
+        const archived_request = if (unifiedHub(a)) try hub.chats(allocator, true, 500) else try wa_hub.chats(allocator, key.account, true, 500);
+        const archived = try client.call(allocator, archived_request);
+        if (archived.status != 200) return error.HubHttpFailed;
+        const normal_data = try hubNormalized(a, allocator, job, response.body, .chats, "");
+        const archived_data = try hubNormalized(a, allocator, job, archived.body, .chats, "");
+        return messenger_view.mergeChatData(allocator, normal_data, archived_data);
     }
     if (unifiedHub(a) and job.kind == .chats and hubHasArg(job, "--archived")) {
         const inbox = try client.call(allocator, try hub.chats(allocator, false, 500));

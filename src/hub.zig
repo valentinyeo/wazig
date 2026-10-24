@@ -232,7 +232,7 @@ pub fn archivedChats(allocator: std.mem.Allocator, archived_raw: []const u8, inb
     var rows: std.ArrayList(std.json.Value) = .empty;
     defer rows.deinit(allocator);
     for (archived_rows.value.object.get("data").?.array.items) |row| {
-        if (sourceProvider(row.object) != .slack) try rows.append(allocator, row);
+        try rows.append(allocator, row);
     }
     for (inbox_rows.value.object.get("data").?.array.items) |row| {
         var known = false;

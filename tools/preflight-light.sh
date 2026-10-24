@@ -17,6 +17,7 @@ PYTHON_LIGHT_TESTS=(
     test_recording_paint
     test_repaint
     test_search_center
+    test_show_archived
     test_slack_emoji
     test_slack_sort
     test_slack_threads

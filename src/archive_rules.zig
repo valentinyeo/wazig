@@ -82,7 +82,20 @@ pub const State = struct {
     }
 
     pub fn localArchived(self: *const State, key: anytype) bool {
-        return if (key.provider == .whatsapp) self.find(key.id) != null else self.findLocal(key) != null;
+        return if (key.provider == .whatsapp) self.find(key.id) != null else if (self.findLocal(key)) |index| self.entries[index].keep else false;
+    }
+
+    pub fn isArchived(self: *const State, key: anytype, provider_archived: bool) bool {
+        if (key.provider != .whatsapp) {
+            if (self.findLocal(key)) |index| return self.entries[index].keep;
+        }
+        return self.localArchived(key) or provider_archived;
+    }
+
+    pub fn setLocalUnarchived(self: *State, key: anytype) bool {
+        if (!self.setLocalArchived(key, true)) return false;
+        self.entries[self.findLocal(key).?].keep = false;
+        return true;
     }
 
     fn findLocal(self: *const State, key: anytype) ?usize {
@@ -99,7 +112,7 @@ pub const State = struct {
     pub fn setLocalArchived(self: *State, key: anytype, archived: bool) bool {
         if (key.provider == .whatsapp or key.account.len > 32 or key.id.len == 0 or key.id.len > max_jid) return false;
         if (self.findLocal(key)) |index| {
-            if (!archived) self.removeAt(index);
+            if (!archived) self.removeAt(index) else self.entries[index].keep = true;
             return true;
         }
         if (!archived) return true;
@@ -210,7 +223,7 @@ pub const State = struct {
         var len: usize = 0;
         for (self.entries[0..self.count]) |*entry| {
             const line = if (entry.provider != .whatsapp)
-                std.fmt.bufPrint(out[len..], "{s}\t{s}\t{s}\n", .{ @tagName(entry.provider), entry.account[0..entry.account_len], entry.jidSlice() }) catch break
+                std.fmt.bufPrint(out[len..], "{s}\t{s}\t{s}{s}\n", .{ @tagName(entry.provider), entry.account[0..entry.account_len], entry.jidSlice(), if (entry.keep) @as([]const u8, "") else "\t0" }) catch break
             else
                 std.fmt.bufPrint(out[len..], "{s}\t{d}\t{s}\n", .{ entry.jidSlice(), @intFromBool(entry.keep), entry.tsSlice() }) catch break;
             len += line.len;
@@ -229,7 +242,7 @@ pub const State = struct {
                 const id = fields.next() orelse continue;
                 if (account.len > 32 or id.len == 0 or id.len > max_jid or self.count >= max_entries) continue;
                 const entry = &self.entries[self.count];
-                entry.* = .{ .provider = std.meta.stringToEnum(@FieldType(Entry, "provider"), jid).?, .keep = true };
+                entry.* = .{ .provider = std.meta.stringToEnum(@FieldType(Entry, "provider"), jid).?, .keep = !std.mem.eql(u8, fields.next() orelse "1", "0") };
                 @memcpy(entry.account[0..account.len], account);
                 entry.account_len = @intCast(account.len);
                 @memcpy(entry.jid[0..id.len], id);
@@ -573,5 +586,29 @@ test "old plain Telegram and Signal archives become local regardless of keep or 
             state.parse(loaded.format(&buffer));
             try std.testing.expect(!state.localArchived(key));
         }
+    }
+}
+
+test "explicit local unarchive overrides phone archived state after restart without affecting another account" {
+    const Key = struct { provider: enum { whatsapp, slack, telegram, signal }, account: []const u8, id: []const u8 };
+    for ([_]Key{
+        .{ .provider = .telegram, .account = "telegram", .id = "telegram:user:7001" },
+        .{ .provider = .signal, .account = "signal", .id = "signal:fixture" },
+        .{ .provider = .slack, .account = "workspace", .id = "channel" },
+    }) |key| {
+        var state = State{};
+        try std.testing.expect(state.isArchived(key, true));
+        try std.testing.expect(state.setLocalUnarchived(key));
+        try std.testing.expect(!state.isArchived(key, true));
+        try std.testing.expect(!state.localArchived(key));
+        var buffer: [512]u8 = undefined;
+        var loaded = State{};
+        loaded.parse(state.format(&buffer));
+        try std.testing.expect(!loaded.isArchived(key, true));
+        var other = key;
+        other.account = "other";
+        try std.testing.expect(loaded.isArchived(other, true));
+        try std.testing.expect(loaded.setLocalArchived(key, true));
+        try std.testing.expect(loaded.isArchived(key, false));
     }
 }

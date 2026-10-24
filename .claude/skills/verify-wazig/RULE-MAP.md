@@ -30,3 +30,5 @@ IGSH-589: update the maps with the implementation and describe only actual asser
 | Composer border is equally thick on every side | composer-border.ps1 screenshot row/column probes, negative pixel control and saved app text scale cases | [Composer border](features/composer-border.md) |
 
 | Slack standard shortcodes use generated public data; custom images stay account-scoped; Giphy animates through the hub media path | slack-emoji.ps1, SlackEmojiHandler and check-slack-emoji-evidence.py exact state, custom pixels, frame crop differences and cached hub bytes | [Slack emoji](features/slack-emoji.md) |
+
+| Show archived is per-view, durable, marked and retains inbox unread filtering | show-archived.ps1, ShowArchivedHandler and check-show-archived-evidence.py | [Show archived](features/show-archived.md) |

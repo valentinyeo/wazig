@@ -35,6 +35,8 @@ const Chat = struct {
     timestamp: Utf8Text(47) = .{},
     provider: Provider = .whatsapp,
     archived: bool = false,
+    provider_archived: bool = false,
+    unread: bool = false,
 };
 const PendingArchive = struct {
     jid: Utf8Text(191) = .{},
@@ -60,6 +62,9 @@ const App = struct {
     displayed_account: Utf8Text(32) = .{},
     displayed_jid: Utf8Text(191) = .{},
     show_archived: bool = false,
+    include_archived: bool = false,
+    unread_only: bool = false,
+    chat_view: enum { all, whatsapp } = .whatsapp,
     bulk: archive_rules.Selection(4) = .{},
     archive_state: ?*archive_rules.State,
     pending_archives: [4]PendingArchive = @splat(.{}),
@@ -1054,5 +1059,55 @@ test "hub Telegram and Signal archives honor both phone and local state in both 
                 try std.testing.expect(chat_key.Key.eql(chat_key.of(&chat), chat_key.of(&archived)));
             }
         }
+    }
+}
+
+fn activeChatView(a: *App) @TypeOf(a.chat_view) {
+    return a.chat_view;
+}
+
+test "mixed archive and unarchive keep the row selected and visibly marked on every provider" {
+    for ([_]Provider{ .whatsapp, .telegram, .signal, .slack }) |provider| {
+        var state = archive_rules.State{};
+        var a = fixture(&state);
+        a.unified_hub = true;
+        a.include_archived = true;
+        a.chats[0].provider = provider;
+        a.chats[0].account.set("fixture-account");
+        a.chats[0].jid.set(if (provider == .whatsapp) "personal:fixture@s.whatsapp.net" else "fixture:local");
+        var key = chat_key.Stored{};
+        key.set(chat_key.of(&a.chats[0]));
+        try std.testing.expect(archiveChat(&a, key.key(), .archive, .shortcut) == null);
+        try std.testing.expectEqual(@as(usize, 2), a.chat_count);
+        try std.testing.expect(a.chats[0].archived);
+        try std.testing.expect(!pendingArchiveHidesChat(&a, key.key().id, false));
+        try std.testing.expect(archiveChat(&a, key.key(), .unarchive, .shortcut) == null);
+        try std.testing.expectEqual(@as(usize, 2), a.chat_count);
+        try std.testing.expect(!a.chats[0].archived);
+        try std.testing.expectEqual(@as(usize, 0), a.selected_chat);
+        if (provider != .whatsapp) try std.testing.expectEqual(@as(usize, 0), a.pending_archive_count);
+    }
+}
+
+test "mixed locally unarchived phone rows remain unarchived after reloading state" {
+    for ([_]Provider{ .telegram, .signal, .slack }) |provider| {
+        var state = archive_rules.State{};
+        var a = fixture(&state);
+        a.unified_hub = true;
+        a.include_archived = true;
+        a.chats[0].provider = provider;
+        a.chats[0].account.set("fixture-account");
+        a.chats[0].jid.set("fixture:phone-archived");
+        a.chats[0].archived = true;
+        a.chats[0].provider_archived = true;
+        var key = chat_key.Stored{};
+        key.set(chat_key.of(&a.chats[0]));
+        try std.testing.expect(archiveChat(&a, key.key(), .unarchive, .shortcut) == null);
+        try std.testing.expectEqual(@as(usize, 2), a.chat_count);
+        try std.testing.expect(!a.chats[0].archived);
+        try std.testing.expectEqual(@as(usize, 0), a.pending_archive_count);
+        var loaded = archive_rules.State{};
+        loaded.parse(a.saved[0..a.saved_len]);
+        try std.testing.expect(!loaded.isArchived(key.key(), true));
     }
 }

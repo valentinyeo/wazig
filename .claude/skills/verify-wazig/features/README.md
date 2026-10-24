@@ -99,3 +99,5 @@ These are source changes in the bounded history window, not claims of live verif
 - IGSH-667: drag across full chat passages -> `passage-copy` (exact stamped partial clipboard and held-edge scrolling on WhatsApp and Slack)
 - IGSH-701: Ctrl+A from an empty composer -> `archive-bulk` (two visible chats selected, Ctrl+E archives both, empty inbox and text select-all preserved)
 - IGSH-670: Slack shortcodes, custom emoji and missing Giphy -> `slack-emoji` (exact Unicode and unknown fallback, custom message/reaction image pixels, two different GIF frame crops and account-scoped hub fetch/cache proof)
+
+- IGSH-737: include archived chats per account and inbox -> `show-archived` (Alt+A, marked mixed rows, local archive actions, tooltip and same-profile restart)

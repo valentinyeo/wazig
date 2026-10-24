@@ -324,3 +324,117 @@ test "bulk selection separates matching channel ids in different workspaces" {
     try std.testing.expect(!selected.containsKey(second));
     try std.testing.expect(Key.eql(first, selected.atKey(Key, 0)));
 }
+
+pub fn archivedSettingKey(allocator: std.mem.Allocator, view: View, account: []const u8) ![]u8 {
+    return if (view == .all) allocator.dupe(u8, "ShowArchived:all") else std.fmt.allocPrint(allocator, "ShowArchived:{s}:{s}", .{ @tagName(view), account });
+}
+
+pub fn archivedSetting(value: ?[]const u8) bool {
+    return if (value) |text| std.mem.eql(u8, text, "1") else false;
+}
+
+pub fn archiveMatches(archived_only: bool, include_archived: bool, inbox: bool, unread_only: bool, archived: bool, unread: bool) bool {
+    const needs_unread = unread_only or (inbox and include_archived and !archived_only);
+    return (!needs_unread or unread) and (if (archived_only) archived else include_archived or !archived);
+}
+
+pub fn mergeChatData(allocator: std.mem.Allocator, normal: []const u8, archived: []const u8) ![]u8 {
+    var first = try std.json.parseFromSlice(std.json.Value, allocator, normal, .{});
+    defer first.deinit();
+    var second = try std.json.parseFromSlice(std.json.Value, allocator, archived, .{});
+    defer second.deinit();
+    var rows: std.ArrayList(std.json.Value) = .empty;
+    defer rows.deinit(allocator);
+    for ([_]std.json.Value{ second.value, first.value }) |root| {
+        if (root != .object) return error.BadChatList;
+        const data = root.object.get("data") orelse return error.BadChatList;
+        if (data != .array) return error.BadChatList;
+        for (data.array.items) |row| {
+            if (row != .object) return error.BadChatList;
+            var known = false;
+            for (rows.items) |existing| {
+                const fields = [_][]const u8{ "jid", "provider", "account" };
+                var equal = true;
+                for (fields) |field| {
+                    const left = existing.object.get(field) orelse .{ .string = "" };
+                    const right = row.object.get(field) orelse .{ .string = "" };
+                    if (left != .string or right != .string or !std.mem.eql(u8, left.string, right.string)) equal = false;
+                }
+                if (equal) {
+                    known = true;
+                    break;
+                }
+            }
+            if (!known) try rows.append(allocator, row);
+        }
+    }
+    return std.json.Stringify.valueAlloc(allocator, .{ .data = rows.items }, .{});
+}
+
+test "Show archived filters unread inbox and independent archived-only mode for every provider" {
+    for ([_]Provider{ .whatsapp, .telegram, .signal, .slack }) |provider| {
+        try std.testing.expect(includes(.all, provider));
+        for ([_]bool{ false, true }) |unread| {
+            try std.testing.expect(archiveMatches(false, false, false, false, false, unread));
+            try std.testing.expect(!archiveMatches(false, false, false, false, true, unread));
+            try std.testing.expect(archiveMatches(false, true, false, false, true, unread));
+            try std.testing.expectEqual(unread, archiveMatches(false, true, true, false, true, unread));
+            try std.testing.expectEqual(unread, archiveMatches(false, true, true, false, false, unread));
+            try std.testing.expectEqual(unread, archiveMatches(false, true, false, true, true, unread));
+            try std.testing.expect(archiveMatches(true, true, true, false, true, unread));
+            try std.testing.expect(!archiveMatches(true, true, true, false, false, unread));
+        }
+    }
+}
+
+test "Show archived saved setting defaults off and survives independently by account identity not view position" {
+    const allocator = std.testing.allocator;
+    const keys = [_]struct { view: View, account: []const u8, enabled: bool }{
+        .{ .view = .all, .account = "", .enabled = true },
+        .{ .view = .whatsapp, .account = "personal", .enabled = true },
+        .{ .view = .whatsapp, .account = "business", .enabled = false },
+        .{ .view = .telegram, .account = "telegram", .enabled = true },
+        .{ .view = .signal, .account = "signal", .enabled = false },
+        .{ .view = .slack, .account = "workspace", .enabled = true },
+    };
+    var saved: std.StringHashMapUnmanaged([]const u8) = .empty;
+    defer {
+        var iterator = saved.keyIterator();
+        while (iterator.next()) |key| allocator.free(key.*);
+        saved.deinit(allocator);
+    }
+    for (keys) |entry| {
+        const key = try archivedSettingKey(allocator, entry.view, entry.account);
+        try saved.put(allocator, key, if (entry.enabled) "1" else "0");
+    }
+    var index = keys.len;
+    while (index > 0) {
+        index -= 1;
+        const entry = keys[index];
+        const key = try archivedSettingKey(allocator, entry.view, entry.account);
+        defer allocator.free(key);
+        try std.testing.expectEqual(entry.enabled, archivedSetting(saved.get(key)));
+    }
+    try std.testing.expect(!archivedSetting(null));
+    try std.testing.expect(!archivedSetting("invalid"));
+    try std.testing.expect(!archivedSetting("0"));
+}
+
+test "mixed chat data keeps every provider including locally archived inbox entries without duplicate identities" {
+    const allocator = std.testing.allocator;
+    const normal =
+        \\{"data":[{"jid":"normal","provider":"telegram"},{"jid":"same","provider":"whatsapp","account":"one"}]}
+    ;
+    const archived =
+        \\{"data":[{"jid":"same","provider":"whatsapp","account":"one","archived":true},{"jid":"same","provider":"whatsapp","account":"two"},{"jid":"archived","provider":"slack","archived":true}]}
+    ;
+    const merged = try mergeChatData(allocator, normal, archived);
+    defer allocator.free(merged);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, merged, .{});
+    defer parsed.deinit();
+    const rows = parsed.value.object.get("data").?.array.items;
+    try std.testing.expectEqual(@as(usize, 4), rows.len);
+    try std.testing.expectEqualStrings("telegram", rows[3].object.get("provider").?.string);
+    try std.testing.expect(rows[0].object.get("archived").?.bool);
+    try std.testing.expect(rows[2].object.get("archived").?.bool);
+}

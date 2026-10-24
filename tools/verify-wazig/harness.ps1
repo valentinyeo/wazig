@@ -224,7 +224,7 @@ function Save-Screen($Session, [string]$Name) {
     $tree | Set-Content (Join-Path $Session.evidence "$Name.uia.txt")
     $state = Read-Control $Session status
     $state | ConvertTo-Json -Depth 12 | Set-Content (Join-Path $Session.evidence "$Name.state.json")
-    if ($Session.feature -in @('archive', 'archive-bulk', 'hub-archive', 'palette-archived', 'slack-sort', 'slack-archive', 'slack-threads', 'workspace-icons', 'signal', 'telegram', 'notrap', 'passage-copy', 'reactions')) {
+    if ($Session.feature -in @('show-archived', 'archive', 'archive-bulk', 'hub-archive', 'palette-archived', 'slack-sort', 'slack-archive', 'slack-threads', 'workspace-icons', 'signal', 'telegram', 'notrap', 'passage-copy', 'reactions')) {
         $arguments = if ($state.show_archived) { @('--archived') } else { @() }
         Read-Control $Session chats -Arguments $arguments | ConvertTo-Json -Depth 12 | Set-Content (Join-Path $Session.evidence "$Name.chats.json")
     }

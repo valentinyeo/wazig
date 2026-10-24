@@ -420,6 +420,70 @@ class PaletteArchivedHandler(Handler):
             self.respond(400, {'error': 'unexpected palette fixture write'}, body=body)
 
 
+SHOW_ARCHIVED_ACCOUNTS = [('whatsapp', 'personal'), ('whatsapp', 'business'),
+                          ('slack', 'T0ARCHIVED'), ('telegram', 'telegram'), ('signal', 'signal')]
+
+
+def show_archived_rows():
+    rows = []
+    for index, (provider, account) in enumerate(SHOW_ARCHIVED_ACCOUNTS):
+        for number, (archived, unread) in enumerate([(False, False), (False, True), (True, True), (True, False)]):
+            jid = (f'{account}:1555000{index:02}{number:02}@s.whatsapp.net' if provider == 'whatsapp' else
+                   f'slack:{account}:C{number:010}' if provider == 'slack' else
+                   f'telegram:user:{7000 + number}' if provider == 'telegram' else f'signal:fixture-{number}')
+            rows.append(dict(jid=jid, provider=provider, name=f'{account} row {number}', kind='direct',
+                             last_message_ts=f'2026-10-24T12:{30 - number * 5 - index:02}:00Z',
+                             unread=unread, unread_count=int(unread), archived=archived,
+                             team_name='Archive Workspace' if provider == 'slack' else ''))
+    return rows
+
+
+class ShowArchivedHandler(PaletteArchivedHandler):
+    def do_GET(self):
+        self.wire_path = self.path
+        if not self.authorized():
+            return
+        url = urlsplit(self.path)
+        query = parse_qs(url.query)
+        if url.path == '/v1/wazig/chats':
+            rows = getattr(self.state, 'show_archived_rows', None)
+            if rows is None:
+                self.state.show_archived_rows = rows = show_archived_rows()
+            self.respond(200, [row for row in rows if row['archived'] == (query.get('archived') == ['true'])])
+        elif url.path == '/v1/wazig/messages':
+            chat = query.get('chat', [''])[0]
+            row = next((row for row in show_archived_rows() if row['jid'] == chat), None)
+            if row is None:
+                self.respond(404, {'error': 'unknown archived-switch chat'})
+                return
+            self.respond(200, [dict(MsgID='ARCHIVED-SWITCH', ChatJID=chat, Timestamp=row['last_message_ts'],
+                                    Text='Synthetic archive switch probe', FromMe=not row['unread'],
+                                    SenderName='Fixture Sender')] if query.get('limit') == ['20'] else [])
+        elif url.path == '/v1/wazig/events':
+            self.events()
+        elif url.path == '/v1/wazig/groups':
+            self.respond(200, [])
+        else:
+            self.respond(404, {'error': 'unavailable'})
+
+    def do_POST(self):
+        self.wire_path = self.path
+        if not self.authorized():
+            return
+        body = json.loads(self.rfile.read(int(self.headers.get('Content-Length', '0'))) or '{}')
+        if self.path == '/v1/wazig/mark-read':
+            self.respond(200, {'status': 'ok'}, body=body)
+        elif self.path == '/v1/wazig/archive' and isinstance(body.get('archived'), bool):
+            row = next((row for row in self.state.show_archived_rows if row['jid'] == body.get('chat')), None)
+            if row is None or row['provider'] != 'whatsapp':
+                self.respond(400, {'error': 'only WhatsApp archives remotely'}, body=body)
+                return
+            row['archived'] = body['archived']
+            self.respond(200, {'status': 'ok'}, body=body)
+        else:
+            self.respond(400, {'error': 'unexpected archive-switch write'}, body=body)
+
+
 def passage_rows(chat):
     return [dict(MsgID=f'PASSAGE-{n}', ChatJID=chat,
                  Timestamp=f'2026-10-{10 if n <= 3 else 11}T12:{n:02}:00Z',

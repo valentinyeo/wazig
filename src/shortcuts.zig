@@ -24,6 +24,7 @@ pub const groups = [_]Group{
         .{ .key = "Mouse wheel over the list", .desc = "Scroll the chat list" },
         .{ .key = "Ctrl+F or /", .desc = "Focus search" },
         .{ .key = "Esc", .desc = "Clear the search and show all chats" },
+        .{ .key = "Alt+A", .desc = "Show or hide archived chats in this view" },
         .{ .key = "U", .desc = "Toggle unread chats" },
         .{ .key = "Ctrl+E or E", .desc = "Archive or unarchive the selected chat" },
         .{ .key = "Ctrl+A in the chat list or empty message box", .desc = "Select all chats; Ctrl+E archives, Esc cancels" },

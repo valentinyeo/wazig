@@ -582,3 +582,15 @@ test "hub Archive keeps a provider-unarchived Telegram candidate and deduplicate
     try std.testing.expectEqualStrings("/v1/wazig/archive", request.path);
     try std.testing.expectEqualStrings("{\"chat\":\"telegram:user:7002\",\"archived\":true}", request.body);
 }
+
+test "Show archived keeps provider flagged Slack rows available to the existing archived-only command" {
+    const allocator = std.testing.allocator;
+    const raw = try hub.archivedChats(allocator, "[{\"provider\":\"slack\",\"account\":\"workspace\",\"jid\":\"channel\",\"archived\":true}]", "[]");
+    defer allocator.free(raw);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
+    defer parsed.deinit();
+    const rows = parsed.value.object.get("data").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), rows.len);
+    try std.testing.expect(rows[0].object.get("archived").?.bool);
+    try std.testing.expectEqualStrings("slack", rows[0].object.get("provider").?.string);
+}

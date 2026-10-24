@@ -486,6 +486,24 @@
       "library": "composer-border.ps1",
       "hub_handler": null,
       "maximize": true
+    },
+    {
+      "name": "show-archived",
+      "pr": true,
+      "hub": "show-archived",
+      "evidence": true,
+      "chats": 10,
+      "script": "journey-show-archived.ps1",
+      "library": "show-archived.ps1",
+      "validator": {
+        "file": "check-show-archived-evidence.py",
+        "function": "check_show_archived"
+      },
+      "hub_handler": {
+        "file": "fake-hub.py",
+        "class": "ShowArchivedHandler"
+      },
+      "maximize": true
     }
   ]
 }

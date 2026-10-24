@@ -521,8 +521,12 @@ pub fn build(b: *std.Build) void {
 
     const control_archive_source = sourceSection("fn controlWhatsAppChats(", "fn controlSortChats(");
     const control_archive_filter = control_archive_source[std.mem.indexOf(u8, control_archive_source, "        chat.archived =").?..std.mem.indexOf(u8, control_archive_source, "        try list.append").?];
+    const archive_filter_source = @embedFile("src/messenger_view.zig");
     const archive_harness_source = std.mem.concat(b.allocator, u8, &.{
         @embedFile("src/archive_actions_test.zig"),
+        "const messenger_view = struct {\n",
+        archive_filter_source[std.mem.indexOf(u8, archive_filter_source, "pub fn archiveMatches(").?..std.mem.indexOf(u8, archive_filter_source, "pub fn mergeChatData(").?],
+        "};\n",
         sourceSection("fn getBool(", "fn getInt("),
         "fn archiveInboxRow(a: *App, row: Chat, object: std.json.ObjectMap) ?Chat { for ([_]Chat{row}) |item| { var chat = item;\n",
         sourceSection("        chat.archived =", "        a.chats[a.chat_count] = chat;"),
